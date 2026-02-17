@@ -55,3 +55,10 @@ logs/
 artifacts/
 ui/.build/
 .ai-agent-cache/
+
+# Runtime data & SQLite databases
+.ai-agent-search/
+.tmp_live_memory/
+*.db
+*.db-shm
+*.db-wal
