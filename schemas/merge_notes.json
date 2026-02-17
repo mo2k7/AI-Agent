@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "merge_notes",
+  "title": "merge_notes",
+  "description": "Merge multiple notes into a single consolidated note. The source notes are soft-deleted and a new merged note is created. Use when related notes should be combined into one comprehensive document.",
+  "type": "object",
+  "properties": {
+    "note_ids": {
+      "type": "array",
+      "description": "Array of note IDs (or 8-char prefixes) to merge. Order determines content sequence.",
+      "items": { "type": "string" },
+      "minItems": 2,
+      "maxItems": 10
+    },
+    "merged_content": {
+      "type": "string",
+      "description": "The merged and reorganized content combining all source notes. Use rich markdown formatting.",
+      "minLength": 1,
+      "maxLength": 16000
+    },
+    "title": {
+      "type": "string",
+      "description": "Optional title for the merged note.",
+      "maxLength": 200
+    },
+    "note_type": {
+      "type": "string",
+      "description": "Optional semantic type for the merged note.",
+      "enum": ["summary", "key_points", "study_guide", "comparison_table", "timeline", "formula_sheet", "flashcards", "cheat_sheet"]
+    }
+  },
+  "additionalProperties": false,
+  "required": ["note_ids", "merged_content"]
+}

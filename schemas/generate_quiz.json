@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "generate_quiz",
+  "title": "generate_quiz",
+  "description": "Generate a quiz or flashcard set from existing notes. Reads the source notes, creates study questions in the requested format, and saves them as a new flashcard-type note. Use for exam preparation, self-testing, and spaced repetition study.",
+  "type": "object",
+  "properties": {
+    "source_note_ids": {
+      "type": "array",
+      "description": "Array of note IDs (or 8-char prefixes) to generate questions from.",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "maxItems": 10
+    },
+    "quiz_type": {
+      "type": "string",
+      "description": "The format of the generated questions.",
+      "enum": ["flashcards", "multiple_choice", "fill_in_blank", "true_false"]
+    },
+    "num_questions": {
+      "type": "integer",
+      "description": "Number of questions to generate. Defaults to 10 if not specified.",
+      "default": 10,
+      "minimum": 1,
+      "maximum": 30
+    },
+    "difficulty": {
+      "type": "string",
+      "description": "Difficulty level of the questions.",
+      "default": "intermediate",
+      "enum": ["basic", "intermediate", "advanced"]
+    },
+    "content": {
+      "type": "string",
+      "description": "The generated quiz content in markdown. For flashcards use **Q:** / **A:** format separated by --- dividers. For multiple choice use **Q:** with lettered options and **Answer:** line. For fill_in_blank use sentences with ___. For true_false use **Statement:** / **Answer:** True or False.",
+      "minLength": 1,
+      "maxLength": 12000
+    }
+  },
+  "additionalProperties": false,
+  "required": ["source_note_ids", "quiz_type", "content"]
+}

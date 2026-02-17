@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "search_files",
+  "title": "search_files",
+  "description": "Find files based on metadata or content",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Search query string — use specific filenames or content keywords, NOT the full natural-language prompt"
+    },
+    "extensions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "File extensions to filter by (without leading dot). Example: [\"pdf\", \"docx\", \"txt\"]"
+    },
+    "folder_hint": {
+      "type": "string",
+      "description": "Preferred folder name to search in first. Example: \"downloads\", \"documents\", \"desktop\""
+    },
+    "path_filter": {
+      "type": "string",
+      "description": "Optional path substring filter (case-insensitive)"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["auto", "fast", "deep"],
+      "default": "auto",
+      "description": "Search strategy mode: auto merges all tiers, fast prioritizes low latency, deep prioritizes recall."
+    },
+    "time_budget_ms": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 10000,
+      "default": 700,
+      "description": "Maximum latency budget for this query before returning best-effort results."
+    },
+    "continuation_token": {
+      "type": "string",
+      "description": "Opaque token from previous results to continue deep scanning."
+    },
+    "include_hidden": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether hidden files and directories should be included."
+    },
+    "max_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 128,
+      "description": "Optional maximum directory depth relative to each scanned root."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 10,
+      "description": "Maximum number of results"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["query"]
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "summarize_note",
+  "title": "summarize_note",
+  "description": "Create a summary of an existing note at a specified detail level. The original note is preserved and a new summary note is created. Use for creating condensed versions of detailed notes or one-line reference cards.",
+  "type": "object",
+  "properties": {
+    "note_id": {
+      "type": "string",
+      "description": "The note ID (or 8-char prefix) of the note to summarize."
+    },
+    "level": {
+      "type": "string",
+      "description": "The summarization level: 'detailed' preserves structure with trimming, 'condensed' reduces to key points, 'one_liner' produces a single sentence.",
+      "enum": ["detailed", "condensed", "one_liner"]
+    },
+    "content": {
+      "type": "string",
+      "description": "The generated summary content in markdown.",
+      "minLength": 1,
+      "maxLength": 8000
+    }
+  },
+  "additionalProperties": false,
+  "required": ["note_id", "level", "content"]
+}

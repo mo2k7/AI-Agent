@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "extract_content",
+  "title": "extract_content",
+  "description": "Extract text from rich formats",
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Path to the file"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["text", "pdf", "code"],
+      "description": "Extraction mode"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["path", "mode"]
+}

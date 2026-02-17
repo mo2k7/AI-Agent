@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "browse_web",
+  "title": "browse_web",
+  "description": "Browse and extract content from web pages. Supports single or batch URL fetching with security-hardened SSRF prevention, content extraction (HTML/JSON/text), robots.txt compliance, rate limiting, and caching. Returns extracted text, metadata, and security audit info.",
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "Single URL to fetch and extract content from (e.g., 'https://example.com/page'). Use either 'url' or 'urls', not both."
+    },
+    "urls": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Multiple URLs to fetch in batch (max 10). Use either 'url' or 'urls', not both."
+    },
+    "extraction_mode": {
+      "type": "string",
+      "enum": ["auto", "raw", "markdown"],
+      "description": "Content extraction strategy. 'auto' uses readability heuristics (recommended), 'raw' returns full page text, 'markdown' extracts and simplifies. Default: 'auto'."
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 3,
+      "maximum": 60,
+      "description": "Per-request timeout in seconds. Default: 15."
+    },
+    "follow_redirects": {
+      "type": "boolean",
+      "description": "Whether to follow HTTP redirects. Each redirect is security-validated. Default: true."
+    },
+    "max_redirects": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "Maximum number of redirect hops to follow. Default: 5."
+    },
+    "include_raw_html": {
+      "type": "boolean",
+      "description": "Include raw HTML in the response for re-parsing. Default: false."
+    },
+    "respect_robots_txt": {
+      "type": "boolean",
+      "description": "Check robots.txt before fetching. Default: true."
+    },
+    "use_cache": {
+      "type": "boolean",
+      "description": "Use response cache to avoid re-fetching recently visited URLs. Default: true."
+    },
+    "verify_ssl": {
+      "type": "boolean",
+      "description": "Verify SSL/TLS certificates. Default: true. Setting false is blocked unless AI_AGENT_ALLOW_INSECURE_TLS=true is explicitly set for local debugging."
+    }
+  },
+  "additionalProperties": false
+}

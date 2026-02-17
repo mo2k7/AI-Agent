@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "read_text",
+  "title": "read_text",
+  "description": "Read plain text content from a file",
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Path to the file to read"
+    },
+    "byte_range": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "Optional [start, end] byte range"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["path"]
+}

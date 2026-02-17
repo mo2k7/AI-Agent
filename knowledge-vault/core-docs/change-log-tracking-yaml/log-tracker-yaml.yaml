@@ -1,0 +1,66 @@
+
+---
+
+## 5) `04_CHANGELOG_POLICY.md`
+
+```md
+# Change Tracking Policy (Vault Rules)
+
+## Goal
+Track change history in a way that is:
+- readable by humans
+- consistent across files
+- auditable for major edits
+
+This vault uses:
+1) **In-place metadata tables** (overwrite dates for “Last Edited” and “Last Major Edit”)
+2) **Append-only major edit logs** (history you do not erase)
+
+---
+
+## What counts as “Last Edited” vs “Last Major Edit”?
+### Last Edited (overwrite)
+Any edit, including:
+- typo fixes
+- formatting changes
+- small clarifications
+
+### Last Major Edit (overwrite + append log)
+Major means:
+- architecture/behavior changed
+- new module/file added
+- public API changed
+- new dependency added
+- significant bug discovered or resolved
+- security posture changed
+
+---
+
+## Required Fields (Every Doc)
+- Last Edited (YYYY-MM-DD)
+- Last Major Edit (YYYY-MM-DD)
+- Modified By
+- WHY (reason for change)
+- Status
+
+---
+
+## Append-Only Major Edits Log (Never Delete Rows)
+Every major change must add a row.
+Format (everywhere):
+| Date | Modified By | WHY | Summary | Impact |
+|---|---|---|---|---|
+
+---
+
+## Change Categories (Optional but Recommended)
+When summarizing changes, classify them like:
+- Added / Changed / Deprecated / Removed / Fixed / Security
+(These categories are a common, human-readable convention in changelogs.)
+
+---
+
+## Cross-Vault Sync Rule
+Whenever a doc’s “Last Major Edit” changes:
+- Add a row to `01_VAULT_INDEX.md` → “Change History Index”
+- Update that file’s row in “Global File Registry”

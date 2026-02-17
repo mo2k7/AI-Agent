@@ -1,0 +1,30 @@
+{
+  "test_id": "get_metadata_001",
+  "description": "Get file metadata for multiple paths",
+  "mock_gemini_response": {
+    "candidates": [{
+      "content": {
+        "parts": [{
+          "functionCall": {
+            "name": "get_metadata",
+            "args": {
+              "paths": [
+                "/Users/test/Documents/report.pdf",
+                "/Users/test/Desktop/image.png"
+              ]
+            }
+          }
+        }]
+      }
+    }]
+  },
+  "expected_tool_call": {
+    "name": "get_metadata",
+    "arguments": {
+      "paths": [
+        "/Users/test/Documents/report.pdf",
+        "/Users/test/Desktop/image.png"
+      ]
+    }
+  }
+}

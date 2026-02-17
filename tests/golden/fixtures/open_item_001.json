@@ -1,0 +1,24 @@
+{
+  "test_id": "open_item_001",
+  "description": "Open a file with default application",
+  "mock_gemini_response": {
+    "candidates": [{
+      "content": {
+        "parts": [{
+          "functionCall": {
+            "name": "open_item",
+            "args": {
+              "path": "/Users/test/Documents/presentation.pptx"
+            }
+          }
+        }]
+      }
+    }]
+  },
+  "expected_tool_call": {
+    "name": "open_item",
+    "arguments": {
+      "path": "/Users/test/Documents/presentation.pptx"
+    }
+  }
+}

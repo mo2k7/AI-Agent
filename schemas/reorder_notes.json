@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "reorder_notes",
+  "title": "reorder_notes",
+  "description": "Reorder notes in the session's notes panel. Notes are displayed sorted by pinned status then by updated_at descending. This tool updates timestamps to achieve the desired order.",
+  "type": "object",
+  "properties": {
+    "note_ids_in_order": {
+      "type": "array",
+      "description": "Note IDs (or 8-char prefixes) in the desired display order, first = most recent.",
+      "items": { "type": "string" },
+      "minItems": 2,
+      "maxItems": 50
+    }
+  },
+  "additionalProperties": false,
+  "required": ["note_ids_in_order"]
+}

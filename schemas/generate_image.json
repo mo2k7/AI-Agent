@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "generate_image",
+  "title": "generate_image",
+  "description": "Generate one or more images using AI. By default, images are saved to the agent-managed output directory and returned as file paths. Optionally set note_id to embed generated images into a note.",
+  "type": "object",
+  "properties": {
+    "prompt": {
+      "type": "string",
+      "description": "Detailed image description. Include subject, style, composition, lighting, and context.",
+      "minLength": 5,
+      "maxLength": 2000
+    },
+    "alt_text": {
+      "type": "string",
+      "description": "Accessibility description of the generated image(s). Defaults to a prompt-derived summary when omitted.",
+      "maxLength": 500
+    },
+    "output_path": {
+      "type": "string",
+      "description": "Optional absolute or ~-relative output path. When omitted, files are saved under the agent image output root."
+    },
+    "note_id": {
+      "type": "string",
+      "description": "Optional note ID (or 8-char prefix) to embed generated images into an existing note."
+    },
+    "quality_tier": {
+      "type": "string",
+      "description": "Quality/speed profile for model selection.",
+      "enum": ["fast", "standard", "ultra"],
+      "default": "standard"
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "description": "Requested aspect ratio.",
+      "enum": ["1:1", "3:4", "4:3", "9:16", "16:9"],
+      "default": "1:1"
+    },
+    "image_size": {
+      "type": "string",
+      "description": "Requested output size profile.",
+      "enum": ["1K", "2K"],
+      "default": "1K"
+    },
+    "output_mime_type": {
+      "type": "string",
+      "description": "Output format for saved image files.",
+      "enum": ["image/png", "image/jpeg"],
+      "default": "image/png"
+    },
+    "number_of_images": {
+      "type": "integer",
+      "description": "Number of images to generate.",
+      "minimum": 1,
+      "maximum": 4,
+      "default": 1
+    },
+    "enhance_prompt": {
+      "type": "boolean",
+      "description": "Whether prompt enhancement should be enabled.",
+      "default": true
+    },
+    "person_generation": {
+      "type": "string",
+      "description": "Policy for generating people in images.",
+      "enum": ["dont_allow", "allow_adult", "allow_all"],
+      "default": "allow_adult"
+    },
+    "negative_prompt": {
+      "type": "string",
+      "description": "Optional negative prompt to discourage unwanted attributes.",
+      "maxLength": 1000
+    },
+    "seed": {
+      "type": "integer",
+      "description": "Optional seed for reproducibility."
+    }
+  },
+  "additionalProperties": false,
+  "required": ["prompt"]
+}

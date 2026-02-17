@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "open_item",
+  "title": "open_item",
+  "description": "Open a file in the default app, a specific app, or Finder",
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Path to the item to open"
+    },
+    "application": {
+      "type": "string",
+      "description": "Optional application name to open the file with (e.g. 'Finder', 'Preview', 'TextEdit', 'Safari')"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["path"]
+}

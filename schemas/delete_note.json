@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "delete_note",
+  "title": "delete_note",
+  "description": "Delete a note from the session's notes panel. Use the note_id prefix shown in [SESSION_NOTES] context to identify the note.",
+  "type": "object",
+  "properties": {
+    "note_id": {
+      "type": "string",
+      "description": "The note ID or its 8-character prefix from [SESSION_NOTES] context."
+    }
+  },
+  "additionalProperties": false,
+  "required": ["note_id"]
+}

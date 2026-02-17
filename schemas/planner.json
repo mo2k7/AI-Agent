@@ -1,0 +1,59 @@
+{
+  "$id": "planner",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "planner",
+  "description": "Generate or analyze a structured execution plan using secure local planning.",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["create", "replan", "analyze"],
+      "description": "Planner action mode."
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "User goal summary for planning."
+    },
+    "ops": {
+      "type": "array",
+      "description": "Candidate file operations to evaluate/order.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": ["move", "rename", "copy", "delete"]
+          },
+          "src": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Absolute source file or directory path."
+          },
+          "dest": {
+            "type": "string",
+            "description": "Absolute destination path for move, rename, or copy operations."
+          },
+          "overwrite_policy": {
+            "type": "string",
+            "enum": ["fail", "rename", "overwrite"]
+          }
+        },
+        "required": ["op", "src"]
+      }
+    },
+    "prior_plan_id": {
+      "type": "string",
+      "description": "Prior plan to revise when mode is replan."
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Optional planning constraints, interpreted as metadata."
+    }
+  },
+  "required": ["mode", "goal"],
+  "additionalProperties": false
+}
+

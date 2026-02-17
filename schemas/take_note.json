@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "take_note",
+  "title": "take_note",
+  "description": "Save a note for the user in the session's notes panel. Use for summaries, key findings, action items, definitions, formulas, or anything the user wants to reference later. The note will appear in the user's floating notes window. Supports full markdown formatting including headings, tables, code blocks, and blockquotes.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "type": "string",
+      "description": "The note text. Use rich markdown formatting: ## headings, bullet/numbered lists, **bold**, `code`, tables, > blockquotes, and ``` code blocks.",
+      "minLength": 1,
+      "maxLength": 8000
+    },
+    "title": {
+      "type": "string",
+      "description": "Optional short title or heading for the note.",
+      "maxLength": 200
+    },
+    "note_type": {
+      "type": "string",
+      "description": "Optional semantic type for study-oriented notes. Determines the visual badge on the note card.",
+      "enum": ["summary", "key_points", "study_guide", "comparison_table", "timeline", "formula_sheet", "flashcards", "cheat_sheet"]
+    },
+    "tags": {
+      "type": "array",
+      "description": "Optional tags for categorizing the note (e.g. ['physics', 'exam-prep', 'chapter-3']). Tags appear as colored chips and enable filtering.",
+      "items": { "type": "string", "maxLength": 50 },
+      "maxItems": 10
+    }
+  },
+  "additionalProperties": false,
+  "required": ["content"]
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "apply_ops",
+  "title": "apply_ops",
+  "description": "Execute a previously planned operation",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "description": "ID of the plan to execute"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, preview what would happen without actually executing operations"
+    },
+    "stop_on_error": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, stop processing remaining operations after the first failure."
+    },
+    "verify_after": {
+      "type": "boolean",
+      "default": true,
+      "description": "If true, verify each successful operation by checking expected filesystem state."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Optional replay-protection key. Repeated executions with the same key return the first result."
+    }
+  },
+  "additionalProperties": false,
+  "required": ["plan_id"]
+}

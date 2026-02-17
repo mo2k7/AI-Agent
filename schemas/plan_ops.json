@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "plan_ops",
+  "title": "plan_ops",
+  "description": "Propose a set of file modifications (move, rename, copy, delete)",
+  "type": "object",
+  "properties": {
+    "ops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": ["move", "delete", "rename", "copy"]
+          },
+          "src": { "type": "string", "description": "Absolute source file or directory path." },
+          "dest": { "type": "string", "description": "Absolute destination path for move, rename, or copy operations." },
+          "overwrite_policy": {
+            "type": "string",
+            "enum": ["fail", "rename", "overwrite"],
+            "default": "fail",
+            "description": "How to handle destination conflicts for move/rename/copy operations."
+          }
+        },
+        "additionalProperties": false,
+        "required": ["op", "src"],
+        "if": {
+          "properties": { "op": { "const": "delete" } }
+        },
+        "then": {},
+        "else": {
+          "required": ["dest"]
+        }
+      },
+      "minItems": 1,
+      "description": "Array of planned operations"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["ops"]
+}

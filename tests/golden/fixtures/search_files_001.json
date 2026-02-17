@@ -1,0 +1,20 @@
+{
+  "test_id": "search_files_001",
+  "description": "Basic file search query",
+  "mock_gemini_response": {
+    "candidates": [{
+      "content": {
+        "parts": [{
+          "functionCall": {
+            "name": "search_files",
+            "args": {"query": "Python files", "path_filter": "Documents"}
+          }
+        }]
+      }
+    }]
+  },
+  "expected_tool_call": {
+    "name": "search_files",
+    "arguments": {"query": "Python files", "path_filter": "Documents"}
+  }
+}

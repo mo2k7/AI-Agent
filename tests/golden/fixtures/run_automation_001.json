@@ -1,0 +1,30 @@
+{
+  "test_id": "run_automation_001",
+  "description": "Run a Shortcuts automation with inputs",
+  "mock_gemini_response": {
+    "candidates": [{
+      "content": {
+        "parts": [{
+          "functionCall": {
+            "name": "run_automation",
+            "args": {
+              "name": "Resize Images",
+              "inputs": {
+                "path": "/Users/test/Photos/vacation"
+              }
+            }
+          }
+        }]
+      }
+    }]
+  },
+  "expected_tool_call": {
+    "name": "run_automation",
+    "arguments": {
+      "name": "Resize Images",
+      "inputs": {
+        "path": "/Users/test/Photos/vacation"
+      }
+    }
+  }
+}
