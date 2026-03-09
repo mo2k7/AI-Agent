@@ -1,0 +1,27 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "grant_folder_access",
+    "title": "grant_folder_access",
+    "description": "Grant the app access to search files in a folder on the user's iOS device. iOS apps cannot search arbitrary files — the user must explicitly grant access to specific folders. To give the app the widest scope, ask the user to select the root 'iCloud Drive' or 'On My iPhone' folder. Once granted, search_files will automatically include them. You MUST provide a clear 'reason' explaining what you are trying to search for.",
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "add",
+                "list",
+                "clear"
+            ],
+            "default": "add",
+            "description": "The action to perform: add (open folder picker), list (show granted folders), clear (remove all grants)."
+        },
+        "reason": {
+            "type": "string",
+            "description": "A short, user-facing explanation of why you need access to a folder (e.g., 'I need access to your iCloud Drive to search for the PDF you mentioned. Please select the root iCloud Drive folder.'). This will be shown to the user in a confirmation modal."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "action"
+    ]
+}
