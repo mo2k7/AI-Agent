@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  FloatingPanelController.swift
 //  AIAgentUI
@@ -48,6 +49,31 @@ final class FloatingPanelController: NSObject {
     
     private override init() {
         super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersDidChange(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func screenParametersDidChange(_ notification: Notification) {
+        guard let panel else { return }
+        // Update maxSize to the screen the panel currently lives on.
+        if let screenSize = (panel.screen ?? NSScreen.main)?.visibleFrame.size {
+            panel.maxSize = screenSize
+        }
+        // Ensure the panel is still fully visible on the (possibly smaller) screen.
+        guard let screen = (panel.screen ?? NSScreen.main)?.visibleFrame else { return }
+        let constrained = EdgeSnapping.constrainToScreen(frame: panel.frame, screen: screen)
+        if constrained != panel.frame {
+            panel.setFrame(constrained, display: true)
+            positionManager.savePosition(panel)
+        }
     }
     
     // MARK: - Setup
@@ -116,8 +142,9 @@ final class FloatingPanelController: NSObject {
             height: ThemeConstants.panelMinHeight
         )
         // No maxSize — let the window resize freely up to the screen bounds,
-        // matching native macOS app behavior.
-        if let screenSize = NSScreen.main?.visibleFrame.size {
+        // matching native macOS app behavior.  Use the screen the panel is on
+        // (falls back to main screen) so multi-monitor setups work correctly.
+        if let screenSize = (panel.screen ?? NSScreen.main)?.visibleFrame.size {
             panel.maxSize = screenSize
         }
         
@@ -130,7 +157,7 @@ final class FloatingPanelController: NSObject {
     /// Positions the panel at its default or last known position
     private func positionPanel() {
         guard let panel = panel else { return }
-        guard let screen = NSScreen.main?.visibleFrame else { return }
+        guard let screen = (panel.screen ?? NSScreen.main)?.visibleFrame else { return }
 
         if positionManager.restorePosition(panel) {
             return
@@ -396,3 +423,4 @@ private extension FloatingPanelController {
         DispatchQueue.main.asyncAfter(deadline: .now() + dragEndDelay, execute: workItem)
     }
 }
+#endif

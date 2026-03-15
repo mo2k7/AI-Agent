@@ -20,29 +20,28 @@ def test_sanitize_text_redacts_paths_and_sensitive_tokens() -> None:
     assert "[url]" in lowered
 
 
-def test_classify_returns_unavailable_when_model_not_loaded(monkeypatch) -> None:
+def test_classify_accepts_structured_clarification_reply() -> None:
     classifier = PlanClarificationIntentClassifier()
-    monkeypatch.setattr(classifier, "_ensure_model_loaded", lambda: None)
     result = classifier.classify(
         reply_prompt="6 weeks, beginner baseline, weekends only",
         root_prompt="Create a study plan for machine learning",
         pending_dimension="timeframe",
         question_count=2,
     )
-    assert result.source == "unavailable"
-    assert result.is_clarification_reply is False
-    assert result.confidence == 0.0
+    assert result.source == "builtin"
+    assert result.model_name == "builtin"
+    assert result.is_clarification_reply is True
+    assert result.confidence >= 0.36
 
 
-def test_classify_rejects_unrelated_task_when_model_not_loaded(monkeypatch) -> None:
+def test_classify_rejects_unrelated_task() -> None:
     classifier = PlanClarificationIntentClassifier()
-    monkeypatch.setattr(classifier, "_ensure_model_loaded", lambda: None)
     result = classifier.classify(
         reply_prompt="Write a short poem about winter clouds.",
         root_prompt="Create a study plan for machine learning",
         pending_dimension="constraints",
         question_count=2,
     )
-    assert result.source == "unavailable"
+    assert result.source == "builtin"
     assert result.is_clarification_reply is False
-    assert result.confidence == 0.0
+    assert result.confidence < 0.36

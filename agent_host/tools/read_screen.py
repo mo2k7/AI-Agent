@@ -21,6 +21,16 @@ async def handle(
     Returns ``(execution_dict, screen_image_bytes)`` where the image bytes
     may be ``None`` when the capture failed or did not include image data.
     """
+    capabilities = ctx.client_capabilities(ctx.client_address)
+    if "screen_capture" not in capabilities:
+        return {
+            "ok": False,
+            "output": (
+                "Screen capture is unavailable for this connected device. "
+                "The active client did not register the screen_capture capability."
+            ),
+        }, None
+
     capture_future: asyncio.Future[dict | None] = (
         asyncio.get_running_loop().create_future()
     )
@@ -30,6 +40,7 @@ async def handle(
     )
 
     await ctx.send_status(ctx.request_id)
+    await ctx.send_capture_request(ctx.request_id)
 
     _SCREEN_CAPTURE_TIMEOUT = object()
     try:

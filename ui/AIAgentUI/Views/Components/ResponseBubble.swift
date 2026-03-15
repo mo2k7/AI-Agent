@@ -8,66 +8,28 @@
 
 import SwiftUI
 
-@MainActor
-private final class ResponseInlineMarkdownCache {
-    static let shared = ResponseInlineMarkdownCache()
-
-    private let maxEntries = 256
-    private let maxCachedSourceLength = 480
-    private var storage: [String: AttributedString] = [:]
-    private var insertionOrder: [String] = []
-
-    private init() {}
-
-    func value(for source: String, builder: () -> AttributedString) -> AttributedString {
-        if source.count > maxCachedSourceLength {
-            return builder()
-        }
-        if let cached = storage[source] {
-            return cached
-        }
-        let rendered = builder()
-        if insertionOrder.count >= maxEntries, let evictedKey = insertionOrder.first {
-            insertionOrder.removeFirst()
-            storage.removeValue(forKey: evictedKey)
-        }
-        insertionOrder.append(source)
-        storage[source] = rendered
-        return rendered
-    }
-}
-
-private struct PlanClarificationOption: Identifiable {
-    let id: String
-    let key: String
-    let text: String
-}
-
-private struct PlanClarificationQuestion: Identifiable {
-    let id: Int
-    let number: Int
-    let prompt: String
-    let options: [PlanClarificationOption]
-}
-
-private struct PlanClarificationPayload {
-    let intro: String
-    let questions: [PlanClarificationQuestion]
-}
+// Extracted to ResponseMarkdownRenderEngine.swift and PlanClarificationModels.swift
 
 /// Displays a message bubble with style-aware markdown rendering and streaming animations.
 struct ResponseBubble: View {
 
     // MARK: - Properties
 
-    /// The message to display
-    let message: Message
+    @ObservedObject var row: MessageRowModel
 
     /// Whether to animate the text (for streaming)
     var animate: Bool = false
+    var isLatestStreamingRow: Bool = false
+    var liveStatus: AgentStatus? = nil
+    var liveStatusDetail: String? = nil
+    var activeToolCall: ToolCall? = nil
+    var browseNotice: BrowsePolicyNotice? = nil
+    var isCancellationInFlight: Bool = false
 
-    @ObservedObject private var appState = AppState.shared
     @AppStorage("animationsEnabled") private var animationsEnabled = true
+    @AppStorage("responsePresentationStyle") private var responsePresentationStyleRaw = ResponsePresentationStyle.readablePro.rawValue
+    @AppStorage("readableProHighContrastEnabled") private var readableProHighContrastEnabled = true
+    @AppStorage("streamingAnimationStyle") private var streamingAnimationStyleRaw = StreamingAnimationStyle.waveReveal.rawValue
     @Environment(\.colorScheme) private var colorScheme
 
     // MARK: - State
@@ -94,70 +56,49 @@ struct ResponseBubble: View {
     @State private var auroraDoneOpacity: CGFloat = 0
     @State private var clarificationSelections: [Int: String] = [:]
     @State private var clarificationCustomResponse: String = ""
+    @State private var parseTask: Task<Void, Never>?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var message: Message {
+        row.snapshot()
+    }
+
+    private var responsePresentationStyle: ResponsePresentationStyle {
+        ResponsePresentationStyle(rawValue: responsePresentationStyleRaw) ?? .readablePro
+    }
+
+    private var streamingAnimationStyle: StreamingAnimationStyle {
+        StreamingAnimationStyle(rawValue: streamingAnimationStyleRaw) ?? .waveReveal
+    }
 
     // MARK: - Body
 
     var body: some View {
-        HStack(alignment: .top, spacing: ThemeConstants.spacingS) {
-            roleIcon
-
-            VStack(alignment: .leading, spacing: ThemeConstants.spacingXS) {
-                HStack(spacing: 6) {
-                    Text(roleLabel)
-                        .font(.caption)
-                        .foregroundColor(metaTextColor)
-
-                    if message.role == .assistant && message.isStreaming {
-                        BubbleThinkingIndicator(
-                            status: appState.status,
-                            statusDetail: appState.statusDetail,
-                            activeToolCall: appState.currentToolCall
-                        )
-                    }
-                }
-
-                messageContent
-
-                if let toolCall = message.toolCall {
-                    ToolCallCard(toolCall: toolCall)
-                        .padding(.top, ThemeConstants.spacingXS)
-                }
-
-                Text(formattedTimestamp)
-                    .font(.caption2)
-                    .foregroundColor(metaTextColor.opacity(0.92))
+        // Chat-app style: user right-aligned, assistant left-aligned with accent bar
+        HStack(alignment: .top, spacing: 0) {
+            if message.role == .user {
+                Spacer(minLength: 40)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(ThemeConstants.spacingM)
-        .background(bubbleBackground)
-        .overlay(
-            RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
-                .stroke(bubbleBorderColor, lineWidth: bubbleBorderWidth)
-        )
-        // Aurora rim overlay — only for wave-reveal on assistant streaming bubbles
-        .overlay {
-            if message.role == .assistant && effectiveStreamingStyle == .waveReveal
-                && (message.isStreaming || auroraPhase == .done) {
-                AuroraRimOverlay(
-                    velocity: streamVelocity,
-                    phase: auroraPhase,
-                    doneOpacity: auroraDoneOpacity,
-                    reduceMotion: reduceMotion,
-                    cornerRadius: ThemeConstants.cornerRadiusMedium
-                )
-                .allowsHitTesting(false)
+
+            if message.role == .assistant {
+                // Left accent bar for assistant messages
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(assistantAccentBarColor)
+                    .frame(width: 3)
+                    .padding(.vertical, 4)
+                    .padding(.trailing, ThemeConstants.spacingS)
+            }
+
+            bubbleColumn
+
+            if message.role == .assistant {
+                Spacer(minLength: 0)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium))
-        .shadow(
-            color: bubbleShadowColor,
-            radius: bubbleShadowRadius,
-            x: 0,
-            y: bubbleShadowRadius > 0 ? 4 : 0
-        )
+        .padding(.horizontal, ThemeConstants.spacingM)
+        .padding(.vertical, ThemeConstants.spacingS)
+        .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(roleLabel): \(message.content)")
         .accessibilityHint(message.isStreaming ? Text("Message is still loading") : Text(""))
@@ -168,21 +109,21 @@ struct ResponseBubble: View {
                 updateDisplayedText(message.content)
             }
         }
-        .onChange(of: message.content) { _, newValue in
+        .onChange(of: row.content) { _, newValue in
             if message.isStreaming {
                 animateTyping(to: newValue)
             } else {
                 updateDisplayedText(newValue)
             }
         }
-        .onChange(of: message.isStreaming) { _, isStreaming in
+        .onChange(of: row.isStreaming) { _, isStreaming in
             if !isStreaming {
                 // Reset clarification selections when streaming finishes with new content
                 clarificationSelections.removeAll()
                 clarificationCustomResponse = ""
                 updateDisplayedText(message.content)
                 // Wave-reveal: transition aurora to .done → fade out
-                if effectiveStreamingStyle == .waveReveal {
+                if effectiveStreamingStyle == .waveReveal && !guardedStreamingEffects {
                     auroraPhase = .done
                     withAnimation(.easeOut(duration: 0.8)) {
                         auroraDoneOpacity = 0
@@ -199,25 +140,169 @@ struct ResponseBubble: View {
                 }
             }
         }
-        .onChange(of: appState.responsePresentationStyle) { _, _ in
-            // Re-parse to apply style updates instantly across existing content.
-            parsedBlocks = NoteMarkdownParser.parse(displayedText)
+        .onChange(of: responsePresentationStyle) { _, _ in
+            scheduleMarkdownParse(for: displayedText)
         }
+        .onDisappear {
+            parseTask?.cancel()
+            parseTask = nil
+        }
+    }
+
+    private var bubbleColumn: some View {
+        VStack(alignment: message.role == .user ? .trailing : .leading, spacing: ThemeConstants.spacingXS) {
+            if message.role == .assistant {
+                HStack(spacing: 6) {
+                    roleIcon
+
+                    Text(roleLabel)
+                        .font(.caption)
+                        .foregroundColor(metaTextColor)
+
+                    if isActiveStreamingRow {
+                        BubbleThinkingIndicator(
+                            status: liveStatus ?? .thinking,
+                            statusDetail: liveStatusDetail ?? "",
+                            activeToolCall: activeToolCall,
+                            browseNotice: browseNotice,
+                            guarded: guardedStreamingEffects,
+                            canCancel: (liveStatus ?? .idle).isBusy,
+                            isCancelling: isCancellationInFlight,
+                            onCancel: {
+                                Task { @MainActor in
+                                    await AppState.shared.cancel()
+                                }
+                            }
+                        )
+                    }
+                }
+            } else {
+                userRolePill
+            }
+
+            userScopedBubbleShell
+
+            timestampLabel
+        }
+        .frame(
+            maxWidth: message.role == .user ? 560 : .infinity,
+            alignment: message.role == .user ? .trailing : .leading
+        )
+    }
+
+    @ViewBuilder
+    private var userScopedBubbleShell: some View {
+        if message.role == .user {
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                bubbleShell
+                    .frame(maxWidth: userBubbleMaxWidth, alignment: .trailing)
+            }
+        } else {
+            bubbleShell
+        }
+    }
+
+    private var userRolePill: some View {
+        Text("You")
+            .font(.caption.weight(.semibold))
+            .foregroundColor(Color.primaryBlue.opacity(0.92))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(Color.primaryBlue.opacity(0.11))
+            )
+    }
+
+    private var timestampLabel: some View {
+        Text(formattedTimestamp)
+            .font(.caption2)
+            .foregroundColor(metaTextColor.opacity(0.92))
+            .frame(
+                maxWidth: message.role == .user ? userBubbleMaxWidth : .infinity,
+                alignment: message.role == .user ? .trailing : .leading
+            )
+    }
+
+    private var bubbleShell: some View {
+        messageContent
+            .padding(ThemeConstants.spacingM)
+            .background(bubbleBackground)
+            .overlay(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: ThemeConstants.cornerRadiusMedium,
+                    bottomLeadingRadius: ThemeConstants.cornerRadiusMedium,
+                    bottomTrailingRadius: message.role == .user ? 4 : ThemeConstants.cornerRadiusMedium,
+                    topTrailingRadius: ThemeConstants.cornerRadiusMedium
+                )
+                    .stroke(bubbleBorderColor, lineWidth: bubbleBorderWidth)
+            )
+            .overlay {
+                if isActiveStreamingRow && effectiveStreamingStyle == .waveReveal && !guardedStreamingEffects
+                    && (message.isStreaming || auroraPhase == .done) {
+                    AuroraRimOverlay(
+                        velocity: streamVelocity,
+                        phase: auroraPhase,
+                        doneOpacity: auroraDoneOpacity,
+                        reduceMotion: reduceMotion,
+                        cornerRadius: ThemeConstants.cornerRadiusMedium
+                    )
+                    .allowsHitTesting(false)
+                }
+            }
+            .clipShape(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: ThemeConstants.cornerRadiusMedium,
+                    bottomLeadingRadius: ThemeConstants.cornerRadiusMedium,
+                    bottomTrailingRadius: message.role == .user ? 4 : ThemeConstants.cornerRadiusMedium,
+                    topTrailingRadius: ThemeConstants.cornerRadiusMedium
+                )
+            )
+            .shadow(
+                color: bubbleShadowColor,
+                radius: bubbleShadowRadius,
+                x: 0,
+                y: bubbleShadowRadius > 0 ? 4 : 0
+            )
+    }
+
+    // MARK: - Assistant Accent Bar Color
+
+    private var assistantAccentBarColor: Color {
+        if isActiveStreamingRow {
+            switch liveStatus ?? .thinking {
+            case .streaming:
+                return .statusStreaming
+            case .callingTool, .executingPlan, .awaitingApproval, .capturingScreen:
+                return .statusToolCall
+            case .thinking, .planning:
+                return .statusThinking
+            default:
+                return .secondaryBlue.opacity(0.4)
+            }
+        }
+        return .secondaryBlue.opacity(0.4)
     }
 
     // MARK: - Subviews
 
+    @ViewBuilder
     private var roleIcon: some View {
-        Image(systemName: message.role == .user ? "person.fill" : "brain")
-            .font(.system(size: 16))
-            .foregroundColor(message.role == .user ? .primaryBlue : .secondaryBlue)
-            .frame(width: 28, height: 28)
+        // Only shown for assistant messages — user messages are identified by position
+        Image(systemName: "brain")
+            .font(.system(size: 14))
+            .foregroundColor(.secondaryBlue)
+            .frame(width: 24, height: 24)
             .background(
                 Circle()
                     .fill(
-                        message.role == .user
-                            ? Color.primaryBlue.opacity(0.1)
-                            : Color.secondaryBlue.opacity(0.1)
+                        RadialGradient(
+                            colors: [Color.secondaryBlue.opacity(0.15), Color.secondaryBlue.opacity(0.05)],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 16
+                        )
                     )
             )
     }
@@ -226,23 +311,31 @@ struct ResponseBubble: View {
     private var messageContent: some View {
         if let clarificationPayload = planClarificationPayload {
             planClarificationView(payload: clarificationPayload)
-        } else if displayedText.isEmpty && message.isStreaming {
+        } else if displayedText.isEmpty && isActiveStreamingRow {
             VStack(alignment: .leading, spacing: ThemeConstants.spacingS) {
-                LoadingShimmer()
-                    .padding(.vertical, 2)
-                liveToolCallDuringStreaming
+                StreamingPlaceholderCard(
+                    title: streamingStatusTitle,
+                    detail: streamingStatusSubtitle,
+                    activeToolCall: activeToolCall,
+                    guarded: guardedStreamingEffects
+                )
             }
         } else {
             VStack(alignment: .leading, spacing: blockSpacing) {
                 // Text content — rendered fully, masked by reveal animation
                 // when wave-reveal is active during streaming.
                 textBlocks
-                    .background(textHeightReader)
+                    .background {
+                        if !showPlainTextStreamingContent {
+                            textHeightReader
+                        }
+                    }
                     .modifier(
                         WaveRevealMaskModifier(
-                            isActive: message.isStreaming
+                            isActive: isActiveStreamingRow
                                 && effectiveStreamingStyle == .waveReveal
-                                && !reduceMotion,
+                                && !reduceMotion
+                                && !guardedStreamingEffects,
                             maskHeight: revealMaskHeight,
                             featherSize: 22
                         )
@@ -251,12 +344,15 @@ struct ResponseBubble: View {
                     .transaction { txn in txn.animation = nil }
 
                 // Bottom streaming indicator — only for non-waveReveal styles
-                if message.isStreaming && effectiveStreamingStyle != .waveReveal {
+                if isActiveStreamingRow && (effectiveStreamingStyle != .waveReveal || guardedStreamingEffects) {
                     streamingFeedback
                         .padding(.top, 4)
                 }
 
-                liveToolCallDuringStreaming
+                if message.role == .assistant, let inlineToolCall = message.toolCall {
+                    InlineToolCallChip(toolCall: inlineToolCall)
+                        .padding(.top, 6)
+                }
             }
             .frame(maxWidth: messageContentMaxWidth, alignment: .leading)
             .textSelection(.enabled)
@@ -292,9 +388,9 @@ struct ResponseBubble: View {
                             if question.number == finalQuestionNumber
                                 && hasCompletedAllSelections
                                 && !hadSelection
-                                && appState.status.canSubmit {
+                                && (liveStatus ?? .idle).canSubmit {
                                 Task {
-                                    await appState.submitPlanClarificationResponse(
+                                    await AppState.shared.submitPlanClarificationResponse(
                                         composeClarificationAnswer(payload)
                                     )
                                 }
@@ -331,23 +427,23 @@ struct ResponseBubble: View {
             HStack(spacing: ThemeConstants.spacingS) {
                 Button("Send Answers") {
                     Task {
-                        await appState.submitPlanClarificationResponse(composeClarificationAnswer(payload))
+                        await AppState.shared.submitPlanClarificationResponse(composeClarificationAnswer(payload))
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(clarificationSelections.count < payload.questions.count || appState.status.isBusy)
+                .disabled(clarificationSelections.count < payload.questions.count || (liveStatus ?? .idle).isBusy)
 
                 Button("Send Custom") {
                     let custom = clarificationCustomResponse.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !custom.isEmpty else { return }
                     Task {
-                        await appState.submitPlanClarificationResponse(custom)
+                        await AppState.shared.submitPlanClarificationResponse(custom)
                     }
                 }
                 .buttonStyle(.bordered)
                 .disabled(
                     clarificationCustomResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || appState.status.isBusy
+                        || (liveStatus ?? .idle).isBusy
                 )
             }
         }
@@ -374,27 +470,15 @@ struct ResponseBubble: View {
         return "\(selectedSummary)\nNotes: \(custom)"
     }
 
-    @ViewBuilder
-    private var liveToolCallDuringStreaming: some View {
-        if message.role == .assistant,
-           message.isStreaming,
-           let activeToolCall = appState.currentToolCall {
-            ActiveToolCallView(
-                toolCall: activeToolCall,
-                isExpanded: $appState.isToolCallExpanded
-            )
-            .padding(.top, ThemeConstants.spacingXS)
-        }
-    }
-
     /// The rendered text blocks, extracted so the reveal mask can wrap them.
     @ViewBuilder
     private var textBlocks: some View {
-        if parsedBlocks.isEmpty {
+        if showPlainTextStreamingContent || parsedBlocks.isEmpty {
             Text(displayedText)
                 .font(paragraphFont)
                 .foregroundColor(primaryTextColor)
                 .lineSpacing(paragraphLineSpacing)
+                .fixedSize(horizontal: false, vertical: true)
         } else {
             VStack(alignment: .leading, spacing: blockSpacing) {
                 ForEach(Array(parsedBlocks.enumerated()), id: \.element.id) { index, block in
@@ -417,7 +501,7 @@ struct ResponseBubble: View {
         }
         .onPreferenceChange(TextHeightPreferenceKey.self) { newHeight in
             fullTextHeight = newHeight
-            if message.isStreaming && effectiveStreamingStyle == .waveReveal {
+            if isActiveStreamingRow && effectiveStreamingStyle == .waveReveal && !guardedStreamingEffects {
                 animateRevealMask(to: newHeight)
             } else {
                 // Not streaming — show everything instantly
@@ -435,7 +519,7 @@ struct ResponseBubble: View {
         switch block.kind {
         case .heading(let level, let text):
             HStack(alignment: .center, spacing: ThemeConstants.spacingS) {
-                if appState.responsePresentationStyle != .denseTechnical {
+                if responsePresentationStyle != .denseTechnical {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(Color.secondaryBlue.opacity(0.65))
                         .frame(width: 3, height: headingAccentHeight(level: level))
@@ -448,25 +532,11 @@ struct ResponseBubble: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         case .paragraph(let text):
-            Text(inlineMarkdown(text))
-                .font(isLeadParagraph ? leadParagraphFont : paragraphFont)
-                .foregroundColor(primaryTextColor)
-                .lineSpacing(isLeadParagraph ? leadParagraphLineSpacing : paragraphLineSpacing)
-                .lineLimit(nil)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(isLeadParagraph ? EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12) : EdgeInsets())
-                .background(
-                    Group {
-                        if isLeadParagraph {
-                            RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
-                                .fill(leadParagraphBackground)
-                        }
-                    }
-                )
+            paragraphView(text, isLeadParagraph: isLeadParagraph)
         case .bullet(let items):
             VStack(alignment: .leading, spacing: bulletItemSpacing) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    if appState.responsePresentationStyle == .readablePro {
+                    if responsePresentationStyle == .readablePro {
                         HStack(alignment: .top, spacing: 10) {
                             Circle()
                                 .fill(Color.secondaryBlue.opacity(0.95))
@@ -506,7 +576,7 @@ struct ResponseBubble: View {
         case .numbered(let items):
             VStack(alignment: .leading, spacing: bulletItemSpacing) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                    if appState.responsePresentationStyle == .readablePro {
+                    if responsePresentationStyle == .readablePro {
                         HStack(alignment: .top, spacing: 10) {
                             Text("\(index + 1).")
                                 .font(.system(.body, design: .rounded))
@@ -625,13 +695,31 @@ struct ResponseBubble: View {
     @ViewBuilder
     private var streamingFeedback: some View {
         ZStack(alignment: .leading) {
-            switch effectiveStreamingStyle {
-            case .waveReveal:
-                EmptyView() // handled by aurora rim overlay + reveal mask
-            case .typewriterLuxe:
-                LuxeStreamingIndicator(eventToken: luxeEventToken)
-            case .minimalMotion:
-                MinimalStreamingIndicator()
+            if guardedStreamingEffects {
+                StreamingStatusFooter(
+                    title: streamingStatusTitle,
+                    detail: guardedStreamingEffects ? "Stable update mode for long output" : streamingStatusSubtitle,
+                    guarded: true,
+                    velocity: streamVelocity
+                )
+            } else {
+                switch effectiveStreamingStyle {
+                case .waveReveal:
+                    EmptyView() // handled by aurora rim overlay + reveal mask
+                case .typewriterLuxe:
+                    LuxeStreamingIndicator(
+                        eventToken: luxeEventToken,
+                        title: streamingStatusTitle,
+                        detail: streamingStatusSubtitle
+                    )
+                case .minimalMotion:
+                    StreamingStatusFooter(
+                        title: streamingStatusTitle,
+                        detail: streamingStatusSubtitle,
+                        guarded: false,
+                        velocity: streamVelocity
+                    )
+                }
             }
         }
         // Keep a stable row height while switching animation modes so the
@@ -651,9 +739,16 @@ struct ResponseBubble: View {
     private var bubbleBackground: some View {
         Group {
             if message.role == .user {
-                Color.primaryBlue.opacity(0.1)
+                LinearGradient(
+                    colors: [
+                        Color.primaryBlue.opacity(0.16),
+                        Color.primaryBlue.opacity(0.11),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
             } else {
-                switch appState.responsePresentationStyle {
+                switch responsePresentationStyle {
                 case .readablePro:
                     Group {
                         if readableProHighContrastActive {
@@ -683,11 +778,56 @@ struct ResponseBubble: View {
         }
     }
 
+    @ViewBuilder
+    private func paragraphView(_ text: String, isLeadParagraph: Bool) -> some View {
+        if isCautionParagraph(text) {
+            cautionParagraphView(text, isLeadParagraph: isLeadParagraph)
+        } else {
+            standardParagraphView(text, isLeadParagraph: isLeadParagraph)
+        }
+    }
+
+    private func standardParagraphView(_ text: String, isLeadParagraph: Bool) -> some View {
+        Text(inlineMarkdown(text))
+            .font(isLeadParagraph ? leadParagraphFont : paragraphFont)
+            .foregroundColor(primaryTextColor)
+            .lineSpacing(isLeadParagraph ? leadParagraphLineSpacing : paragraphLineSpacing)
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(isLeadParagraph ? EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12) : EdgeInsets())
+            .background(
+                Group {
+                    if isLeadParagraph {
+                        RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
+                            .fill(leadParagraphBackground)
+                    }
+                }
+            )
+    }
+
+    private func cautionParagraphView(_ text: String, isLeadParagraph: Bool) -> some View {
+        Text(inlineMarkdown(text))
+            .font(isLeadParagraph ? leadParagraphFont : paragraphFont)
+            .foregroundColor(cautionTextColor)
+            .lineSpacing(isLeadParagraph ? leadParagraphLineSpacing : paragraphLineSpacing)
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(cautionParagraphPadding(isLeadParagraph: isLeadParagraph))
+            .background(
+                RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
+                    .fill(cautionParagraphBackground)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
+                    .stroke(cautionParagraphBorder, lineWidth: 1)
+            )
+    }
+
     private var bubbleBorderColor: Color {
         if message.role == .user {
-            return Color.primaryBlue.opacity(0.12)
+            return Color.primaryBlue.opacity(0.18)
         }
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             if readableProHighContrastActive {
                 return colorScheme == .dark
@@ -704,12 +844,12 @@ struct ResponseBubble: View {
 
     private var bubbleBorderWidth: CGFloat {
         if message.role == .user { return 0.8 }
-        return appState.responsePresentationStyle == .glassEditorial ? 1.05 : 0.85
+        return responsePresentationStyle == .glassEditorial ? 1.05 : 0.85
     }
 
     private var bubbleShadowColor: Color {
         guard message.role == .assistant else { return .clear }
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             if readableProHighContrastActive {
                 return colorScheme == .dark ? .black.opacity(0.22) : .black.opacity(0.08)
@@ -724,7 +864,7 @@ struct ResponseBubble: View {
 
     private var bubbleShadowRadius: CGFloat {
         guard message.role == .assistant else { return 0 }
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return readableProHighContrastActive ? 6 : 4
         case .glassEditorial:
@@ -736,7 +876,7 @@ struct ResponseBubble: View {
 
     private var codeBackground: some View {
         Group {
-            switch appState.responsePresentationStyle {
+            switch responsePresentationStyle {
             case .readablePro:
                 Color.inputBackground.opacity(0.72)
             case .glassEditorial:
@@ -755,7 +895,7 @@ struct ResponseBubble: View {
     }
 
     private var leadParagraphBackground: some ShapeStyle {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             if readableProHighContrastActive {
                 return AnyShapeStyle(
@@ -781,8 +921,43 @@ struct ResponseBubble: View {
         }
     }
 
+    private var cautionParagraphBackground: some ShapeStyle {
+        switch responsePresentationStyle {
+        case .readablePro:
+            return AnyShapeStyle(
+                colorScheme == .dark
+                    ? Color.warning.opacity(0.16)
+                    : Color.warning.opacity(0.10)
+            )
+        case .glassEditorial:
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [
+                        Color.warning.opacity(0.16),
+                        Color.warning.opacity(0.08),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+        case .denseTechnical:
+            return AnyShapeStyle(Color.warning.opacity(0.08))
+        }
+    }
+
+    private var cautionParagraphBorder: Color {
+        switch responsePresentationStyle {
+        case .readablePro:
+            return Color.warning.opacity(colorScheme == .dark ? 0.34 : 0.26)
+        case .glassEditorial:
+            return Color.warning.opacity(0.28)
+        case .denseTechnical:
+            return Color.warning.opacity(0.22)
+        }
+    }
+
     private var listRowBackground: Color {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return Color.secondaryBlue.opacity(0.09)
         case .glassEditorial:
@@ -795,7 +970,7 @@ struct ResponseBubble: View {
     // MARK: - Typographic Tokens
 
     private var blockSpacing: CGFloat {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return 13
         case .glassEditorial:
@@ -806,7 +981,7 @@ struct ResponseBubble: View {
     }
 
     private var bulletItemSpacing: CGFloat {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return 8
         case .glassEditorial:
@@ -817,7 +992,7 @@ struct ResponseBubble: View {
     }
 
     private var paragraphLineSpacing: CGFloat {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return 6
         case .glassEditorial:
@@ -828,7 +1003,7 @@ struct ResponseBubble: View {
     }
 
     private var leadParagraphLineSpacing: CGFloat {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return 5
         case .glassEditorial:
@@ -839,7 +1014,7 @@ struct ResponseBubble: View {
     }
 
     private var paragraphFont: Font {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return .system(.body, design: .rounded)
         case .glassEditorial:
@@ -850,7 +1025,7 @@ struct ResponseBubble: View {
     }
 
     private var leadParagraphFont: Font {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .readablePro:
             return .system(.title3, design: .rounded).weight(.semibold)
         case .glassEditorial:
@@ -861,7 +1036,7 @@ struct ResponseBubble: View {
     }
 
     private var numberBadgeFont: Font {
-        switch appState.responsePresentationStyle {
+        switch responsePresentationStyle {
         case .denseTechnical:
             return .system(.callout, design: .monospaced)
         default:
@@ -873,7 +1048,7 @@ struct ResponseBubble: View {
         let normalized = max(1, min(level, 3))
         switch normalized {
         case 1:
-            return appState.responsePresentationStyle == .denseTechnical ? .headline : .title3
+            return responsePresentationStyle == .denseTechnical ? .headline : .title3
         case 2:
             return .headline
         default:
@@ -908,15 +1083,18 @@ struct ResponseBubble: View {
 
     private var effectiveStreamingStyle: StreamingAnimationStyle {
         guard animationsEnabled else { return .minimalMotion }
-        return appState.streamingAnimationStyle
+        return streamingAnimationStyle
     }
 
     private var streamingIndicatorHeight: CGFloat {
-        24
+        38
     }
 
     private var messageContentMaxWidth: CGFloat? {
-        switch appState.responsePresentationStyle {
+        if message.role == .user {
+            return userBubbleContentMaxWidth
+        }
+        switch responsePresentationStyle {
         case .readablePro:
             return 760
         case .glassEditorial, .denseTechnical:
@@ -924,11 +1102,30 @@ struct ResponseBubble: View {
         }
     }
 
+    private var userBubbleMaxWidth: CGFloat {
+        540
+    }
+
+    private var userBubbleContentMaxWidth: CGFloat {
+        500
+    }
+
     private var primaryTextColor: Color {
         if readableProHighContrastActive {
             return colorScheme == .dark ? Color.white.opacity(0.98) : Color.black.opacity(0.92)
         }
         return .textPrimary
+    }
+
+    private var cautionTextColor: Color {
+        switch responsePresentationStyle {
+        case .readablePro:
+            return colorScheme == .dark ? Color.warning.opacity(0.96) : Color.warning.opacity(0.92)
+        case .glassEditorial:
+            return colorScheme == .dark ? Color.warning.opacity(0.94) : Color.warning.opacity(0.88)
+        case .denseTechnical:
+            return colorScheme == .dark ? Color.warning.opacity(0.90) : Color.warning.opacity(0.82)
+        }
     }
 
     private var secondaryTextColor: Color {
@@ -946,8 +1143,65 @@ struct ResponseBubble: View {
     }
 
     private var readableProHighContrastActive: Bool {
-        appState.responsePresentationStyle == .readablePro
-            && appState.readableProHighContrastEnabled
+        responsePresentationStyle == .readablePro
+            && readableProHighContrastEnabled
+    }
+
+    private var isActiveStreamingRow: Bool {
+        message.role == .assistant
+            && message.isStreaming
+            && isLatestStreamingRow
+    }
+
+    private var guardedStreamingEffects: Bool {
+        guard isActiveStreamingRow else { return false }
+        return message.content.count > 8_000
+            || streamVelocity > 0.72
+            || isCancellationInFlight
+    }
+
+    private var showPlainTextStreamingContent: Bool {
+        isActiveStreamingRow && message.isStreaming
+    }
+
+    private var streamingStatusTitle: String {
+        switch liveStatus ?? .thinking {
+        case .thinking:
+            return "Thinking"
+        case .planning:
+            return "Planning"
+        case .awaitingApproval:
+            return "Awaiting approval"
+        case .executingPlan:
+            return "Executing plan"
+        case .streaming:
+            return "Generating"
+        case .callingTool:
+            return "Using tool"
+        case .capturingScreen:
+            return "Capturing screen"
+        case .planReady:
+            return "Plan ready"
+        case .complete:
+            return "Finishing"
+        case .error:
+            return "Recovering"
+        case .idle:
+            return "Preparing"
+        case .connecting:
+            return "Connecting"
+        }
+    }
+
+    private var streamingStatusSubtitle: String {
+        let trimmed = (liveStatusDetail ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        if let activeToolCall = activeToolCall {
+            return "Working with \(activeToolCall.name)"
+        }
+        return "Building the response"
     }
 
     private var planClarificationPayload: PlanClarificationPayload? {
@@ -970,16 +1224,14 @@ struct ResponseBubble: View {
     private func updateDisplayedText(_ text: String) {
         let previousCount = displayedText.count
 
-        // Wrap the text/block mutation in a non-animated transaction to
-        // prevent SwiftUI from implicitly animating layout changes.
         var txn = Transaction()
         txn.animation = nil
         withTransaction(txn) {
             displayedText = text
-            parsedBlocks = NoteMarkdownParser.parse(text)
         }
+        scheduleMarkdownParse(for: text)
 
-        if message.isStreaming && text.count > previousCount {
+        if isActiveStreamingRow && text.count > previousCount {
             let charDelta = text.count - previousCount
             let now = Date().timeIntervalSinceReferenceDate
 
@@ -1019,7 +1271,32 @@ struct ResponseBubble: View {
                 auroraDoneOpacity = 1.0
             }
 
-            triggerStreamingFeedback()
+            if !guardedStreamingEffects {
+                triggerStreamingFeedback()
+            }
+        }
+    }
+
+    private func scheduleMarkdownParse(for text: String) {
+        parseTask?.cancel()
+        if isActiveStreamingRow && message.isStreaming {
+            parsedBlocks = []
+            parseTask = nil
+            return
+        }
+        let style = responsePresentationStyle
+        parseTask = Task {
+            let blocks = await ResponseMarkdownRenderEngine.shared.parse(text: text, style: style)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard displayedText == text else { return }
+                var txn = Transaction()
+                txn.animation = nil
+                withTransaction(txn) {
+                    parsedBlocks = blocks
+                }
+                parseTask = nil
+            }
         }
     }
 
@@ -1036,6 +1313,7 @@ struct ResponseBubble: View {
     }
 
     private func triggerStreamingFeedback() {
+        guard !guardedStreamingEffects else { return }
         switch effectiveStreamingStyle {
         case .waveReveal:
             break // velocity + chunkEvent drive aurora rim + mask
@@ -1061,6 +1339,25 @@ struct ResponseBubble: View {
             return text.count <= 320
         }
         return false
+    }
+
+    private func isCautionParagraph(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.range(of: "Caution:", options: [.caseInsensitive, .anchored]) != nil
+    }
+
+    private func cautionParagraphPadding(isLeadParagraph: Bool) -> EdgeInsets {
+        if isLeadParagraph {
+            return EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+        }
+        switch responsePresentationStyle {
+        case .readablePro:
+            return EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+        case .glassEditorial:
+            return EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+        case .denseTechnical:
+            return EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8)
+        }
     }
 
     private static func parsePlanClarificationPayload(_ text: String) -> PlanClarificationPayload? {
@@ -1163,632 +1460,40 @@ struct ResponseBubble: View {
     }()
 }
 
-// MARK: - Wave Reveal Phase
-
-/// Describes the lifecycle of the aurora rim animation.
-private enum WaveRevealPhase {
-    case idle       // no streaming
-    case thinking   // streaming started, no text yet
-    case streaming  // text arriving
-    case done       // streaming complete, fading out
-}
-
-// MARK: - Text Height Preference Key
-
-private struct TextHeightPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-// MARK: - Wave Reveal Mask Modifier (spec §D)
-
-/// A feathered top-to-bottom reveal mask applied to the text content.
-/// The full text is rendered normally; a mask reveals from top as content
-/// grows. The feathered bottom edge creates a smooth "materializing" effect.
-private struct WaveRevealMaskModifier: ViewModifier {
-    let isActive: Bool
-    let maskHeight: CGFloat
-    let featherSize: CGFloat
-
-    func body(content: Content) -> some View {
-        if isActive {
-            content.mask(
-                VStack(spacing: 0) {
-                    // Fully opaque region
-                    Rectangle()
-                        .frame(height: max(0, maskHeight - featherSize))
-                    // Feathered edge — linear fade from opaque to transparent
-                    LinearGradient(
-                        colors: [.white, .clear],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: featherSize)
-                    // Transparent region below the reveal
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            )
-        } else {
-            content
-        }
-    }
-}
-
-// MARK: - Aurora Rim Overlay (spec §A, §C)
-
-/// A velocity-reactive gradient stroke around the response bubble.
-///
-/// Uses `TimelineView(.animation)` as the render heartbeat (spec §A).
-/// The gradient rotates continuously; its opacity, blur, and line width
-/// are mapped from the smoothed token velocity (spec §C).
-private struct AuroraRimOverlay: View {
-
-    let velocity: CGFloat          // EMA-smoothed 0…1
-    let phase: WaveRevealPhase
-    let doneOpacity: CGFloat       // animated to 0 on .done
-    let reduceMotion: Bool
-    let cornerRadius: CGFloat
-
-    // Aurora color palette
-    private static let auroraColors: [Color] = [
-        Color.secondaryBlue.opacity(0.8),
-        Color.statusStreaming.opacity(0.7),
-        Color.primaryBlue.opacity(0.6),
-        Color.secondaryBlue.opacity(0.5),
-        Color.statusStreaming.opacity(0.7),
-        Color.primaryBlue.opacity(0.8),
-        Color.secondaryBlue.opacity(0.8),
-    ]
-
-    var body: some View {
-        if reduceMotion {
-            // Respect Reduce Motion: simple static glow, no drift
-            RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(Color.secondaryBlue.opacity(Double(rimOpacity)), lineWidth: Double(rimLineWidth))
-                .opacity(Double(doneOpacity))
-        } else {
-            TimelineView(.animation) { context in
-                let t = context.date.timeIntervalSinceReferenceDate
-                let v = effectiveVelocity
-
-                // Rotation period: 12s idle → 7s fast (spec §C)
-                let period = 12.0 - 5.0 * Double(v)
-                let angle = Angle.degrees(t.truncatingRemainder(dividingBy: period) / period * 360)
-
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .stroke(
-                        AngularGradient(
-                            colors: Self.auroraColors,
-                            center: .center,
-                            angle: angle
-                        ),
-                        lineWidth: Double(rimLineWidth)
-                    )
-                    .blur(radius: Double(rimBlur))
-                    .opacity(Double(rimOpacity) * Double(doneOpacity))
-            }
-        }
-    }
-
-    // MARK: - Velocity → visual parameter mapping (spec §C)
-
-    private var effectiveVelocity: CGFloat {
-        switch phase {
-        case .idle:
-            return 0
-        case .thinking:
-            return 0.05 // slow pulse
-        case .streaming:
-            return velocity
-        case .done:
-            return 0.05
-        }
-    }
-
-    /// opacity = 0.18 + 0.55 * v
-    private var rimOpacity: CGFloat {
-        0.18 + 0.55 * effectiveVelocity
-    }
-
-    /// blurRadius = 1.0 + 4.0 * v
-    private var rimBlur: CGFloat {
-        1.0 + 4.0 * effectiveVelocity
-    }
-
-    /// lineWidth = 1.2 + 1.0 * v
-    private var rimLineWidth: CGFloat {
-        1.2 + 1.0 * effectiveVelocity
-    }
-}
-
-private struct LuxeStreamingIndicator: View {
-    let eventToken: Int
-    @State private var phase = false
-
-    var body: some View {
-        HStack(spacing: ThemeConstants.spacingS) {
-            HStack(spacing: 5) {
-                ForEach(0..<3, id: \.self) { idx in
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.secondaryBlue, Color.primaryBlue],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 6, height: 6)
-                        .scaleEffect(phase ? (idx == 1 ? 1.45 : 1.2) : 0.82)
-                        .opacity(phase ? 1.0 : 0.6)
-                        .animation(
-                            .easeInOut(duration: 0.42).delay(Double(idx) * 0.06),
-                            value: phase
-                        )
-                }
-            }
-            Text("Composing")
-                .font(.caption2)
-                .foregroundColor(.textSecondary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            Capsule()
-                .fill(Color.secondaryBlue.opacity(0.14))
-        )
-        .onAppear {
-            phase.toggle()
-        }
-        .onChange(of: eventToken) { _, _ in
-            phase.toggle()
-        }
-    }
-}
-
-private struct MinimalStreamingIndicator: View {
-    var body: some View {
-        HStack(spacing: ThemeConstants.spacingS) {
-            Circle()
-                .fill(Color.statusStreaming.opacity(0.65))
-                .frame(width: 6, height: 6)
-            Text("Updating")
-                .font(.caption2)
-                .foregroundColor(.textSecondary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            Capsule()
-                .fill(Color.statusStreaming.opacity(0.1))
-        )
-    }
-}
-
-// MARK: - Bubble Thinking Indicator
-
-/// Compact thinking indicator with timer for message bubbles
-struct BubbleThinkingIndicator: View {
-
-    let status: AgentStatus
-    let statusDetail: String
-    let activeToolCall: ToolCall?
-
-    @State private var elapsedTime: TimeInterval = 0
-    @State private var startTime: Date = Date()
-    @State private var dotPhase = 0
-    @State private var isExpanded = false
-
-    private let timer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
-    private let dotTimer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } }) {
-                HStack(spacing: 6) {
-                    Text(activityTitle)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(activityColor)
-
-                    HStack(spacing: 2) {
-                        ForEach(0..<3, id: \.self) { i in
-                            Circle()
-                                .fill(activityColor)
-                                .frame(width: 4, height: 4)
-                                .opacity(dotPhase == i ? 1.0 : 0.4)
-                        }
-                    }
-
-                    Text(formattedTime)
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundColor(activityColor)
-
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundColor(activityColor.opacity(0.7))
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    Capsule()
-                        .fill(activityColor.opacity(0.15))
-                )
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(activityDetail)
-                        .font(.caption)
-                        .foregroundColor(.textSecondary)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    HStack(spacing: 8) {
-                        Label(activityLabel, systemImage: activitySymbol)
-                        Spacer()
-                        Text(formattedTime)
-                            .font(.system(size: 11, design: .monospaced))
-                    }
-                    .font(.caption2)
-                    .foregroundColor(.textTertiary)
-
-                    if let activeToolCall {
-                        HStack(spacing: 8) {
-                            Label(toolLine(activeToolCall), systemImage: "hammer")
-                                .lineLimit(1)
-                            Spacer()
-                            Text(activeToolCall.status.badgeText)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundColor(activityColor)
-                        }
-                        .font(.caption2)
-                        .foregroundColor(.textTertiary)
-                    }
-                }
-                .padding(10)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.cardBackground.opacity(0.8))
-                )
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .onReceive(timer) { _ in
-            elapsedTime = Date().timeIntervalSince(startTime)
-        }
-        .onReceive(dotTimer) { _ in
-            dotPhase = (dotPhase + 1) % 3
-        }
-        .onAppear {
-            startTime = Date()
-            elapsedTime = 0
-        }
-        .onChange(of: phaseKey) { _, _ in
-            startTime = Date()
-            elapsedTime = 0
-        }
-    }
-
-    private var formattedTime: String {
-        let seconds = elapsedTime
-        if seconds < 60 {
-            return String(format: "%.1fs", seconds)
-        } else {
-            let mins = Int(seconds) / 60
-            let secs = seconds.truncatingRemainder(dividingBy: 60)
-            return String(format: "%d:%04.1f", mins, secs)
-        }
-    }
-
-    private var activityColor: Color {
-        switch status {
-        case .error:
-            return .statusError
-        case .complete:
-            return .statusComplete
-        case .streaming:
-            return .statusStreaming
-        default:
-            return .statusThinking
-        }
-    }
-
-    private var activityTitle: String {
-        // For planning/thinking, show a short dynamic phase label from the
-        // backend's statusDetail when available, so the user sees which step
-        // of the pipeline is currently active (e.g. "Preparing context" vs.
-        // "Drafting plan") instead of a static "Planning" label.
-        switch status {
-        case .planning, .thinking, .executingPlan:
-            let trimmed = statusDetail.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                // Truncate long details to keep the pill compact
-                return trimmed.count > 36 ? String(trimmed.prefix(33)) + "..." : trimmed
-            }
-            if case .planning = status { return "Planning" }
-            if case .executingPlan = status { return "Executing" }
-            return "Thinking"
-        case .callingTool:
-            return "Tooling"
-        case .capturingScreen:
-            return "Reading Screen"
-        case .streaming:
-            return "Responding"
-        case .awaitingApproval:
-            return "Approval"
-        case .complete:
-            return "Done"
-        case .error:
-            return "Issue"
-        default:
-            return "Thinking"
-        }
-    }
-
-    private var activitySymbol: String {
-        switch status {
-        case .planning:
-            return "list.bullet.clipboard"
-        case .callingTool:
-            return "hammer"
-        case .capturingScreen:
-            return "eye"
-        case .streaming:
-            return "text.bubble"
-        case .awaitingApproval:
-            return "hand.raised"
-        case .complete:
-            return "checkmark.circle"
-        case .error:
-            return "exclamationmark.triangle"
-        default:
-            return "brain"
-        }
-    }
-
-    private var activityLabel: String {
-        switch status {
-        case .planning:
-            return "Plan mode active"
-        case .callingTool:
-            return "Running a tool"
-        case .capturingScreen:
-            return "Reading screen contents"
-        case .streaming:
-            return "Sending answer"
-        case .awaitingApproval:
-            return "Waiting for approval"
-        case .complete:
-            return "Finished"
-        case .error:
-            return "Needs attention"
-        default:
-            return "Analyzing request"
-        }
-    }
-
-    private var activityDetail: String {
-        let trimmed = statusDetail.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            return trimmed
-        }
-        return activityLabel
-    }
-
-    private var phaseKey: String {
-        // Include statusDetail so the timer resets whenever the backend sends
-        // a new phase description (e.g. "Preparing context..." → "Analyzing
-        // your request...").  Without this, the timer never resets within a
-        // single status enum case like `.planning`.
-        let detailSuffix = statusDetail.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base: String
-        switch status {
-        case .idle:
-            base = "idle"
-        case .connecting:
-            base = "connecting"
-        case .thinking:
-            base = "thinking"
-        case .planning:
-            base = "planning"
-        case .planReady:
-            base = "plan_ready"
-        case .awaitingApproval:
-            base = "awaiting_approval"
-        case .executingPlan:
-            base = "executing_plan"
-        case .callingTool(let toolName):
-            base = "calling_tool:\(toolName)"
-        case .capturingScreen:
-            base = "capturing_screen"
-        case .streaming:
-            base = "streaming"
-        case .error(let message):
-            base = "error:\(message)"
-        case .complete:
-            base = "complete"
-        }
-        return detailSuffix.isEmpty ? base : "\(base)|\(detailSuffix)"
-    }
-
-    private func toolLine(_ toolCall: ToolCall) -> String {
-        switch toolCall.status {
-        case .pending:
-            return "Queued: \(toolCall.name)"
-        case .executing:
-            return "Running: \(toolCall.name)"
-        case .success:
-            return "Finished: \(toolCall.name)"
-        case .failed:
-            return "Failed: \(toolCall.name)"
-        }
-    }
-}
-
-// MARK: - Message List View
-
-/// A scrollable list of message bubbles
-struct MessageListView: View {
-
-    let messages: [Message]
-    let sessionId: String
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var scrollProxy: ScrollViewProxy?
-    @State private var pendingScrollTask: Task<Void, Never>?
-    private let bottomAnchorID = "message-list-bottom-anchor"
-
-    var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: ThemeConstants.spacingM) {
-                    ForEach(messages) { message in
-                        ResponseBubble(
-                            message: message,
-                            animate: message.isStreaming
-                        )
-                        .id(message.id)
-                    }
-                    Color.clear
-                        .frame(height: 1)
-                        .id(bottomAnchorID)
-                }
-                .padding(ThemeConstants.spacingM)
-            }
-            .onAppear {
-                scrollProxy = proxy
-                scrollToBottom(animated: false)
-            }
-            .onDisappear {
-                pendingScrollTask?.cancel()
-                pendingScrollTask = nil
-            }
-            .onChange(of: sessionId) { _, _ in
-                scheduleScrollToBottom(animated: false)
-            }
-            .onChange(of: messageIDSequence) { _, _ in
-                scheduleScrollToBottom(animated: false)
-            }
-            .onChange(of: messages.last?.content) { _, _ in
-                scheduleScrollToBottom(animated: false)
-            }
-        }
-    }
-
-    private func scrollToBottom(animated: Bool = true) {
-        guard scrollProxy != nil else { return }
-        if !animated || reduceMotion || isStreaming {
-            scrollProxy?.scrollTo(bottomAnchorID, anchor: .bottom)
-        } else {
-            withAnimation(AnimationConstants.snappy) {
-                scrollProxy?.scrollTo(bottomAnchorID, anchor: .bottom)
-            }
-        }
-    }
-
-    private var isStreaming: Bool {
-        messages.last?.isStreaming == true
-    }
-
-    private var messageIDSequence: [AnyHashable] {
-        messages.map { AnyHashable($0.id) }
-    }
-
-    private func scheduleScrollToBottom(animated: Bool) {
-        pendingScrollTask?.cancel()
-        pendingScrollTask = Task { @MainActor in
-            await Task.yield()
-            scrollToBottom(animated: animated)
-            pendingScrollTask = nil
-        }
-    }
-}
-
-// MARK: - Empty State View
-
-/// Shown when there are no messages
-struct EmptyMessageView: View {
-    var body: some View {
-        VStack(spacing: ThemeConstants.spacingL) {
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 48))
-                .foregroundColor(.textTertiary)
-
-            Text("Start a conversation")
-                .font(.headline)
-                .foregroundColor(.textSecondary)
-
-            Text("Type a message below to get started")
-                .font(.subheadline)
-                .foregroundColor(.textTertiary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
-}
-
-struct SessionHistoryLoadingView: View {
-    @State private var isAnimating = false
-
-    var body: some View {
-        VStack(spacing: ThemeConstants.spacingM) {
-            ZStack {
-                Circle()
-                    .stroke(Color.statusConnecting.opacity(0.2), lineWidth: 4)
-                    .frame(width: 28, height: 28)
-
-                Circle()
-                    .trim(from: 0.1, to: 0.85)
-                    .stroke(Color.statusConnecting, style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                    .frame(width: 28, height: 28)
-                    .rotationEffect(.degrees(isAnimating ? 360 : 0))
-                    .animation(.linear(duration: 1.0).repeatForever(autoreverses: false), value: isAnimating)
-            }
-
-            Text("Loading session history...")
-                .font(.subheadline)
-                .foregroundColor(.textSecondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            isAnimating = true
-        }
-    }
-}
 
 #if DEBUG
 struct ResponseBubblePreview: View {
     var body: some View {
         VStack(spacing: ThemeConstants.spacingM) {
             ResponseBubble(
-                message: Message.user("Find all Python files in my Documents folder")
+                row: MessageRowModel(message: Message.user("Find all Python files in my Documents folder"))
             )
 
             ResponseBubble(
-                message: Message(
-                    role: .assistant,
-                    content: """
-                    ## Search Summary
+                row: MessageRowModel(
+                    message: Message(
+                        role: .assistant,
+                        content: """
+                        ## Search Summary
 
-                    - Found **15** matching files.
-                    - Sorted by most recently modified.
+                        - Found **15** matching files.
+                        - Sorted by most recently modified.
 
-                    1. `main.py`
-                    2. `config.py`
-                    3. `utils.py`
-                    """
+                        1. `main.py`
+                        2. `config.py`
+                        3. `utils.py`
+                        """
+                    )
                 )
             )
 
             ResponseBubble(
-                message: Message(
-                    role: .assistant,
-                    content: "Processing your request and preparing final output...",
-                    isStreaming: true
+                row: MessageRowModel(
+                    message: Message(
+                        role: .assistant,
+                        content: "Processing your request and preparing final output...",
+                        isStreaming: true
+                    )
                 ),
                 animate: true
             )

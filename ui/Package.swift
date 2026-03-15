@@ -6,7 +6,8 @@ import PackageDescription
 let package = Package(
     name: "AIAgentUI",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        .iOS(.v17)
     ],
     products: [
         .executable(
@@ -24,7 +25,9 @@ let package = Package(
             dependencies: [],
             path: "AIAgentUI",
             exclude: [
-                "App/Info.plist"
+                "App/Info.plist",
+                "App/Info-iOS.plist",
+                "App/AIAgent.entitlements"
             ],
             resources: [
                 .process("Resources/Assets.xcassets")

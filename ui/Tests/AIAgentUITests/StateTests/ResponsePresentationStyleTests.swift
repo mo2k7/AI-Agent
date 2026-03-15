@@ -14,3 +14,12 @@ func streamingAnimationStyleDisplayNamesAreStable() {
     #expect(StreamingAnimationStyle.typewriterLuxe.displayName == "Typewriter Luxe")
     #expect(StreamingAnimationStyle.minimalMotion.displayName == "Minimal Motion")
 }
+
+@Test
+func browseRestrictionProfileDisplayNamesAreStable() {
+    #expect(BrowseRestrictionProfile.strict.displayName == "Strict")
+    #expect(BrowseRestrictionProfile.standard.displayName == "Standard")
+    #expect(BrowseRestrictionProfile.flexible.displayName == "Flexible")
+    #expect(BrowseRestrictionProfile.standard.quickMenuDescription == "Recommended balanced browsing with fewer false blocks.")
+    #expect(BrowseRestrictionProfile.flexible.quickMenuDescription == "Broader access while still blocking SSRF, prompt-injection, and PII.")
+}

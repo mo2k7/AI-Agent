@@ -11,9 +11,11 @@ import stat
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, TypeVar, TYPE_CHECKING, cast
+
+from cryptography.exceptions import InvalidTag
 
 from .crypto import CryptoBox, compute_hmac, verify_hmac
 from .retriever import encode_text_semantic
@@ -220,7 +222,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
 class MemoryStore:
     """Per-session encrypted store plus global cross-session index."""
 
-    _INDEX_SCHEMA_SQL = """
+    _SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -230,7 +232,9 @@ class MemoryStore:
             last_activity REAL NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
             wrapped_dek TEXT NOT NULL,
-            wrap_nonce TEXT NOT NULL
+            wrap_nonce TEXT NOT NULL,
+            row_hmac TEXT NOT NULL DEFAULT '',
+            store_version INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_sessions_last_activity
@@ -253,32 +257,38 @@ class MemoryStore:
 
         CREATE INDEX IF NOT EXISTS idx_semantic_fact_key
         ON semantic_index(fact_key);
-    """
 
-    _SESSION_SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS messages (
             message_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
             turn_index INTEGER NOT NULL,
             role TEXT NOT NULL,
             content_enc TEXT NOT NULL,
             created_at REAL NOT NULL,
             token_estimate INTEGER NOT NULL DEFAULT 0,
-            meta_json TEXT NOT NULL DEFAULT '{}'
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_messages_turn
-        ON messages(turn_index);
+        CREATE INDEX IF NOT EXISTS idx_messages_session_turn
+        ON messages(session_id, turn_index);
 
         CREATE TABLE IF NOT EXISTS summaries (
             summary_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
             turn_start INTEGER NOT NULL,
             turn_end INTEGER NOT NULL,
             summary_enc TEXT NOT NULL,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
+
+        CREATE INDEX IF NOT EXISTS idx_summaries_session
+        ON summaries(session_id, turn_end DESC, created_at DESC);
 
         CREATE TABLE IF NOT EXISTS semantic_memories (
             memory_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
             kind TEXT NOT NULL,
             fact_key TEXT NOT NULL,
             content_enc TEXT NOT NULL,
@@ -289,39 +299,35 @@ class MemoryStore:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
-            hmac TEXT NOT NULL
+            hmac TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_semantic_fact_key
-        ON semantic_memories(fact_key, is_deleted, updated_at DESC);
-
-        CREATE TABLE IF NOT EXISTS session_info (
-            session_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            memory_mode TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL,
-            last_activity REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            wrapped_dek TEXT NOT NULL,
-            wrap_nonce TEXT NOT NULL
-        );
+        CREATE INDEX IF NOT EXISTS idx_semantic_memories_session_fact_deleted
+        ON semantic_memories(session_id, fact_key, is_deleted, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS notes (
             note_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
             content_enc TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            workspace_kind TEXT NOT NULL DEFAULT 'tab',
+            is_default_tab INTEGER NOT NULL DEFAULT 0,
+            tab_order INTEGER NOT NULL DEFAULT 0,
             is_pinned INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
-            source TEXT NOT NULL DEFAULT 'user'
+            source TEXT NOT NULL DEFAULT 'user',
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_notes_updated
-        ON notes(is_deleted, is_pinned DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_notes_session_deleted_updated
+        ON notes(session_id, is_deleted, is_default_tab DESC, is_pinned DESC, tab_order ASC, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS note_images (
             image_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
             note_id TEXT NOT NULL,
             image_enc TEXT NOT NULL,
             mime_type TEXT NOT NULL DEFAULT 'image/png',
@@ -330,25 +336,28 @@ class MemoryStore:
             alt_text TEXT NOT NULL DEFAULT '',
             created_at REAL NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (note_id) REFERENCES notes(note_id)
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY (note_id) REFERENCES notes(note_id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_note_images_note_id
-        ON note_images(note_id, is_deleted);
+        CREATE INDEX IF NOT EXISTS idx_note_images_session_note_deleted
+        ON note_images(session_id, note_id, is_deleted);
 
         CREATE TABLE IF NOT EXISTS note_versions (
             version_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
             note_id TEXT NOT NULL,
             content_enc TEXT NOT NULL,
             created_at REAL NOT NULL,
-            FOREIGN KEY (note_id) REFERENCES notes(note_id)
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY (note_id) REFERENCES notes(note_id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_note_versions_note_id
-        ON note_versions(note_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_note_versions_session_note_created
+        ON note_versions(session_id, note_id, created_at DESC);
     """
 
-    _INDEX_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    _REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
         "sessions": {
             "session_id": "TEXT",
             "title": "TEXT NOT NULL DEFAULT ''",
@@ -359,6 +368,8 @@ class MemoryStore:
             "status": "TEXT NOT NULL DEFAULT 'active'",
             "wrapped_dek": "TEXT NOT NULL DEFAULT ''",
             "wrap_nonce": "TEXT NOT NULL DEFAULT ''",
+            "row_hmac": "TEXT NOT NULL DEFAULT ''",
+            "store_version": "INTEGER NOT NULL DEFAULT 0",
         },
         "semantic_index": {
             "memory_id": "TEXT",
@@ -370,11 +381,9 @@ class MemoryStore:
             "confidence": "REAL NOT NULL DEFAULT 0",
             "updated_at": "REAL NOT NULL DEFAULT 0",
         },
-    }
-
-    _SESSION_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
         "messages": {
             "message_id": "TEXT",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
             "turn_index": "INTEGER NOT NULL DEFAULT 0",
             "role": "TEXT NOT NULL DEFAULT 'user'",
             "content_enc": "TEXT NOT NULL DEFAULT ''",
@@ -384,6 +393,7 @@ class MemoryStore:
         },
         "summaries": {
             "summary_id": "TEXT",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
             "turn_start": "INTEGER NOT NULL DEFAULT 0",
             "turn_end": "INTEGER NOT NULL DEFAULT 0",
             "summary_enc": "TEXT NOT NULL DEFAULT ''",
@@ -391,6 +401,7 @@ class MemoryStore:
         },
         "semantic_memories": {
             "memory_id": "TEXT",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
             "kind": "TEXT NOT NULL DEFAULT 'profile_fact'",
             "fact_key": "TEXT NOT NULL DEFAULT ''",
             "content_enc": "TEXT NOT NULL DEFAULT ''",
@@ -403,54 +414,81 @@ class MemoryStore:
             "is_deleted": "INTEGER NOT NULL DEFAULT 0",
             "hmac": "TEXT NOT NULL DEFAULT ''",
         },
-        "session_info": {
-            "session_id": "TEXT",
-            "title": "TEXT NOT NULL DEFAULT ''",
-            "memory_mode": "TEXT NOT NULL DEFAULT 'on'",
-            "created_at": "REAL NOT NULL DEFAULT 0",
-            "updated_at": "REAL NOT NULL DEFAULT 0",
-            "last_activity": "REAL NOT NULL DEFAULT 0",
-            "status": "TEXT NOT NULL DEFAULT 'active'",
-            "wrapped_dek": "TEXT NOT NULL DEFAULT ''",
-            "wrap_nonce": "TEXT NOT NULL DEFAULT ''",
-        },
         "notes": {
             "note_id": "TEXT",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
             "content_enc": "TEXT NOT NULL DEFAULT ''",
+            "title": "TEXT NOT NULL DEFAULT ''",
+            "workspace_kind": "TEXT NOT NULL DEFAULT 'tab'",
+            "is_default_tab": "INTEGER NOT NULL DEFAULT 0",
+            "tab_order": "INTEGER NOT NULL DEFAULT 0",
             "is_pinned": "INTEGER NOT NULL DEFAULT 0",
             "created_at": "REAL NOT NULL DEFAULT 0",
             "updated_at": "REAL NOT NULL DEFAULT 0",
             "is_deleted": "INTEGER NOT NULL DEFAULT 0",
             "source": "TEXT NOT NULL DEFAULT 'user'",
         },
+        "note_images": {
+            "image_id": "TEXT",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
+            "note_id": "TEXT NOT NULL DEFAULT ''",
+            "image_enc": "TEXT NOT NULL DEFAULT ''",
+            "mime_type": "TEXT NOT NULL DEFAULT 'image/png'",
+            "width": "INTEGER NOT NULL DEFAULT 0",
+            "height": "INTEGER NOT NULL DEFAULT 0",
+            "alt_text": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "REAL NOT NULL DEFAULT 0",
+            "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "note_versions": {
+            "version_id": "TEXT",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
+            "note_id": "TEXT NOT NULL DEFAULT ''",
+            "content_enc": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "REAL NOT NULL DEFAULT 0",
+        },
     }
     _SEMANTIC_HMAC_VERSION = "v2"
     _SEMANTIC_HMAC_PREFIX = f"{_SEMANTIC_HMAC_VERSION}:"
+    _NOTE_WORKSPACE_TAB = "tab"
+    _NOTE_WORKSPACE_SESSION_PAD = "session_pad"
+    _DEFAULT_SESSION_PAD_TITLE = "Session Notes"
 
     _SESSION_INFO_SELECT_COLUMNS = (
         "session_id, title, memory_mode, created_at, updated_at, "
         "last_activity, status, wrapped_dek, wrap_nonce"
     )
 
+    # Well-known deterministic keys used by test fixtures (conftest.py).
+    # These must NEVER encrypt production data — if the keychain module
+    # is accidentally patched in a non-test process, sessions become
+    # permanently undecryptable once the real key is restored.
+    _TEST_KEYS: frozenset[bytes] = frozenset({b"k" * 32, b"m" * 32})
+
     def __init__(self, root_dir: Path, *, master_key: bytes):
+        if master_key in self._TEST_KEYS and os.environ.get("AI_AGENT_ENV") != "test":
+            raise MemoryStoreError(
+                "Refusing to initialize MemoryStore with a well-known test key "
+                "outside test environment (AI_AGENT_ENV != 'test'). "
+                "This would encrypt production sessions with a deterministic key."
+            )
         self.root_dir = root_dir
-        self.sessions_dir = root_dir / "sessions"
-        self.index_db_path = root_dir / "index.db"
+        self.db_path = root_dir / "memory.db"
         self._master_box = CryptoBox(master_key)
         self._master_key = master_key
         self._dek_cache: dict[str, bytes] = {}
         self._dek_cache_lock = threading.Lock()
 
         self._ensure_directories()
-        self._init_index_db()
+        self._init_db()
+        self._validate_session_deks()
 
     # ------------------------------------------------------------------
     # setup
     # ------------------------------------------------------------------
     def _ensure_directories(self) -> None:
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
         self._enforce_permissions(self.root_dir, is_dir=True)
-        self._enforce_permissions(self.sessions_dir, is_dir=True)
 
     def _canonical_session_id(self, session_id: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", session_id.strip()).strip("-.")
@@ -470,26 +508,7 @@ class MemoryStore:
             raise MemoryStoreError(f"Insecure permissions on {path}: {oct(actual_mode)}")
 
     @staticmethod
-    def _is_recoverable_index_error(exc: BaseException) -> bool:
-        if not isinstance(exc, sqlite3.DatabaseError):
-            return False
-        lower = str(exc).lower()
-        return any(
-            marker in lower
-            for marker in (
-                "no such table",
-                "malformed",
-                "not a database",
-                "disk image is malformed",
-                "database schema is malformed",
-                "file is not a database",
-                "no such column",
-                "has no column named",
-            )
-        )
-
-    @staticmethod
-    def _is_recoverable_session_error(exc: BaseException) -> bool:
+    def _is_recoverable_db_error(exc: BaseException) -> bool:
         if not isinstance(exc, sqlite3.DatabaseError):
             return False
         lower = str(exc).lower()
@@ -520,10 +539,6 @@ class MemoryStore:
                 counter += 1
                 target = path.with_name(f"{path.name}.corrupt-{stamp}-{counter}")
             path.replace(target)
-
-    def _create_session_schema(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(self._SESSION_SCHEMA_SQL)
-        self._ensure_required_columns(conn, self._SESSION_REQUIRED_COLUMNS)
 
     def _table_columns(self, conn: sqlite3.Connection, table_name: str) -> set[str]:
         rows = conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()
@@ -556,32 +571,32 @@ class MemoryStore:
             repair()
             return operation()
 
-    def _rebuild_index_db(self) -> None:
-        self._quarantine_db_family(self.index_db_path)
-        conn = _sqlite_connect(self.index_db_path)
+    def _rebuild_db(self) -> None:
+        self._quarantine_db_family(self.db_path)
+        conn = _sqlite_connect(self.db_path)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             conn.execute("PRAGMA synchronous=NORMAL;")
-            self._ensure_index_schema(conn)
+            self._ensure_schema(conn)
         finally:
             conn.close()
-        if self.index_db_path.exists():
-            self._enforce_permissions(self.index_db_path, is_dir=False)
+        if self.db_path.exists():
+            self._enforce_permissions(self.db_path, is_dir=False)
 
-    def _connect_index(self, *, ensure_schema: bool = True) -> sqlite3.Connection:
+    def _connect_db(self, *, ensure_schema: bool = True) -> sqlite3.Connection:
         def _open() -> sqlite3.Connection:
-            conn = _sqlite_connect(self.index_db_path)
+            conn = _sqlite_connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA foreign_keys=ON;")
                 conn.execute("PRAGMA synchronous=NORMAL;")
                 if ensure_schema:
-                    self._ensure_index_schema(conn)
-                    if self.index_db_path.exists():
-                        self._enforce_permissions(self.index_db_path, is_dir=False)
+                    self._ensure_schema(conn)
+                    if self.db_path.exists():
+                        self._enforce_permissions(self.db_path, is_dir=False)
                 return conn
             except Exception:
                 conn.close()
@@ -592,38 +607,44 @@ class MemoryStore:
 
         return self._with_repair(
             operation=_open,
-            is_recoverable=self._is_recoverable_index_error,
-            repair=self._rebuild_index_db,
+            is_recoverable=self._is_recoverable_db_error,
+            repair=self._rebuild_db,
         )
 
     @contextmanager
-    def _index_connection(self, *, ensure_schema: bool = True):
-        conn = self._connect_index(ensure_schema=ensure_schema)
+    def _db_connection(self, *, ensure_schema: bool = True):
+        conn = self._connect_db(ensure_schema=ensure_schema)
         try:
             with conn:
                 yield conn
         finally:
             conn.close()
 
-    def _ensure_index_schema(self, conn: sqlite3.Connection) -> None:
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
         existing = {str(row["name"]) for row in rows}
-        required = {"sessions", "semantic_index"}
+        required = {"sessions", "semantic_index", "messages", "notes"}
         if not required.issubset(existing):
-            conn.executescript(self._INDEX_SCHEMA_SQL)
+            conn.executescript(self._SCHEMA_SQL)
+
+        # Add missing columns BEFORE creating indexes that depend on them.
+        self._ensure_required_columns(conn, self._REQUIRED_COLUMNS)
+
         conn.executescript(
             """
-            CREATE INDEX IF NOT EXISTS idx_sessions_last_activity
-            ON sessions(last_activity DESC);
-            CREATE INDEX IF NOT EXISTS idx_semantic_session_updated
-            ON semantic_index(session_id, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_semantic_fact_key
-            ON semantic_index(fact_key);
+            CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity DESC);
+            CREATE INDEX IF NOT EXISTS idx_semantic_session_updated ON semantic_index(session_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_semantic_fact_key ON semantic_index(fact_key);
+            CREATE INDEX IF NOT EXISTS idx_messages_session_turn ON messages(session_id, turn_index);
+            CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, turn_end DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_semantic_memories_session_fact_deleted ON semantic_memories(session_id, fact_key, is_deleted, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_notes_session_deleted_updated ON notes(session_id, is_deleted, is_default_tab DESC, is_pinned DESC, tab_order ASC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_note_images_session_note_deleted ON note_images(session_id, note_id, is_deleted);
+            CREATE INDEX IF NOT EXISTS idx_note_versions_session_note_created ON note_versions(session_id, note_id, created_at DESC);
             """
         )
-        self._ensure_required_columns(conn, self._INDEX_REQUIRED_COLUMNS)
         conn.commit()
 
         verify_rows = conn.execute(
@@ -633,23 +654,69 @@ class MemoryStore:
         has_required_tables = required.issubset(verify_existing)
         has_required_columns = all(
             set(columns.keys()).issubset(self._table_columns(conn, table_name))
-            for table_name, columns in self._INDEX_REQUIRED_COLUMNS.items()
+            for table_name, columns in self._REQUIRED_COLUMNS.items()
         )
         if not has_required_tables or not has_required_columns:
-            raise MemoryStoreError(
-                "Failed to initialize memory index database schema"
-            )
+            raise MemoryStoreError("Failed to initialize memory database schema")
 
-    def _init_index_db(self) -> None:
+    def _init_db(self) -> None:
         self._with_repair(
-            operation=lambda: self._connect_index(ensure_schema=True).close(),
-            is_recoverable=self._is_recoverable_index_error,
-            repair=self._rebuild_index_db,
+            operation=lambda: self._connect_db(ensure_schema=True).close(),
+            is_recoverable=self._is_recoverable_db_error,
+            repair=self._rebuild_db,
         )
 
-        if not self.index_db_path.exists():
-            raise MemoryStoreError("Failed to initialize memory index database")
-        self._enforce_permissions(self.index_db_path, is_dir=False)
+        if not self.db_path.exists():
+            raise MemoryStoreError("Failed to initialize memory database")
+        self._enforce_permissions(self.db_path, is_dir=False)
+
+    def _validate_session_deks(self) -> None:
+        """Verify all session DEKs can be unwrapped with the current master key."""
+        with self._db_connection() as conn:
+            rows = conn.execute(
+                "SELECT session_id, wrapped_dek, wrap_nonce FROM sessions"
+            ).fetchall()
+
+        invalid_sessions: list[str] = []
+        for row in rows:
+            session_id = str(row["session_id"])
+            try:
+                self._master_box.unwrap_key(row["wrapped_dek"], row["wrap_nonce"])
+            except (InvalidTag, Exception):
+                invalid_sessions.append(session_id)
+
+        if not invalid_sessions:
+            return
+
+        for session_id in invalid_sessions:
+            message_count = 0
+            try:
+                with self._db_connection() as conn:
+                    count_row = conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                        (session_id,)
+                    ).fetchone()
+                    message_count = int(count_row[0]) if count_row else 0
+            except sqlite3.DatabaseError:
+                message_count = 0
+
+            if message_count == 0:
+                logger.warning(
+                    "Removing session %s: DEK cannot be unwrapped with current "
+                    "master key and session has 0 messages",
+                    session_id,
+                )
+                self.delete_session(session_id)
+            else:
+                logger.critical(
+                    "Session %s has %d messages but its DEK cannot be unwrapped "
+                    "with the current master key — session data is inaccessible.",
+                    session_id,
+                    message_count,
+                )
+                with self._db_connection() as conn:
+                    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM semantic_index WHERE session_id = ?", (session_id,))
 
     def _safe_memory_mode(self, raw_mode: object, *, session_id: str | None = None) -> MemoryMode:
         """Parse persisted memory mode and self-heal invalid values."""
@@ -662,16 +729,29 @@ class MemoryStore:
         fallback = MemoryMode.ON
         if session_id:
             try:
-                with self._index_connection() as conn:
+                now = time.time()
+                with self._db_connection() as conn:
+                    title_row = conn.execute(
+                        "SELECT title FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    title = title_row["title"] if title_row else ""
+                    row_hmac = self._compute_session_hmac(
+                        session_id=session_id,
+                        title=title,
+                        memory_mode=fallback.value,
+                        updated_at=now,
+                    )
                     conn.execute(
                         """
                         UPDATE sessions
-                        SET memory_mode = ?, updated_at = ?, last_activity = ?
+                        SET memory_mode = ?, updated_at = ?, last_activity = ?,
+                            row_hmac = ?, store_version = store_version + 1
                         WHERE session_id = ?
                         """,
-                        (fallback.value, time.time(), time.time(), session_id),
+                        (fallback.value, now, now, row_hmac, session_id),
                     )
-                self._upsert_session_info_from_index(session_id)
+
             except sqlite3.Error as exc:
                 raise MemoryStoreError(
                     f"Failed to repair invalid memory_mode for session {session_id}"
@@ -704,7 +784,43 @@ class MemoryStore:
             return []
         return [str(item) for item in decoded]
 
+    def _compute_session_hmac(
+        self,
+        *,
+        session_id: str,
+        title: str,
+        memory_mode: str,
+        updated_at: float,
+    ) -> str:
+        """Compute HMAC-SHA256 over session identity fields."""
+        payload = f"{session_id}|{title}|{memory_mode}|{updated_at}"
+        return compute_hmac(self._master_key, payload)
+
+    def _verify_session_hmac(self, row: sqlite3.Row) -> bool:
+        """Verify HMAC on a session row.
+
+        Returns True if valid or if the HMAC is empty (pre-migration row).
+        """
+        keys = row.keys()
+        hmac_value = row["row_hmac"] if "row_hmac" in keys else ""
+        if not hmac_value:
+            return True
+        expected_payload = (
+            f"{row['session_id']}|{row['title']}|"
+            f"{row['memory_mode']}|{row['updated_at']}"
+        )
+        return verify_hmac(self._master_key, expected_payload, hmac_value)
+
     def _row_to_session_record(self, row: sqlite3.Row) -> SessionRecord:
+        if not self._verify_session_hmac(row):
+            raise MemoryStoreError(
+                f"Session HMAC verification failed for session_id={row['session_id']}"
+            )
+        # store_version may be absent in pre-migration rows.
+        try:
+            sv = int(row["store_version"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            sv = 0
         return SessionRecord(
             session_id=row["session_id"],
             title=row["title"],
@@ -716,20 +832,22 @@ class MemoryStore:
             updated_at=float(row["updated_at"]),
             last_activity=float(row["last_activity"]),
             status=row["status"],
+            store_version=sv,
         )
 
     def _fetch_session_row(self, session_id: str) -> sqlite3.Row | None:
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
             return conn.execute(
                 """
-                SELECT session_id, title, memory_mode, created_at, updated_at, last_activity, status
+                SELECT session_id, title, memory_mode, created_at, updated_at,
+                       last_activity, status, row_hmac, store_version
                 FROM sessions
                 WHERE session_id = ?
                 """,
                 (session_id,),
             ).fetchone()
 
-    def _upsert_index_session(
+    def _upsert_session(
         self,
         *,
         session_id: str,
@@ -741,15 +859,16 @@ class MemoryStore:
         status: str,
         wrapped_dek: str,
         wrap_nonce: str,
+        row_hmac: str = "",
     ) -> None:
         session_id = self._canonical_session_id(session_id)
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions (
                     session_id, title, memory_mode, created_at, updated_at, last_activity,
-                    status, wrapped_dek, wrap_nonce
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, wrapped_dek, wrap_nonce, row_hmac, store_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(session_id) DO UPDATE SET
                     title=excluded.title,
                     memory_mode=excluded.memory_mode,
@@ -758,7 +877,9 @@ class MemoryStore:
                     last_activity=excluded.last_activity,
                     status=excluded.status,
                     wrapped_dek=excluded.wrapped_dek,
-                    wrap_nonce=excluded.wrap_nonce
+                    wrap_nonce=excluded.wrap_nonce,
+                    row_hmac=excluded.row_hmac,
+                    store_version=sessions.store_version + 1
                 """,
                 (
                     session_id,
@@ -770,161 +891,9 @@ class MemoryStore:
                     status,
                     wrapped_dek,
                     wrap_nonce,
+                    row_hmac,
                 ),
             )
-
-    def _upsert_session_info(
-        self,
-        *,
-        session_id: str,
-        title: str,
-        memory_mode: str,
-        created_at: float,
-        updated_at: float,
-        last_activity: float,
-        status: str,
-        wrapped_dek: str,
-        wrap_nonce: str,
-    ) -> None:
-        session_id = self._canonical_session_id(session_id)
-        with self._session_connection(session_id) as conn:
-            self._write_session_info(
-                conn,
-                session_id=session_id,
-                title=title,
-                memory_mode=memory_mode,
-                created_at=created_at,
-                updated_at=updated_at,
-                last_activity=last_activity,
-                status=status,
-                wrapped_dek=wrapped_dek,
-                wrap_nonce=wrap_nonce,
-            )
-
-    def _write_session_info(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        session_id: str,
-        title: str,
-        memory_mode: str,
-        created_at: float,
-        updated_at: float,
-        last_activity: float,
-        status: str,
-        wrapped_dek: str,
-        wrap_nonce: str,
-    ) -> None:
-        conn.execute(
-            """
-            INSERT INTO session_info (
-                session_id, title, memory_mode, created_at, updated_at,
-                last_activity, status, wrapped_dek, wrap_nonce
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                title=excluded.title,
-                memory_mode=excluded.memory_mode,
-                created_at=excluded.created_at,
-                updated_at=excluded.updated_at,
-                last_activity=excluded.last_activity,
-                status=excluded.status,
-                wrapped_dek=excluded.wrapped_dek,
-                wrap_nonce=excluded.wrap_nonce
-            """,
-            (
-                session_id,
-                title,
-                memory_mode,
-                created_at,
-                updated_at,
-                last_activity,
-                status,
-                wrapped_dek,
-                wrap_nonce,
-            ),
-        )
-
-    def _ensure_session_info_row(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        session_id: str,
-    ) -> None:
-        session_id = self._canonical_session_id(session_id)
-        existing = conn.execute(
-            "SELECT 1 FROM session_info WHERE session_id = ? LIMIT 1",
-            (session_id,),
-        ).fetchone()
-        if existing is not None:
-            return
-
-        with self._index_connection() as index_conn:
-            row = index_conn.execute(
-                f"SELECT {self._SESSION_INFO_SELECT_COLUMNS} FROM sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return
-
-        self._write_session_info(
-            conn,
-            session_id=row["session_id"],
-            title=row["title"],
-            memory_mode=row["memory_mode"],
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
-            last_activity=float(row["last_activity"]),
-            status=row["status"],
-            wrapped_dek=row["wrapped_dek"],
-            wrap_nonce=row["wrap_nonce"],
-        )
-
-    def _upsert_session_info_from_index(self, session_id: str) -> None:
-        session_id = self._canonical_session_id(session_id)
-        with self._index_connection() as conn:
-            row = conn.execute(
-                f"SELECT {self._SESSION_INFO_SELECT_COLUMNS} FROM sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return
-        self._upsert_session_info(
-            session_id=row["session_id"],
-            title=row["title"],
-            memory_mode=row["memory_mode"],
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
-            last_activity=float(row["last_activity"]),
-            status=row["status"],
-            wrapped_dek=row["wrapped_dek"],
-            wrap_nonce=row["wrap_nonce"],
-        )
-
-    def _load_session_info(self, session_id: str) -> dict[str, object] | None:
-        session_id = self._canonical_session_id(session_id)
-        path = self._session_db_path(session_id)
-        if not path.exists():
-            return None
-
-        with self._session_connection(session_id) as conn:
-            row = conn.execute(
-                f"SELECT {self._SESSION_INFO_SELECT_COLUMNS} FROM session_info WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return None
-
-        return {
-            "session_id": session_id,
-            "title": str(row["title"]).strip() or f"Session {session_id[:8]}",
-            "memory_mode": self._safe_memory_mode(row["memory_mode"]).value,
-            "created_at": float(row["created_at"]),
-            "updated_at": float(row["updated_at"]),
-            "last_activity": float(row["last_activity"]),
-            "status": str(row["status"]).strip() or "active",
-            "wrapped_dek": row["wrapped_dek"],
-            "wrap_nonce": row["wrap_nonce"],
-        }
 
     # ------------------------------------------------------------------
     # session lifecycle
@@ -934,19 +903,13 @@ class MemoryStore:
         now = time.time()
         data_key = os.urandom(32)
         wrapped_dek, wrap_nonce = self._master_box.wrap_key(data_key)
-        self._upsert_index_session(
+        row_hmac = self._compute_session_hmac(
             session_id=session_id,
             title=title,
             memory_mode=memory_mode.value,
-            created_at=now,
             updated_at=now,
-            last_activity=now,
-            status="active",
-            wrapped_dek=wrapped_dek,
-            wrap_nonce=wrap_nonce,
         )
-        self._ensure_session_db(session_id)
-        self._upsert_session_info(
+        self._upsert_session(
             session_id=session_id,
             title=title,
             memory_mode=memory_mode.value,
@@ -956,6 +919,7 @@ class MemoryStore:
             status="active",
             wrapped_dek=wrapped_dek,
             wrap_nonce=wrap_nonce,
+            row_hmac=row_hmac,
         )
         return SessionRecord(
             session_id=session_id,
@@ -967,18 +931,26 @@ class MemoryStore:
             status="active",
         )
 
+    _RE_SESSION_SEQ = re.compile(r"^session_(\d+)_")
+
     def next_session_sequence(self) -> int:
-        """Return the next 1-based session number for default naming."""
-        with self._index_connection() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*) AS session_count
-                FROM sessions
-                WHERE status != 'deleted'
-                """
-            ).fetchone()
-        count = int(row["session_count"]) if row is not None else 0
-        return count + 1
+        """Return the next monotonically-increasing session number.
+
+        Scans existing session titles for the ``session_{N}_{date}`` pattern
+        and returns ``max(N) + 1``.  This guarantees uniqueness even after
+        deletions (unlike the previous ``COUNT(*)`` approach which could
+        collide with surviving higher-numbered sessions).
+        """
+        with self._db_connection() as conn:
+            rows = conn.execute(
+                "SELECT title FROM sessions WHERE status != 'deleted'"
+            ).fetchall()
+        max_seq = 0
+        for row in rows:
+            m = self._RE_SESSION_SEQ.match(str(row["title"]))
+            if m:
+                max_seq = max(max_seq, int(m.group(1)))
+        return max_seq + 1
 
     def ensure_session(self, session_id: str, *, memory_mode: MemoryMode) -> SessionRecord:
         session_id = self._canonical_session_id(session_id)
@@ -997,45 +969,92 @@ class MemoryStore:
         row = self._fetch_session_row(session_id)
         if row is None:
             return None
-
         return self._row_to_session_record(row)
 
-    def list_sessions(self, *, limit: int = 50) -> list[SessionRecord]:
+    def list_sessions(self, *, limit: int | None = 50) -> list[SessionRecord]:
+        query = """
+            SELECT session_id, title, memory_mode, created_at, updated_at,
+                   last_activity, status, row_hmac, store_version
+            FROM sessions
+            WHERE status != 'deleted'
+            ORDER BY last_activity DESC
+        """
+        params: tuple[object, ...] = ()
         try:
-            bounded_limit = max(1, min(int(limit), 5000))
+            parsed_limit = int(limit) if limit is not None else 0
         except (TypeError, ValueError):
-            bounded_limit = 50
-        with self._index_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT session_id, title, memory_mode, created_at, updated_at, last_activity, status
-                FROM sessions
-                WHERE status != 'deleted'
-                ORDER BY last_activity DESC
-                LIMIT ?
-                """,
-                (bounded_limit,),
-            ).fetchall()
+            parsed_limit = 50
+        if parsed_limit > 0:
+            query += "\nLIMIT ?"
+            params = (min(parsed_limit, 5000),)
+        with self._db_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
 
         records = [self._row_to_session_record(row) for row in rows]
         return records
 
+    def list_sessions_since(
+        self, since_version: int, *, limit: int = 200
+    ) -> tuple[list[SessionRecord], int]:
+        """Return sessions changed since *since_version*.
+
+        Returns ``(records, max_version)`` where *max_version* is the
+        highest ``store_version`` in the returned set (or *since_version*
+        if nothing changed).
+        """
+        bounded_limit = max(1, min(int(limit), 5000))
+        with self._db_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, title, memory_mode, created_at, updated_at,
+                       last_activity, status, row_hmac, store_version
+                FROM sessions
+                WHERE store_version > ? AND status != 'deleted'
+                ORDER BY store_version ASC
+                LIMIT ?
+                """,
+                (since_version, bounded_limit),
+            ).fetchall()
+        records = [self._row_to_session_record(row) for row in rows]
+        max_ver = max((r.store_version for r in records), default=since_version)
+        return records, max_ver
+
+    def max_store_version(self) -> int:
+        """Return the current maximum store_version across all sessions."""
+        with self._db_connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(store_version), 0) AS mv FROM sessions"
+            ).fetchone()
+        return int(row["mv"]) if row else 0
+
     def set_session_mode(self, session_id: str, mode: MemoryMode) -> None:
         session_id = self._canonical_session_id(session_id)
         now = time.time()
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
+            current = conn.execute(
+                "SELECT title FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                raise MemoryStoreError(f"Unknown session: {session_id}")
+            row_hmac = self._compute_session_hmac(
+                session_id=session_id,
+                title=current["title"],
+                memory_mode=mode.value,
+                updated_at=now,
+            )
             result = conn.execute(
                 """
                 UPDATE sessions
-                SET memory_mode = ?, updated_at = ?, last_activity = ?
+                SET memory_mode = ?, updated_at = ?, last_activity = ?, row_hmac = ?,
+                    store_version = store_version + 1
                 WHERE session_id = ?
                 """,
-                (mode.value, now, now, session_id),
+                (mode.value, now, now, row_hmac, session_id),
             )
             affected = result.rowcount
         if affected <= 0:
             raise MemoryStoreError(f"Unknown session: {session_id}")
-        self._upsert_session_info_from_index(session_id)
 
     def rename_session(self, session_id: str, *, title: str) -> SessionRecord:
         session_id = self._canonical_session_id(session_id)
@@ -1044,14 +1063,27 @@ class MemoryStore:
             raise MemoryStoreError("Session title cannot be empty")
 
         now = time.time()
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
+            current = conn.execute(
+                "SELECT memory_mode FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                raise MemoryStoreError(f"Unknown session: {session_id}")
+            row_hmac = self._compute_session_hmac(
+                session_id=session_id,
+                title=normalized,
+                memory_mode=current["memory_mode"],
+                updated_at=now,
+            )
             result = conn.execute(
                 """
                 UPDATE sessions
-                SET title = ?, updated_at = ?, last_activity = ?
+                SET title = ?, updated_at = ?, last_activity = ?, row_hmac = ?,
+                    store_version = store_version + 1
                 WHERE session_id = ?
                 """,
-                (normalized, now, now, session_id),
+                (normalized, now, now, row_hmac, session_id),
             )
             affected = result.rowcount
         if affected <= 0:
@@ -1060,92 +1092,14 @@ class MemoryStore:
         updated = self.get_session(session_id)
         if updated is None:
             raise MemoryStoreError(f"Unknown session: {session_id}")
-        self._upsert_session_info_from_index(session_id)
         return updated
 
     def delete_session(self, session_id: str) -> None:
         session_id = self._canonical_session_id(session_id)
         with self._dek_cache_lock:
             self._dek_cache.pop(session_id, None)
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM semantic_index WHERE session_id = ?", (session_id,))
-
-        session_db = self._session_db_path(session_id)
-        session_paths = [
-            session_db,
-            Path(f"{session_db}-wal"),
-            Path(f"{session_db}-shm"),
-        ]
-        for path in session_paths:
-            if path.exists():
-                path.unlink(missing_ok=True)
-
-    # ------------------------------------------------------------------
-    # session db helpers
-    # ------------------------------------------------------------------
-    def _session_db_path(self, session_id: str) -> Path:
-        session_id = self._canonical_session_id(session_id)
-        return self.sessions_dir / f"{session_id}.db"
-
-    def _ensure_session_db(self, session_id: str) -> Path:
-        path = self._session_db_path(session_id)
-        def _ensure_once() -> None:
-            conn = _sqlite_connect(path)
-            try:
-                self._create_session_schema(conn)
-                integrity = conn.execute("PRAGMA integrity_check;").fetchone()
-                if integrity and integrity[0] != "ok":
-                    raise sqlite3.DatabaseError(
-                        f"Integrity check failed: {integrity[0]}"
-                    )
-            finally:
-                conn.close()
-
-        self._with_repair(
-            operation=_ensure_once,
-            is_recoverable=self._is_recoverable_session_error,
-            repair=lambda: self._quarantine_db_family(path),
-        )
-
-        self._enforce_permissions(path, is_dir=False)
-        return path
-
-    def _connect_session(self, session_id: str) -> sqlite3.Connection:
-        path = self._ensure_session_db(session_id)
-
-        def _open() -> sqlite3.Connection:
-            conn = _sqlite_connect(path)
-            try:
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA foreign_keys=ON;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
-                conn.execute("PRAGMA secure_delete=ON;")
-                self._ensure_session_info_row(conn, session_id=session_id)
-                return conn
-            except Exception:
-                conn.close()
-                raise
-
-        def _repair() -> None:
-            self._quarantine_db_family(path)
-            self._ensure_session_db(session_id)
-
-        return self._with_repair(
-            operation=_open,
-            is_recoverable=self._is_recoverable_session_error,
-            repair=_repair,
-        )
-
-    @contextmanager
-    def _session_connection(self, session_id: str):
-        conn = self._connect_session(session_id)
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
 
     def _get_session_dek(self, session_id: str) -> bytes:
         session_id = self._canonical_session_id(session_id)
@@ -1154,7 +1108,7 @@ class MemoryStore:
         if cached is not None:
             return cached
 
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
             row = conn.execute(
                 "SELECT wrapped_dek, wrap_nonce FROM sessions WHERE session_id = ?",
                 (session_id,),
@@ -1162,7 +1116,12 @@ class MemoryStore:
         if row is None:
             raise MemoryStoreError(f"Unknown session: {session_id}")
 
-        dek = self._master_box.unwrap_key(row["wrapped_dek"], row["wrap_nonce"])
+        try:
+            dek = self._master_box.unwrap_key(row["wrapped_dek"], row["wrap_nonce"])
+        except InvalidTag:
+            raise MemoryStoreError(
+                f"Cannot decrypt session key for {session_id} — master key may have changed"
+            )
         with self._dek_cache_lock:
             self._dek_cache[session_id] = dek
         return dek
@@ -1181,23 +1140,28 @@ class MemoryStore:
         content: str,
         meta: dict[str, Any] | None = None,
     ) -> SessionMessage:
+        session_id = self._canonical_session_id(session_id)
         now = time.time()
         message_id = str(uuid.uuid4())
         metadata = meta or {}
 
-        with self._session_connection(session_id) as conn:
-            row = conn.execute("SELECT COALESCE(MAX(turn_index), -1) AS max_turn FROM messages").fetchone()
+        with self._db_connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(turn_index), -1) AS max_turn FROM messages WHERE session_id = ?",
+                (session_id,)
+            ).fetchone()
             turn_index = int(row["max_turn"]) + 1
 
             encrypted = self._session_box(session_id).encrypt_text(content, aad=message_id.encode("utf-8"))
             conn.execute(
                 """
                 INSERT INTO messages (
-                    message_id, turn_index, role, content_enc, created_at, token_estimate, meta_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    message_id, session_id, turn_index, role, content_enc, created_at, token_estimate, meta_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
+                    session_id,
                     turn_index,
                     role,
                     encrypted,
@@ -1218,19 +1182,21 @@ class MemoryStore:
         )
 
     def list_recent_messages(self, session_id: str, *, limit: int = 10) -> list[SessionMessage]:
+        session_id = self._canonical_session_id(session_id)
         try:
             bounded_limit = max(1, min(int(limit), 5000))
         except (TypeError, ValueError):
             bounded_limit = 10
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT message_id, turn_index, role, content_enc, created_at, meta_json
                 FROM messages
+                WHERE session_id = ?
                 ORDER BY turn_index DESC
                 LIMIT ?
                 """,
-                (bounded_limit,),
+                (session_id, bounded_limit),
             ).fetchall()
 
         box = self._session_box(session_id)
@@ -1258,19 +1224,21 @@ class MemoryStore:
         return parsed
 
     def list_messages(self, session_id: str, *, limit: int = 500) -> list[SessionMessage]:
+        session_id = self._canonical_session_id(session_id)
         try:
             bounded_limit = max(1, min(int(limit), 5000))
         except (TypeError, ValueError):
             bounded_limit = 500
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT message_id, turn_index, role, content_enc, created_at, meta_json
                 FROM messages
+                WHERE session_id = ?
                 ORDER BY turn_index DESC
                 LIMIT ?
                 """,
-                (bounded_limit,),
+                (session_id, bounded_limit),
             ).fetchall()
 
         box = self._session_box(session_id)
@@ -1296,37 +1264,119 @@ class MemoryStore:
         parsed.sort(key=lambda item: item.turn_index)
         return parsed
 
+    def list_messages_page(
+        self,
+        session_id: str,
+        *,
+        direction: str,
+        limit: int = 120,
+        anchor_turn_index: int | None = None,
+    ) -> tuple[list[SessionMessage], bool]:
+        session_id = self._canonical_session_id(session_id)
+        try:
+            bounded_limit = max(1, min(int(limit), 5000))
+        except (TypeError, ValueError):
+            bounded_limit = 120
+
+        normalized_direction = str(direction).strip().lower()
+        if normalized_direction not in {"latest", "older"}:
+            raise ValueError(f"Unsupported history page direction: {direction}")
+
+        if normalized_direction == "older" and anchor_turn_index is None:
+            raise ValueError("anchor_turn_index is required for older history pages")
+
+        params: tuple[Any, ...]
+        query: str
+        if normalized_direction == "latest":
+            query = """
+                SELECT message_id, turn_index, role, content_enc, created_at, meta_json
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY turn_index DESC
+                LIMIT ?
+            """
+            params = (session_id, bounded_limit)
+        else:
+            assert anchor_turn_index is not None
+            query = """
+                SELECT message_id, turn_index, role, content_enc, created_at, meta_json
+                FROM messages
+                WHERE session_id = ? AND turn_index < ?
+                ORDER BY turn_index DESC
+                LIMIT ?
+            """
+            params = (session_id, int(anchor_turn_index), bounded_limit)
+
+        with self._db_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+            if not rows:
+                return ([], False)
+
+            oldest_turn_index = int(rows[-1]["turn_index"])
+            has_older_row = conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? AND turn_index < ? LIMIT 1",
+                (session_id, oldest_turn_index,),
+            ).fetchone()
+
+        box = self._session_box(session_id)
+        parsed: list[SessionMessage] = []
+        for row in rows:
+            try:
+                message_id = row["message_id"]
+                content = box.decrypt_text(row["content_enc"], aad=message_id.encode("utf-8"))
+                parsed.append(
+                    SessionMessage(
+                        message_id=message_id,
+                        role=row["role"],
+                        content=content,
+                        created_at=float(row["created_at"]),
+                        turn_index=int(row["turn_index"]),
+                        meta=self._safe_json_object(row["meta_json"]),
+                    )
+                )
+            except Exception as exc:
+                raise MemoryStoreError(
+                    f"Failed to decode message {row['message_id']} for session {session_id}"
+                ) from exc
+        parsed.sort(key=lambda item: item.turn_index)
+        return (parsed, has_older_row is not None)
+
     def upsert_summary(self, session_id: str, *, turn_start: int, turn_end: int, summary: str) -> None:
+        session_id = self._canonical_session_id(session_id)
         now = time.time()
-        summary_id = f"summary-{turn_end}"
+        summary_id = f"{session_id}-summary-{turn_end}"
         box = self._session_box(session_id)
         encrypted = box.encrypt_text(summary, aad=summary_id.encode("utf-8"))
 
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO summaries (summary_id, turn_start, turn_end, summary_enc, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO summaries (summary_id, session_id, turn_start, turn_end, summary_enc, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary_id) DO UPDATE SET
                     turn_start=excluded.turn_start,
                     turn_end=excluded.turn_end,
                     summary_enc=excluded.summary_enc,
                     created_at=excluded.created_at
                 """,
-                (summary_id, turn_start, turn_end, encrypted, now),
+                (summary_id, session_id, turn_start, turn_end, encrypted, now),
             )
 
         self._touch_session(session_id)
 
     def latest_summary(self, session_id: str) -> str:
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        with self._db_connection() as conn:
             row = conn.execute(
                 """
                 SELECT summary_id, summary_enc
                 FROM summaries
+                WHERE session_id = ?
                 ORDER BY turn_end DESC, created_at DESC
                 LIMIT 1
-                """
+                """,
+                (session_id,)
             ).fetchone()
 
         if row is None:
@@ -1454,19 +1504,20 @@ class MemoryStore:
         policy_flags: tuple[str, ...],
         embedding_service: object | None = None,
     ) -> MemoryRecord:
+        session_id = self._canonical_session_id(session_id)
         now = time.time()
         box = self._session_box(session_id)
 
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             existing = conn.execute(
                 """
                 SELECT memory_id, confidence, content_enc, created_at
                 FROM semantic_memories
-                WHERE fact_key = ? AND kind = ? AND is_deleted = 0
+                WHERE session_id = ? AND fact_key = ? AND kind = ? AND is_deleted = 0
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (fact_key, kind.value),
+                (session_id, fact_key, kind.value),
             ).fetchone()
 
             if existing is not None:
@@ -1479,31 +1530,40 @@ class MemoryStore:
                 memory_id = str(uuid.uuid4())
                 created_at = now
 
-            encrypted = box.encrypt_text(content, aad=memory_id.encode("utf-8"))
-            trust_flags_json = json.dumps(list(trust_flags), separators=(",", ":"))
-            policy_flags_json = json.dumps(list(policy_flags), separators=(",", ":"))
-            digest = self._semantic_hmac_v2(
-                memory_id=memory_id,
-                kind=kind.value,
-                fact_key=fact_key,
-                content_enc=encrypted,
-                confidence=confidence,
-                source_message_id=source_message_id,
-                trust_flags_json=trust_flags_json,
-                policy_flags_json=policy_flags_json,
-                created_at=created_at,
-                updated_at=now,
-                is_deleted=0,
-            )
+        encrypted = box.encrypt_text(content, aad=memory_id.encode("utf-8"))
+        trust_flags_json = json.dumps(list(trust_flags), separators=(",", ":"))
+        policy_flags_json = json.dumps(list(policy_flags), separators=(",", ":"))
+        digest = self._semantic_hmac_v2(
+            memory_id=memory_id,
+            kind=kind.value,
+            fact_key=fact_key,
+            content_enc=encrypted,
+            confidence=confidence,
+            source_message_id=source_message_id,
+            trust_flags_json=trust_flags_json,
+            policy_flags_json=policy_flags_json,
+            created_at=created_at,
+            updated_at=now,
+            is_deleted=0,
+        )
 
+        service = cast("EmbeddingService | None", embedding_service)
+        if service is None:
+            raise MemoryStoreError(
+                "Embedding service is required for semantic memory indexing."
+            )
+        encoded = encode_text_semantic(content, service, task_type="RETRIEVAL_DOCUMENT")
+
+        with self._db_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO semantic_memories (
-                    memory_id, kind, fact_key, content_enc, confidence,
+                    memory_id, session_id, kind, fact_key, content_enc, confidence,
                     source_message_id, trust_flags_json, policy_flags_json,
                     created_at, updated_at, is_deleted, hmac
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 ON CONFLICT(memory_id) DO UPDATE SET
+                    session_id=excluded.session_id,
                     kind=excluded.kind,
                     fact_key=excluded.fact_key,
                     content_enc=excluded.content_enc,
@@ -1517,6 +1577,7 @@ class MemoryStore:
                 """,
                 (
                     memory_id,
+                    session_id,
                     kind.value,
                     fact_key,
                     encrypted,
@@ -1530,13 +1591,6 @@ class MemoryStore:
                 ),
             )
 
-        service = cast("EmbeddingService | None", embedding_service)
-        if service is None:
-            raise MemoryStoreError(
-                "Embedding service is required for semantic memory indexing."
-            )
-        encoded = encode_text_semantic(content, service, task_type="RETRIEVAL_DOCUMENT")
-        with self._index_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO semantic_index (
@@ -1581,11 +1635,11 @@ class MemoryStore:
         )
 
     def load_records_by_ids(self, memory_ids: list[str]) -> list[MemoryRecord]:
-        grouped: dict[str, list[str]] = {}
-        with self._index_connection() as conn:
-            if not memory_ids:
-                return []
+        if not memory_ids:
+            return []
 
+        grouped: dict[str, list[str]] = {}
+        with self._db_connection() as conn:
             placeholders = ",".join("?" for _ in memory_ids)
             rows = conn.execute(
                 f"SELECT memory_id, session_id FROM semantic_index WHERE memory_id IN ({placeholders})",
@@ -1597,7 +1651,7 @@ class MemoryStore:
 
         records: list[MemoryRecord] = []
         for session_id, ids in grouped.items():
-            with self._session_connection(session_id) as conn:
+            with self._db_connection() as conn:
                 placeholders = ",".join("?" for _ in ids)
                 rows = conn.execute(
                     f"""
@@ -1605,9 +1659,9 @@ class MemoryStore:
                            source_message_id, trust_flags_json, policy_flags_json,
                            created_at, updated_at, hmac
                     FROM semantic_memories
-                    WHERE is_deleted = 0 AND memory_id IN ({placeholders})
+                    WHERE session_id = ? AND is_deleted = 0 AND memory_id IN ({placeholders})
                     """,
-                    tuple(ids),
+                    (session_id, *ids),
                 ).fetchall()
 
             box = self._session_box(session_id)
@@ -1659,7 +1713,7 @@ class MemoryStore:
         return records
 
     def semantic_index_candidates(self, *, limit: int = 500) -> list[dict[str, Any]]:
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT memory_id, session_id, kind, fact_key, vector_json, token_set_json, confidence
@@ -1673,18 +1727,19 @@ class MemoryStore:
         return [dict(row) for row in rows]
 
     def list_session_memories(self, session_id: str, *, limit: int = 200) -> list[MemoryRecord]:
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        with self._db_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT memory_id, kind, fact_key, content_enc, confidence,
                        source_message_id, trust_flags_json, policy_flags_json,
                        created_at, updated_at, hmac
                 FROM semantic_memories
-                WHERE is_deleted = 0
+                WHERE session_id = ? AND is_deleted = 0
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (session_id, limit),
             ).fetchall()
 
         box = self._session_box(session_id)
@@ -1726,6 +1781,8 @@ class MemoryStore:
                         updated_at=float(row["updated_at"]),
                     )
                 )
+            except MemoryStoreError:
+                raise
             except Exception as exc:
                 raise MemoryStoreError(
                     f"Failed to decode memory record {row['memory_id']} for session {session_id}"
@@ -1733,53 +1790,192 @@ class MemoryStore:
         return records
 
     def delete_memory(self, session_id: str, memory_id: str) -> bool:
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        with self._db_connection() as conn:
             result = conn.execute(
                 """
                 UPDATE semantic_memories
                 SET is_deleted = 1, updated_at = ?
-                WHERE memory_id = ?
+                WHERE session_id = ? AND memory_id = ?
                 """,
-                (time.time(), memory_id),
+                (time.time(), session_id, memory_id),
             )
             changed = result.rowcount > 0
+            if changed:
+                conn.execute(
+                    "DELETE FROM semantic_index WHERE memory_id = ?",
+                    (memory_id,)
+                )
 
-        if changed:
-            with self._index_connection() as conn:
-                conn.execute("DELETE FROM semantic_index WHERE memory_id = ?", (memory_id,))
-            self._touch_session(session_id)
+        self._touch_session(session_id)
         return changed
 
     def _touch_session(self, session_id: str) -> None:
         session_id = self._canonical_session_id(session_id)
         now = time.time()
-        with self._index_connection() as conn:
+        with self._db_connection() as conn:
+            current = conn.execute(
+                "SELECT title, memory_mode FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                raise MemoryStoreError(f"Unknown session: {session_id}")
+            row_hmac = self._compute_session_hmac(
+                session_id=session_id,
+                title=current["title"],
+                memory_mode=current["memory_mode"],
+                updated_at=now,
+            )
             result = conn.execute(
                 """
                 UPDATE sessions
-                SET updated_at = ?, last_activity = ?
+                SET updated_at = ?, last_activity = ?, row_hmac = ?,
+                    store_version = store_version + 1
                 WHERE session_id = ?
                 """,
-                (now, now, session_id),
+                (now, now, row_hmac, session_id),
             )
-        if result.rowcount <= 0:
-            raise MemoryStoreError(f"Unknown session: {session_id}")
-        with self._session_connection(session_id) as conn:
-            info_result = conn.execute(
-                """
-                UPDATE session_info
-                SET updated_at = ?, last_activity = ?
-                WHERE session_id = ?
-                """,
-                (now, now, session_id),
-            )
-            info_affected = info_result.rowcount
-        if info_affected <= 0:
-            self._upsert_session_info_from_index(session_id)
+            if result.rowcount <= 0:
+                raise MemoryStoreError(f"Unknown session: {session_id}")
 
     # ------------------------------------------------------------------
     # notes CRUD
     # ------------------------------------------------------------------
+
+    def _normalize_note_workspace_kind(self, workspace_kind: str | None) -> str:
+        normalized = str(workspace_kind or self._NOTE_WORKSPACE_TAB).strip().lower()
+        if normalized == self._NOTE_WORKSPACE_SESSION_PAD:
+            return self._NOTE_WORKSPACE_SESSION_PAD
+        return self._NOTE_WORKSPACE_TAB
+
+    def _normalize_note_title(self, title: str | None, *, workspace_kind: str) -> str:
+        normalized = str(title or "").strip()
+        if normalized:
+            return normalized[:200]
+        if workspace_kind == self._NOTE_WORKSPACE_SESSION_PAD:
+            return self._DEFAULT_SESSION_PAD_TITLE
+        return ""
+
+    def _resolve_note_id_alias(self, session_id: str, note_id: str) -> str:
+        normalized = str(note_id or "").strip()
+        if normalized.lower() in {"session_pad", "default", "default_tab"}:
+            return str(self.get_or_create_session_pad(session_id)["note_id"])
+        return normalized
+
+    def _next_note_tab_order(self, session_id: str, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(tab_order), -1) AS max_tab_order FROM notes WHERE session_id = ? AND is_deleted = 0",
+            (session_id,)
+        ).fetchone()
+        return max(1, int(row["max_tab_order"]) + 1)
+
+    def _derive_note_title(self, content: str, *, workspace_kind: str, fallback: str) -> str:
+        if workspace_kind == self._NOTE_WORKSPACE_SESSION_PAD:
+            return self._DEFAULT_SESSION_PAD_TITLE
+
+        for raw_line in content.replace("\r\n", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("<!--") and line.endswith("-->"):
+                continue
+            if line.startswith("### "):
+                return line[4:204].strip() or fallback
+            if line.startswith("## "):
+                return line[3:203].strip() or fallback
+            if line.startswith("# "):
+                return line[2:202].strip() or fallback
+            if line.startswith("**") and line.endswith("**") and len(line) > 4:
+                return line[2:-2][:200].strip() or fallback
+            return line[:200]
+        return fallback
+
+    def _note_dict_from_row(self, session_id: str, row: sqlite3.Row) -> dict[str, object] | None:
+        note_id = str(row["note_id"])
+        box = self._session_box(session_id)
+        try:
+            content = box.decrypt_text(row["content_enc"], aad=note_id.encode("utf-8"))
+        except Exception:
+            logger.warning("Failed to decrypt note %s in session %s", note_id, session_id)
+            return None
+
+        workspace_kind = self._normalize_note_workspace_kind(row["workspace_kind"])
+        stored_title = str(row["title"] or "").strip()
+        return {
+            "note_id": note_id,
+            "title": stored_title or self._derive_note_title(
+                content,
+                workspace_kind=workspace_kind,
+                fallback="Untitled Tab",
+            ),
+            "content": content,
+            "workspace_kind": workspace_kind,
+            "is_default_tab": bool(row["is_default_tab"]),
+            "tab_order": int(row["tab_order"]),
+            "is_pinned": bool(row["is_pinned"]),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+            "source": row["source"],
+        }
+
+    def get_or_create_session_pad(self, session_id: str) -> dict[str, object]:
+        session_id = self._canonical_session_id(session_id)
+        with self._db_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT note_id, content_enc, title, workspace_kind, is_default_tab, tab_order,
+                       is_pinned, created_at, updated_at, source
+                FROM notes
+                WHERE session_id = ? AND is_deleted = 0 AND is_default_tab = 1
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (session_id,)
+            ).fetchone()
+            if row is not None:
+                note = self._note_dict_from_row(session_id, row)
+                if note is not None:
+                    return note
+
+            now = time.time()
+            note_id = str(uuid.uuid4())
+            encrypted = self._session_box(session_id).encrypt_text("", aad=note_id.encode("utf-8"))
+            conn.execute(
+                """
+                INSERT INTO notes (
+                    note_id, session_id, content_enc, title, workspace_kind, is_default_tab, tab_order,
+                    is_pinned, created_at, updated_at, is_deleted, source
+                )
+                VALUES (?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?)
+                """,
+                (
+                    note_id,
+                    session_id,
+                    encrypted,
+                    self._DEFAULT_SESSION_PAD_TITLE,
+                    self._NOTE_WORKSPACE_SESSION_PAD,
+                    now,
+                    now,
+                    "user",
+                ),
+            )
+            created_row = conn.execute(
+                """
+                SELECT note_id, content_enc, title, workspace_kind, is_default_tab, tab_order,
+                       is_pinned, created_at, updated_at, source
+                FROM notes
+                WHERE note_id = ?
+                """,
+                (note_id,),
+            ).fetchone()
+
+        self._touch_session(session_id)
+        if created_row is None:
+            raise MemoryStoreError("Failed to create session pad")
+        note = self._note_dict_from_row(session_id, created_row)
+        if note is None:
+            raise MemoryStoreError("Failed to read session pad after creation")
+        return note
 
     def create_note(
         self,
@@ -1787,25 +1983,64 @@ class MemoryStore:
         *,
         content: str,
         source: str = "user",
+        title: str | None = None,
+        workspace_kind: str | None = None,
+        is_default_tab: bool = False,
+        tab_order: int | None = None,
     ) -> dict[str, object]:
         """Create a new note in a session. Returns the note dict."""
+        session_id = self._canonical_session_id(session_id)
         now = time.time()
         note_id = str(uuid.uuid4())
         box = self._session_box(session_id)
+        normalized_workspace_kind = self._normalize_note_workspace_kind(workspace_kind)
+        if normalized_workspace_kind == self._NOTE_WORKSPACE_SESSION_PAD:
+            is_default_tab = True
+        if is_default_tab:
+            normalized_workspace_kind = self._NOTE_WORKSPACE_SESSION_PAD
+        normalized_title = self._normalize_note_title(
+            title,
+            workspace_kind=normalized_workspace_kind,
+        )
         encrypted = box.encrypt_text(content, aad=note_id.encode("utf-8"))
 
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
+            resolved_tab_order = 0 if is_default_tab else (
+                max(1, int(tab_order)) if tab_order is not None else self._next_note_tab_order(session_id, conn)
+            )
             conn.execute(
                 """
-                INSERT INTO notes (note_id, content_enc, is_pinned, created_at, updated_at, is_deleted, source)
-                VALUES (?, ?, 0, ?, ?, 0, ?)
+                INSERT INTO notes (
+                    note_id, session_id, content_enc, title, workspace_kind, is_default_tab, tab_order,
+                    is_pinned, created_at, updated_at, is_deleted, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?)
                 """,
-                (note_id, encrypted, now, now, source),
+                (
+                    note_id,
+                    session_id,
+                    encrypted,
+                    normalized_title,
+                    normalized_workspace_kind,
+                    int(is_default_tab),
+                    resolved_tab_order,
+                    now,
+                    now,
+                    source,
+                ),
             )
         self._touch_session(session_id)
         return {
             "note_id": note_id,
+            "title": normalized_title or self._derive_note_title(
+                content,
+                workspace_kind=normalized_workspace_kind,
+                fallback="Untitled Tab",
+            ),
             "content": content,
+            "workspace_kind": normalized_workspace_kind,
+            "is_default_tab": bool(is_default_tab),
+            "tab_order": resolved_tab_order,
             "is_pinned": False,
             "created_at": now,
             "updated_at": now,
@@ -1813,73 +2048,46 @@ class MemoryStore:
         }
 
     def list_notes(self, session_id: str, *, limit: int = 200) -> list[dict[str, object]]:
-        """List non-deleted notes for a session, pinned first, then by updated_at DESC."""
+        """List non-deleted notes for a session, session pad first."""
+        session_id = self._canonical_session_id(session_id)
         try:
             bounded_limit = max(1, min(int(limit), 1000))
         except (TypeError, ValueError):
             bounded_limit = 200
 
-        with self._session_connection(session_id) as conn:
+        self.get_or_create_session_pad(session_id)
+        with self._db_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT note_id, content_enc, is_pinned, created_at, updated_at, source
+                SELECT note_id, content_enc, title, workspace_kind, is_default_tab, tab_order,
+                       is_pinned, created_at, updated_at, source
                 FROM notes
-                WHERE is_deleted = 0
-                ORDER BY is_pinned DESC, updated_at DESC
+                WHERE session_id = ? AND is_deleted = 0
+                ORDER BY is_default_tab DESC, is_pinned DESC, tab_order ASC, updated_at DESC
                 LIMIT ?
                 """,
-                (bounded_limit,),
+                (session_id, bounded_limit),
             ).fetchall()
 
-        box = self._session_box(session_id)
         notes: list[dict[str, object]] = []
         for row in rows:
-            note_id = row["note_id"]
-            try:
-                content = box.decrypt_text(
-                    row["content_enc"], aad=note_id.encode("utf-8")
-                )
-            except Exception:
-                logger.warning("Failed to decrypt note %s in session %s", note_id, session_id)
-                continue
-            notes.append(
-                {
-                    "note_id": note_id,
-                    "content": content,
-                    "is_pinned": bool(row["is_pinned"]),
-                    "created_at": float(row["created_at"]),
-                    "updated_at": float(row["updated_at"]),
-                    "source": row["source"],
-                }
-            )
+            note = self._note_dict_from_row(session_id, row)
+            if note is not None:
+                notes.append(note)
         return notes
 
     def get_note(self, session_id: str, note_id: str) -> dict[str, object] | None:
         """Get a single note by ID. Returns None if not found or deleted."""
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
+        with self._db_connection() as conn:
             row = conn.execute(
-                "SELECT note_id, content_enc, is_pinned, created_at, updated_at, source "
-                "FROM notes WHERE note_id = ? AND is_deleted = 0",
-                (note_id,),
+                "SELECT note_id, content_enc, title, workspace_kind, is_default_tab, tab_order, "
+                "is_pinned, created_at, updated_at, source "
+                "FROM notes WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                (session_id, normalized_note_id),
             ).fetchone()
-        if row is None:
-            return None
-        box = self._session_box(session_id)
-        try:
-            content = box.decrypt_text(
-                row["content_enc"], aad=note_id.encode("utf-8")
-            )
-        except Exception:
-            logger.warning("Failed to decrypt note %s in session %s", note_id, session_id)
-            return None
-        return {
-            "note_id": note_id,
-            "content": content,
-            "is_pinned": bool(row["is_pinned"]),
-            "created_at": float(row["created_at"]),
-            "updated_at": float(row["updated_at"]),
-            "source": row["source"],
-        }
+        return None if row is None else self._note_dict_from_row(session_id, row)
 
     def update_note(
         self,
@@ -1888,30 +2096,36 @@ class MemoryStore:
         *,
         content: str | None = None,
         is_pinned: bool | None = None,
+        title: str | None = None,
         touch_timestamp: float | None = None,
     ) -> dict[str, object] | None:
         """Update a note's content and/or pinned state. Returns updated note or None."""
+        session_id = self._canonical_session_id(session_id)
         now = touch_timestamp if touch_timestamp is not None else time.time()
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
         box = self._session_box(session_id)
 
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             existing = conn.execute(
-                "SELECT note_id, content_enc, is_pinned, created_at, source "
-                "FROM notes WHERE note_id = ? AND is_deleted = 0",
-                (note_id,),
+                "SELECT note_id, content_enc, title, workspace_kind, is_default_tab, tab_order, "
+                "is_pinned, created_at, source "
+                "FROM notes WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                (session_id, normalized_note_id),
             ).fetchone()
             if existing is None:
                 return None
 
             new_content_enc = existing["content_enc"]
+            final_title = str(existing["title"] or "").strip()
+            workspace_kind = self._normalize_note_workspace_kind(existing["workspace_kind"])
             try:
                 final_content = box.decrypt_text(
-                    existing["content_enc"], aad=note_id.encode("utf-8")
+                    existing["content_enc"], aad=normalized_note_id.encode("utf-8")
                 )
             except Exception:
                 logger.warning(
                     "Failed to decrypt note %s in session %s during update",
-                    note_id,
+                    normalized_note_id,
                     session_id,
                 )
                 if content is None:
@@ -1923,12 +2137,15 @@ class MemoryStore:
                 # Snapshot old content as a version before overwriting
                 version_id = str(uuid.uuid4())
                 conn.execute(
-                    "INSERT INTO note_versions (version_id, note_id, content_enc, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (version_id, note_id, existing["content_enc"], now),
+                    "INSERT INTO note_versions (version_id, note_id, session_id, content_enc, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (version_id, normalized_note_id, session_id, existing["content_enc"], now),
                 )
                 final_content = content
-                new_content_enc = box.encrypt_text(content, aad=note_id.encode("utf-8"))
+                new_content_enc = box.encrypt_text(content, aad=normalized_note_id.encode("utf-8"))
+
+            if title is not None:
+                final_title = self._normalize_note_title(title, workspace_kind=workspace_kind)
 
             final_pinned = bool(existing["is_pinned"])
             if is_pinned is not None:
@@ -1936,16 +2153,24 @@ class MemoryStore:
 
             conn.execute(
                 """
-                UPDATE notes SET content_enc = ?, is_pinned = ?, updated_at = ?
-                WHERE note_id = ? AND is_deleted = 0
+                UPDATE notes SET content_enc = ?, title = ?, is_pinned = ?, updated_at = ?
+                WHERE session_id = ? AND note_id = ? AND is_deleted = 0
                 """,
-                (new_content_enc, int(final_pinned), now, note_id),
+                (new_content_enc, final_title, int(final_pinned), now, session_id, normalized_note_id),
             )
 
         self._touch_session(session_id)
         return {
-            "note_id": note_id,
+            "note_id": normalized_note_id,
+            "title": final_title or self._derive_note_title(
+                final_content,
+                workspace_kind=workspace_kind,
+                fallback="Untitled Tab",
+            ),
             "content": final_content,
+            "workspace_kind": workspace_kind,
+            "is_default_tab": bool(existing["is_default_tab"]),
+            "tab_order": int(existing["tab_order"]),
             "is_pinned": final_pinned,
             "created_at": float(existing["created_at"]),
             "updated_at": now,
@@ -1954,19 +2179,27 @@ class MemoryStore:
 
     def delete_note(self, session_id: str, note_id: str) -> bool:
         """Soft-delete a note. Returns True if the note existed and was deleted."""
+        session_id = self._canonical_session_id(session_id)
         now = time.time()
-        with self._session_connection(session_id) as conn:
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
+        with self._db_connection() as conn:
+            existing = conn.execute(
+                "SELECT is_default_tab FROM notes WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                (session_id, normalized_note_id),
+            ).fetchone()
+            if existing is not None and bool(existing["is_default_tab"]):
+                raise MemoryStoreError("Cannot delete the session pad")
             result = conn.execute(
                 "UPDATE notes SET is_deleted = 1, updated_at = ? "
-                "WHERE note_id = ? AND is_deleted = 0",
-                (now, note_id),
+                "WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                (now, session_id, normalized_note_id),
             )
             changed = result.rowcount > 0
             if changed:
                 conn.execute(
                     "UPDATE note_images SET is_deleted = 1 "
-                    "WHERE note_id = ? AND is_deleted = 0",
-                    (note_id,),
+                    "WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                    (session_id, normalized_note_id),
                 )
         if changed:
             self._touch_session(session_id)
@@ -1988,31 +2221,33 @@ class MemoryStore:
         alt_text: str = "",
     ) -> dict[str, object]:
         """Store an encrypted image associated with a note. Returns metadata dict."""
+        session_id = self._canonical_session_id(session_id)
         now = time.time()
         image_id = str(uuid.uuid4())
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
         box = self._session_box(session_id)
         image_enc = box.encrypt_bytes(image_bytes, aad=image_id.encode("utf-8"))
 
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             note_row = conn.execute(
-                "SELECT 1 FROM notes WHERE note_id = ? AND is_deleted = 0",
-                (note_id,),
+                "SELECT 1 FROM notes WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                (session_id, normalized_note_id,),
             ).fetchone()
             if note_row is None:
                 raise MemoryStoreError(
-                    f"Note not found or deleted: {note_id}"
+                    f"Note not found or deleted: {normalized_note_id}"
                 )
             conn.execute(
                 """
                 INSERT INTO note_images
-                    (image_id, note_id, image_enc, mime_type, width, height, alt_text, created_at, is_deleted)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    (image_id, note_id, session_id, image_enc, mime_type, width, height, alt_text, created_at, is_deleted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
-                (image_id, note_id, image_enc, mime_type, width, height, alt_text, now),
+                (image_id, normalized_note_id, session_id, image_enc, mime_type, width, height, alt_text, now),
             )
         return {
             "image_id": image_id,
-            "note_id": note_id,
+            "note_id": normalized_note_id,
             "mime_type": mime_type,
             "width": width,
             "height": height,
@@ -2022,14 +2257,15 @@ class MemoryStore:
 
     def get_note_image(self, session_id: str, image_id: str) -> dict[str, object] | None:
         """Retrieve a single image including decrypted bytes. Returns None if not found."""
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        with self._db_connection() as conn:
             row = conn.execute(
                 "SELECT ni.image_id, ni.note_id, ni.image_enc, ni.mime_type, ni.width, "
                 "ni.height, ni.alt_text, ni.created_at "
                 "FROM note_images ni "
                 "INNER JOIN notes n ON n.note_id = ni.note_id "
-                "WHERE ni.image_id = ? AND ni.is_deleted = 0 AND n.is_deleted = 0",
-                (image_id,),
+                "WHERE ni.session_id = ? AND ni.image_id = ? AND ni.is_deleted = 0 AND n.is_deleted = 0",
+                (session_id, image_id,),
             ).fetchone()
         if row is None:
             return None
@@ -2054,15 +2290,17 @@ class MemoryStore:
 
     def list_note_images(self, session_id: str, note_id: str) -> list[dict[str, object]]:
         """List metadata for all images attached to a note (no bytes returned)."""
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
+        with self._db_connection() as conn:
             rows = conn.execute(
                 "SELECT ni.image_id, ni.note_id, ni.mime_type, ni.width, ni.height, "
                 "ni.alt_text, ni.created_at "
                 "FROM note_images ni "
                 "INNER JOIN notes n ON n.note_id = ni.note_id "
-                "WHERE ni.note_id = ? AND ni.is_deleted = 0 AND n.is_deleted = 0 "
+                "WHERE ni.session_id = ? AND ni.note_id = ? AND ni.is_deleted = 0 AND n.is_deleted = 0 "
                 "ORDER BY ni.created_at ASC",
-                (note_id,),
+                (session_id, normalized_note_id,),
             ).fetchall()
         return [
             {
@@ -2079,11 +2317,13 @@ class MemoryStore:
 
     def delete_note_images_for_note(self, session_id: str, note_id: str) -> int:
         """Soft-delete all images for a note. Returns count of deleted images."""
-        with self._session_connection(session_id) as conn:
+        session_id = self._canonical_session_id(session_id)
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
+        with self._db_connection() as conn:
             result = conn.execute(
                 "UPDATE note_images SET is_deleted = 1 "
-                "WHERE note_id = ? AND is_deleted = 0",
-                (note_id,),
+                "WHERE session_id = ? AND note_id = ? AND is_deleted = 0",
+                (session_id, normalized_note_id,),
             )
         return result.rowcount
 
@@ -2093,17 +2333,19 @@ class MemoryStore:
         self, session_id: str, note_id: str, *, limit: int = 50
     ) -> list[dict[str, object]]:
         """List version history for a note (most recent first). Content is decrypted."""
+        session_id = self._canonical_session_id(session_id)
         try:
             bounded_limit = max(1, min(int(limit), 500))
         except (TypeError, ValueError):
             bounded_limit = 50
+        normalized_note_id = self._resolve_note_id_alias(session_id, note_id)
         box = self._session_box(session_id)
-        with self._session_connection(session_id) as conn:
+        with self._db_connection() as conn:
             rows = conn.execute(
                 "SELECT version_id, note_id, content_enc, created_at "
-                "FROM note_versions WHERE note_id = ? "
+                "FROM note_versions WHERE session_id = ? AND note_id = ? "
                 "ORDER BY created_at DESC LIMIT ?",
-                (note_id, bounded_limit),
+                (session_id, normalized_note_id, bounded_limit),
             ).fetchall()
 
         versions: list[dict[str, object]] = []

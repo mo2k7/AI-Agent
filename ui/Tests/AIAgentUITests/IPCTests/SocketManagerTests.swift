@@ -3,16 +3,31 @@ import Testing
 @testable import AIAgentApp
 
 @Test
+func tailscaleEndpointRecognizesMagicDNSAndCGNATHosts() {
+    #expect(TailscaleEndpoint.isTailscaleHost("100.85.139.105"))
+    #expect(TailscaleEndpoint.isTailscaleHost("muhammads-macbook-pro.tail8a4dee.ts.net"))
+    #expect(TailscaleEndpoint.isTailscaleHost("muhammads-macbook-pro.tail8a4dee.ts.net."))
+    #expect(!TailscaleEndpoint.isTailscaleHost("example.com"))
+}
+
+@Test
+func tailscaleEndpointUpgradesMagicDNSWebSocketsToTLS() {
+    let url = URL(string: "ws://muhammads-macbook-pro.tail8a4dee.ts.net:8765")!
+    let upgraded = TailscaleEndpoint.upgradeToTLS(url)
+    #expect(upgraded.absoluteString == "wss://muhammads-macbook-pro.tail8a4dee.ts.net:8765")
+}
+
+@Test
 @MainActor
 func socketManagerFallsBackAcrossCandidatesUntilConnected() async {
     let manager = SocketManager()
-    let candidates = ["/tmp/ai-agent-old.sock", "/tmp/ai-agent-new.sock", "/tmp/ai-agent-final.sock"]
+    let candidates = ["ws://127.0.0.1:9001", "ws://127.0.0.1:9002", "ws://127.0.0.1:9003"]
     var attempts: [String] = []
 
     do {
-        try await manager.connectUsingCandidates(candidates) { path in
-            attempts.append(path)
-            if path != "/tmp/ai-agent-new.sock" {
+        try await manager.connectUsingCandidates(candidates) { endpoint in
+            attempts.append(endpoint)
+            if endpoint != "ws://127.0.0.1:9002" {
                 throw SocketError.connectionFailed("simulated failure")
             }
         }
@@ -20,20 +35,20 @@ func socketManagerFallsBackAcrossCandidatesUntilConnected() async {
         Issue.record("Expected fallback to succeed, got error: \(error)")
     }
 
-    #expect(attempts == ["/tmp/ai-agent-old.sock", "/tmp/ai-agent-new.sock"])
+    #expect(attempts == ["ws://127.0.0.1:9001", "ws://127.0.0.1:9002"])
 }
 
 @Test
 @MainActor
 func socketManagerStopsStateMachineAfterFirstSuccessfulCandidate() async {
     let manager = SocketManager()
-    let candidates = ["/tmp/ai-agent-first.sock", "/tmp/ai-agent-second.sock"]
+    let candidates = ["ws://127.0.0.1:9101", "ws://127.0.0.1:9102"]
     var attempts: [String] = []
 
     do {
-        try await manager.connectUsingCandidates(candidates) { path in
-            attempts.append(path)
-            if path == "/tmp/ai-agent-first.sock" {
+        try await manager.connectUsingCandidates(candidates) { endpoint in
+            attempts.append(endpoint)
+            if endpoint == "ws://127.0.0.1:9101" {
                 return
             }
             throw SocketError.connectionFailed("should not be attempted")
@@ -42,14 +57,14 @@ func socketManagerStopsStateMachineAfterFirstSuccessfulCandidate() async {
         Issue.record("Expected first candidate success, got \(error)")
     }
 
-    #expect(attempts == ["/tmp/ai-agent-first.sock"])
+    #expect(attempts == ["ws://127.0.0.1:9101"])
 }
 
 @Test
 @MainActor
 func socketManagerReportsFailureAfterAllCandidatesFail() async {
     let manager = SocketManager()
-    let candidates = ["/tmp/ai-agent-a.sock", "/tmp/ai-agent-b.sock"]
+    let candidates = ["ws://127.0.0.1:9201", "ws://127.0.0.1:9202"]
     var attempts: [String] = []
 
     do {
@@ -61,8 +76,8 @@ func socketManagerReportsFailureAfterAllCandidatesFail() async {
     } catch let error as SocketError {
         if case .connectionFailed(let reason) = error {
             #expect(reason.contains("2 attempted"))
-            #expect(reason.contains("/tmp/ai-agent-a.sock"))
-            #expect(reason.contains("/tmp/ai-agent-b.sock"))
+            #expect(reason.contains("ws://127.0.0.1:9201"))
+            #expect(reason.contains("ws://127.0.0.1:9202"))
         } else {
             Issue.record("Expected connectionFailed error, got \(error)")
         }
@@ -80,12 +95,12 @@ func socketManagerRejectsEmptyCandidateList() async {
 
     do {
         try await manager.connectUsingCandidates([])
-        Issue.record("Expected noAvailableSocket for empty candidates.")
+        Issue.record("Expected noConfiguredEndpoint for empty candidates.")
     } catch let error as SocketError {
-        if case .noAvailableSocket = error {
+        if case .noConfiguredEndpoint = error {
             #expect(true)
         } else {
-            Issue.record("Expected noAvailableSocket, got \(error)")
+            Issue.record("Expected noConfiguredEndpoint, got \(error)")
         }
     } catch {
         Issue.record("Expected SocketError, got \(error)")
@@ -96,19 +111,19 @@ func socketManagerRejectsEmptyCandidateList() async {
 @MainActor
 func socketManagerAllowsRetryAfterFailedDirectConnect() async {
     let manager = SocketManager()
-    let missingPath = "/tmp/ai-agent-missing-\(UUID().uuidString).sock"
+    let missingEndpoint = "ws://127.0.0.1:65534"
     defer { manager.disconnect() }
 
     do {
-        try await manager.connect(toPath: missingPath)
-        Issue.record("Expected first connect attempt to fail for missing socket.")
+        try await manager.connect(toURLString: missingEndpoint)
+        Issue.record("Expected first connect attempt to fail for missing endpoint.")
     } catch {
         // Expected
     }
 
     do {
-        try await manager.connect(toPath: missingPath)
-        Issue.record("Expected second connect attempt to fail for missing socket.")
+        try await manager.connect(toURLString: missingEndpoint)
+        Issue.record("Expected second connect attempt to fail for missing endpoint.")
     } catch let error as SocketError {
         if case .alreadyConnecting = error {
             Issue.record("Retry path should not be blocked by stale connecting state.")
@@ -124,7 +139,7 @@ func socketManagerDisconnectClearsDispatcherAccumulators() {
     let manager = SocketManager()
     var updates: [(requestId: String, text: String, done: Bool)] = []
 
-    manager.dispatcher.onStreamingUpdate = { requestId, text, done in
+    manager.dispatcher.onStreamingUpdate = { requestId, _delta, text, done in
         updates.append((requestId, text, done))
     }
 

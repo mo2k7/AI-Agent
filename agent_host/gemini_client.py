@@ -9,6 +9,7 @@ Uses the new `google.genai` Client API which allows per-request model selection.
 
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -62,7 +63,7 @@ class GeminiClient:
         >>> tools = [{"name": "search_files", "description": "Search files", "parameters": {...}}]
         >>> response = client.send_prompt_with_tools("Find my Python files", tools)
         >>> # Use a different model for this request
-        >>> response = client.send_prompt_with_tools("...", tools, model="gemini-3-pro-preview")
+        >>> response = client.send_prompt_with_tools("...", tools, model="gemini-2.5-pro")
     """
     
     # HTTP status codes for retry logic
@@ -79,24 +80,39 @@ class GeminiClient:
         "predict",
         "generate",
     )
-    _IMAGE_QUALITY_PREFERENCES: dict[str, tuple[str, ...]] = {
-        "fast": (
-            "imagen-4.0-fast-generate-001",
-            "imagen-3.0-fast-generate-001",
-        ),
-        "standard": (
-            "imagen-4.0-generate-001",
-            "imagen-3.0-generate-001",
-        ),
-        "ultra": (
-            "imagen-4.0-ultra-generate-001",
-        ),
-    }
+
+    @staticmethod
+    def _resolve_http_timeout_seconds() -> Optional[float]:
+        """Resolve SDK HTTP timeout from environment."""
+        timeout_source = "AI_AGENT_GEMINI_HTTP_TIMEOUT_SECONDS"
+        raw_timeout = os.environ.get(timeout_source, "").strip()
+        if not raw_timeout:
+            timeout_source = "AI_AGENT_MODEL_TIMEOUT_SECONDS"
+            raw_timeout = os.environ.get(timeout_source, "").strip()
+        if not raw_timeout:
+            return None
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid %s value %r for Gemini HTTP timeout",
+                timeout_source,
+                raw_timeout,
+            )
+            return None
+        if timeout_seconds <= 0:
+            logger.warning(
+                "Ignoring non-positive %s value %r for Gemini HTTP timeout",
+                timeout_source,
+                raw_timeout,
+            )
+            return None
+        return timeout_seconds
     
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gemini-2.0-flash-exp",
+        model_name: str | None = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         *,
@@ -110,6 +126,8 @@ class GeminiClient:
         Args:
             api_key: Google API key for authentication.
             model_name: Default model name to use (can be overridden per request).
+                When omitted, the client resolves the best available text model
+                dynamically from the live Gemini catalog.
             max_retries: Maximum number of retry attempts for failed requests.
             retry_delay: Initial delay in seconds between retry attempts.
             require_no_training: Fail closed unless backend mode can enforce no-training policy.
@@ -132,32 +150,268 @@ class GeminiClient:
         if use_vertexai and (not vertex_project or not vertex_project.strip()):
             raise GeminiClientError("vertex_project is required when use_vertexai is enabled")
         
-        self.model_name = model_name
+        self.model_name = self._normalize_model_name(model_name) if model_name else ""
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.require_no_training = require_no_training
         self.use_vertexai = use_vertexai
         self.vertex_project = vertex_project.strip() if isinstance(vertex_project, str) else None
         self.vertex_location = vertex_location.strip() if vertex_location else "us-central1"
+        self.http_timeout_seconds = self._resolve_http_timeout_seconds()
+        http_options = (
+            types.HttpOptions(timeout=self.http_timeout_seconds)
+            if self.http_timeout_seconds is not None
+            else None
+        )
 
         if self.use_vertexai:
+            client_kwargs: Dict[str, Any] = {
+                "vertexai": True,
+                "project": self.vertex_project,
+                "location": self.vertex_location,
+            }
+            if http_options is not None:
+                client_kwargs["http_options"] = http_options
             self._client = genai.Client(
-                vertexai=True,
-                project=self.vertex_project,
-                location=self.vertex_location,
+                **client_kwargs,
             )
             logger.info(
-                "Initialized GeminiClient (Vertex AI) with default model: %s, project=%s, location=%s",
-                model_name,
+                "Initialized GeminiClient (Vertex AI) with default model: %s, project=%s, location=%s, http_timeout=%s",
+                self.model_name or "<auto>",
                 self.vertex_project,
                 self.vertex_location,
+                self.http_timeout_seconds if self.http_timeout_seconds is not None else "default",
             )
         else:
-            self._client = genai.Client(api_key=api_key)
-            logger.info("Initialized GeminiClient with default model: %s", model_name)
+            client_kwargs = {"api_key": api_key}
+            if http_options is not None:
+                client_kwargs["http_options"] = http_options
+            self._client = genai.Client(**client_kwargs)
+            logger.info(
+                "Initialized GeminiClient with default model: %s, http_timeout=%s",
+                self.model_name or "<auto>",
+                self.http_timeout_seconds if self.http_timeout_seconds is not None else "default",
+            )
         self._cached_image_models: list[str] = []
         self._cached_image_models_expires_at = 0.0
+        self._cached_models: list[dict[str, Any]] = []
+        self._cached_models_expires_at = 0.0
     
+    _MODEL_CACHE_TTL_SECONDS = 600.0
+
+    def list_models(
+        self,
+        *,
+        filter_action: str | None = None,
+        force_refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List all available Gemini models.
+
+        Args:
+            filter_action: Optional action to filter by (e.g. ``"generateContent"``,
+                ``"embedContent"``).  Only models whose ``supported_actions`` include
+                the given action are returned.
+            force_refresh: Bypass the cache and re-fetch from the API.
+
+        Returns:
+            List of model info dicts with keys: ``name``, ``display_name``,
+            ``description``, ``supported_actions``, ``input_token_limit``,
+            ``output_token_limit``.
+        """
+        now = time.time()
+        if (
+            not force_refresh
+            and self._cached_models
+            and now < self._cached_models_expires_at
+        ):
+            models = self._cached_models
+        else:
+            try:
+                try:
+                    pager = self._client.models.list(
+                        config=types.ListModelsConfig(page_size=200),
+                    )
+                except TypeError:
+                    pager = self._client.models.list()
+            except Exception as exc:
+                raise GeminiClientError(f"Failed to list models: {exc}") from exc
+
+            models = []
+            for model in pager:
+                raw_name = str(getattr(model, "name", "") or "").strip()
+                if not raw_name:
+                    continue
+                normalized_name = self._normalize_model_name(raw_name)
+                supported_actions = getattr(model, "supported_actions", None) or []
+                if not isinstance(supported_actions, (list, tuple)):
+                    supported_actions = []
+                record = {
+                    "name": normalized_name,
+                    "display_name": str(getattr(model, "display_name", "") or ""),
+                    "description": str(getattr(model, "description", "") or ""),
+                    "supported_actions": [str(a) for a in supported_actions],
+                    "input_token_limit": int(getattr(model, "input_token_limit", 0) or 0),
+                    "output_token_limit": int(getattr(model, "output_token_limit", 0) or 0),
+                }
+                record.update(self._derive_model_metadata(record))
+                models.append(record)
+            self._cached_models = self._sort_model_catalog(models)
+            self._cached_models_expires_at = now + self._MODEL_CACHE_TTL_SECONDS
+
+        if filter_action:
+            lowered_filter = filter_action.strip().lower()
+            return [
+                m for m in models
+                if any(lowered_filter in str(a).lower() for a in m["supported_actions"])
+            ]
+        return list(models)
+
+    @classmethod
+    def _extract_model_version(cls, model_name: str) -> tuple[int, int, int]:
+        lowered = model_name.strip().lower()
+        match = re.search(r"gemini-(\d+)(?:\.(\d+))?(?:[.-](\d+))?", lowered)
+        if match is None:
+            match = re.search(r"imagen-(\d+)(?:\.(\d+))?(?:[.-](\d+))?", lowered)
+        if match is None:
+            return (0, 0, 0)
+        major = int(match.group(1) or 0)
+        minor = int(match.group(2) or 0)
+        patch = int(match.group(3) or 0)
+        return (major, minor, patch)
+
+    @classmethod
+    def _looks_like_preview_model(cls, value: str) -> bool:
+        lowered = value.strip().lower()
+        return any(token in lowered for token in ("preview", "experimental", "exp"))
+
+    @classmethod
+    def _supports_native_deep_think(cls, model_name: str) -> bool:
+        lowered = model_name.strip().lower()
+        major, minor, _ = cls._extract_model_version(lowered)
+        if not lowered.startswith("gemini-"):
+            return False
+        if major >= 3:
+            return True
+        return major == 2 and minor >= 5
+
+    @classmethod
+    def _derive_model_metadata(cls, model_info: dict[str, Any]) -> dict[str, Any]:
+        normalized_name = str(model_info.get("name", "") or "").strip()
+        display_name = str(model_info.get("display_name", "") or "").strip()
+        description = str(model_info.get("description", "") or "").strip()
+        supported_actions = model_info.get("supported_actions", []) or []
+        lowered_actions = [str(action).lower() for action in supported_actions]
+        lowered_name = normalized_name.lower()
+        return {
+            "is_preview": cls._looks_like_preview_model(normalized_name)
+            or cls._looks_like_preview_model(display_name)
+            or cls._looks_like_preview_model(description),
+            "supports_deep_think": cls._supports_native_deep_think(normalized_name),
+            "is_text_generation_model": cls._is_selectable_text_model_name(
+                lowered_name,
+                lowered_actions,
+            ),
+            "is_image_generation_model": cls._is_image_generation_model_name(
+                lowered_name,
+                lowered_actions,
+            ),
+        }
+
+    @classmethod
+    def _sort_model_catalog(cls, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            models,
+            key=lambda model: (
+                1 if model.get("is_text_generation_model") else 0,
+                1 if not model.get("is_preview") else 0,
+                cls._extract_model_version(str(model.get("name", ""))),
+                int(model.get("output_token_limit", 0) or 0),
+                int(model.get("input_token_limit", 0) or 0),
+                str(model.get("display_name", "") or model.get("name", "")).lower(),
+            ),
+            reverse=True,
+        )
+
+    @classmethod
+    def _is_selectable_text_model_name(
+        cls,
+        lowered_name: str,
+        lowered_actions: list[str],
+    ) -> bool:
+        if not lowered_name.startswith("gemini-"):
+            return False
+        if any(token in lowered_name for token in ("image", "embedding", "embed", "tts", "aqa")):
+            return False
+        if not lowered_actions:
+            return True
+        return any("generatecontent" in action for action in lowered_actions)
+
+    @classmethod
+    def _is_image_generation_model_name(
+        cls,
+        lowered_name: str,
+        lowered_actions: list[str],
+    ) -> bool:
+        if lowered_name.startswith("gemini-") and "image" in lowered_name:
+            return True
+        if lowered_name.startswith("imagen-"):
+            return True
+        if not lowered_actions:
+            return False
+        if lowered_name.startswith("gemini-") and any(
+            any(hint in action for hint in cls._IMAGE_SUPPORTED_ACTION_HINTS)
+            for action in lowered_actions
+        ):
+            return "image" in lowered_name
+        return False
+
+    def list_text_models(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
+        return [
+            model
+            for model in self.list_models(force_refresh=force_refresh)
+            if model.get("is_text_generation_model")
+        ]
+
+    def resolve_text_model(self, model_override: str | None = None) -> str:
+        available_models = self.list_text_models()
+        if not available_models:
+            raise GeminiClientError("No text-generation Gemini models are available for this account/project.")
+
+        requested_model = (model_override or self.model_name or "").strip()
+        if requested_model:
+            normalized = self._normalize_model_name(requested_model)
+            available_names = {str(model["name"]) for model in available_models}
+            if normalized not in available_names:
+                raise GeminiClientError(
+                    f"Configured model '{requested_model}' is unavailable. "
+                    f"Available text models: {', '.join(sorted(available_names))}"
+                )
+            return normalized
+
+        ranked_models = sorted(
+            available_models,
+            key=self._text_model_sort_key,
+            reverse=True,
+        )
+        resolved = str(ranked_models[0]["name"])
+        self.model_name = resolved
+        return resolved
+
+    @classmethod
+    def _text_model_sort_key(cls, model_info: dict[str, Any]) -> tuple[Any, ...]:
+        normalized_name = str(model_info.get("name", "") or "").strip().lower()
+        version = cls._extract_model_version(normalized_name)
+        stable_rank = 1 if not model_info.get("is_preview") else 0
+        latency_rank = 2 if "flash" in normalized_name else 1 if "pro" in normalized_name else 0
+        return (
+            stable_rank,
+            version,
+            latency_rank,
+            int(model_info.get("output_token_limit", 0) or 0),
+            int(model_info.get("input_token_limit", 0) or 0),
+            normalized_name,
+        )
+
     def send_prompt_with_tools(
         self,
         prompt: str,
@@ -201,7 +455,7 @@ class GeminiClient:
             >>> # Use default model
             >>> result = client.send_prompt_with_tools("Find Python files", tools)
             >>> # Use specific model for this request
-            >>> result = client.send_prompt_with_tools("Find files", tools, model="gemini-3-flash-preview")
+            >>> result = client.send_prompt_with_tools("Find files", tools, model="gemini-2.5-flash")
         """
         if not prompt:
             raise GeminiClientError("Prompt cannot be empty")
@@ -210,7 +464,7 @@ class GeminiClient:
             raise GeminiClientError("Tools list cannot be empty")
         
         # Use provided model or fall back to instance default
-        model_name = model or self.model_name
+        model_name = self.resolve_text_model(model)
         
         # Convert tools to new Gemini format
         gemini_tools = self._convert_tools_to_gemini_format(tools)
@@ -275,7 +529,7 @@ class GeminiClient:
         if not tools:
             raise GeminiClientError("Tools list cannot be empty")
 
-        model_name = model or self.model_name
+        model_name = self.resolve_text_model(model)
         gemini_tools = self._convert_tools_to_gemini_format(tools)
 
         config_kwargs: Dict[str, Any] = {
@@ -313,7 +567,8 @@ class GeminiClient:
             return None
 
         normalized = model_name.strip().lower()
-        if "gemini-3" in normalized:
+        major, minor, _ = self._extract_model_version(normalized)
+        if major >= 3:
             level_name = os.environ.get("AI_AGENT_DEEP_THINK_LEVEL_GEMINI3", "high")
             level = self._resolve_thinking_level(level_name)
             return types.ThinkingConfig(
@@ -321,7 +576,7 @@ class GeminiClient:
                 thinking_level=level,
             )
 
-        if "gemini-2.5" in normalized:
+        if major == 2 and minor >= 5:
             budget = self._parse_int_env(
                 "AI_AGENT_DEEP_THINK_BUDGET_GEMINI25",
                 default=12288,
@@ -397,21 +652,6 @@ class GeminiClient:
             normalized = normalized[len("models/") :]
         return normalized
 
-    @staticmethod
-    def _resolve_person_generation(value: str) -> types.PersonGeneration:
-        normalized = value.strip().lower()
-        mapping = {
-            "dont_allow": types.PersonGeneration.DONT_ALLOW,
-            "allow_adult": types.PersonGeneration.ALLOW_ADULT,
-            "allow_all": types.PersonGeneration.ALLOW_ALL,
-        }
-        resolved = mapping.get(normalized)
-        if resolved is None:
-            raise GeminiClientError(
-                "person_generation must be one of: dont_allow, allow_adult, allow_all"
-            )
-        return resolved
-
     def _list_available_image_models(self, *, force_refresh: bool = False) -> list[str]:
         now = time.time()
         if (
@@ -431,27 +671,12 @@ class GeminiClient:
         except Exception as exc:
             raise GeminiClientError(f"Failed to list image models: {exc}") from exc
 
-        discovered: set[str] = set()
-        for model in pager:
-            raw_name = str(getattr(model, "name", "") or "").strip()
-            if not raw_name:
-                continue
-            normalized = self._normalize_model_name(raw_name)
-            lowered = normalized.lower()
-            if "imagen" not in lowered:
-                continue
-
-            supported_actions = getattr(model, "supported_actions", None)
-            if isinstance(supported_actions, (list, tuple, set)) and supported_actions:
-                lowered_actions = {str(action).lower() for action in supported_actions}
-                if not any(
-                    any(hint in action for hint in self._IMAGE_SUPPORTED_ACTION_HINTS)
-                    for action in lowered_actions
-                ):
-                    continue
-            discovered.add(normalized)
-
-        models = sorted(discovered)
+        discovered = [
+            model["name"]
+            for model in self.list_models(force_refresh=force_refresh)
+            if model.get("is_image_generation_model")
+        ]
+        models = sorted(set(discovered))
         self._cached_image_models = models
         self._cached_image_models_expires_at = now + self._IMAGE_MODEL_CACHE_TTL_SECONDS
         return list(models)
@@ -479,40 +704,37 @@ class GeminiClient:
             return normalized_override
 
         normalized_tier = quality_tier.strip().lower()
-        preferences = self._IMAGE_QUALITY_PREFERENCES.get(normalized_tier)
-        if preferences is None:
+        if normalized_tier not in {"fast", "standard", "ultra"}:
             raise GeminiClientError(
                 "quality_tier must be one of: fast, standard, ultra"
             )
 
-        for preferred in preferences:
-            if preferred in available:
-                return preferred
+        ranked = sorted(
+            available,
+            key=lambda model_name: self._image_model_sort_key(model_name, normalized_tier),
+            reverse=True,
+        )
+        return ranked[0]
 
-        if normalized_tier == "fast":
-            tier_candidates = [
-                name for name in available if "fast" in name.lower()
-            ]
-        elif normalized_tier == "ultra":
-            tier_candidates = [
-                name for name in available if "ultra" in name.lower()
-            ]
+    @classmethod
+    def _image_model_sort_key(
+        cls,
+        model_name: str,
+        quality_tier: str,
+    ) -> tuple[Any, ...]:
+        lowered = model_name.strip().lower()
+        version = cls._extract_model_version(lowered)
+        stable_rank = 1 if not cls._looks_like_preview_model(lowered) else 0
+        native_rank = 1 if lowered.startswith("gemini-") else 0
+        if quality_tier == "fast":
+            speed_rank = 2 if any(token in lowered for token in ("flash", "lite")) else 1
+        elif quality_tier == "ultra":
+            speed_rank = 2 if any(token in lowered for token in ("pro", "ultra", "max")) else 1
         else:
-            tier_candidates = [
-                name
-                for name in available
-                if "fast" not in name.lower() and "ultra" not in name.lower()
-            ]
+            speed_rank = 1
+        return (stable_rank, native_rank, version, speed_rank, lowered)
 
-        if not tier_candidates:
-            raise GeminiClientError(
-                f"No available image model satisfies quality_tier='{normalized_tier}'. "
-                f"Available image models: {', '.join(available)}"
-            )
-
-        return sorted(tier_candidates, reverse=True)[0]
-
-    def generate_images(
+    def generate_image(
         self,
         *,
         prompt: str,
@@ -520,120 +742,155 @@ class GeminiClient:
         number_of_images: int = 1,
         aspect_ratio: str = "1:1",
         image_size: str = "1K",
-        enhance_prompt: bool = True,
-        person_generation: str = "allow_adult",
+        person_generation: str = "ALLOW_ADULT",
         negative_prompt: str | None = None,
-        seed: int | None = None,
         model_override: str | None = None,
-        output_mime_type: str = "image/png",
     ) -> Dict[str, Any]:
+        """Generate images using Nano Banana (Gemini native image generation).
+
+        Uses ``generate_content()`` with ``response_modalities=['TEXT', 'IMAGE']``
+        instead of the legacy Imagen ``generate_images()`` API.
+
+        Args:
+            prompt: Detailed image description.
+            quality_tier: One of ``fast``, ``standard``, ``ultra``.
+            number_of_images: How many images to generate (1-4).
+            aspect_ratio: Aspect ratio string (e.g. ``1:1``, ``16:9``).
+            image_size: Output size profile (``1K``, ``2K``, ``4K``).
+            person_generation: Policy string (``ALLOW_ADULT``, ``ALLOW_ALL``, ``ALLOW_NONE``).
+            negative_prompt: Optional text describing what to avoid.
+            model_override: Override the auto-resolved model name.
+
+        Returns:
+            Dictionary with ``model`` and ``images`` list.
+        """
         if not prompt or not prompt.strip():
             raise GeminiClientError("Image prompt cannot be empty")
         if number_of_images < 1 or number_of_images > 4:
             raise GeminiClientError("number_of_images must be between 1 and 4")
-        if output_mime_type not in {"image/png", "image/jpeg"}:
-            raise GeminiClientError("output_mime_type must be image/png or image/jpeg")
 
         model_name = self.resolve_image_model(
             quality_tier=quality_tier,
             model_override=model_override,
         )
-        person_generation_enum = self._resolve_person_generation(person_generation)
-        config_kwargs: dict[str, Any] = {
-            "number_of_images": number_of_images,
-            "output_mime_type": output_mime_type,
+
+        # Build the text prompt — append negative prompt as avoidance instruction
+        full_prompt = prompt.strip()
+        if negative_prompt and negative_prompt.strip():
+            full_prompt = f"{full_prompt}\n\nAvoid: {negative_prompt.strip()}"
+
+        # Build Nano Banana config using generate_content with image output
+        image_config_kwargs: dict[str, Any] = {
             "aspect_ratio": aspect_ratio,
             "image_size": image_size,
-            "enhance_prompt": enhance_prompt,
-            "person_generation": person_generation_enum,
-            "safety_filter_level": types.SafetyFilterLevel.BLOCK_MEDIUM_AND_ABOVE,
-            "include_safety_attributes": True,
-            "include_rai_reason": True,
         }
-        if negative_prompt and negative_prompt.strip():
-            config_kwargs["negative_prompt"] = negative_prompt.strip()
-        if seed is not None:
-            config_kwargs["seed"] = seed
-        config = types.GenerateImagesConfig(**config_kwargs)
+        if person_generation and person_generation.strip():
+            image_config_kwargs["person_generation"] = person_generation.strip()
 
-        last_exception: Optional[Exception] = None
-        delay = self.retry_delay
-        for attempt in range(self.max_retries + 1):
-            try:
-                logger.info("[MODEL_VERIFICATION] Calling image API with model='%s'", model_name)
-                response = self._client.models.generate_images(
-                    model=model_name,
-                    prompt=prompt,
-                    config=config,
-                )
+        config = types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            image_config=types.ImageConfig(**image_config_kwargs),
+        )
 
-                images: list[dict[str, Any]] = []
-                generated_images = getattr(response, "generated_images", None) or []
-                for generated in generated_images:
-                    image_obj = getattr(generated, "image", None)
-                    raw_bytes = getattr(image_obj, "image_bytes", None) if image_obj else None
-                    image_bytes = (
-                        bytes(raw_bytes)
-                        if isinstance(raw_bytes, (bytes, bytearray, memoryview))
-                        else b""
-                    )
-                    width = int(getattr(image_obj, "width", 0) or 0) if image_obj else 0
-                    height = int(getattr(image_obj, "height", 0) or 0) if image_obj else 0
-                    images.append(
-                        {
-                            "bytes": image_bytes,
-                            "width": width,
-                            "height": height,
-                            "rai_filtered_reason": str(
-                                getattr(generated, "rai_filtered_reason", "") or ""
-                            ),
-                            "safety_attributes": getattr(generated, "safety_attributes", None),
-                        }
-                    )
-                return {
-                    "model": model_name,
-                    "images": images,
-                    "raw_response": response,
-                }
-            except genai_errors.APIError as e:
-                error_code = getattr(e, "code", None)
-                error_message = getattr(e, "message", None)
-                if not isinstance(error_message, str) or not error_message.strip():
-                    details = getattr(e, "details", None)
-                    error_message = str(details) if details else str(e)
-                error_message = str(error_message).strip() or "Gemini image request failed."
+        all_images: list[dict[str, Any]] = []
+        text_responses: list[str] = []
 
-                if error_code == 429:
-                    last_exception = GeminiRateLimitError(
-                        f"Image generation rate limit exceeded: {error_message}",
-                        status_code=429,
+        for image_idx in range(number_of_images):
+            last_exception: Optional[Exception] = None
+            delay = self.retry_delay
+
+            for attempt in range(self.max_retries + 1):
+                try:
+                    logger.info(
+                        "[MODEL_VERIFICATION] Calling Nano Banana image API with model='%s' (image %d/%d)",
+                        model_name, image_idx + 1, number_of_images,
                     )
-                elif error_code in (500, 502, 503, 504):
-                    last_exception = GeminiServerError(
-                        f"Image generation server error ({error_code}): {error_message}",
-                        status_code=error_code,
+                    response = self._client.models.generate_content(
+                        model=model_name,
+                        contents=[full_prompt],
+                        config=config,
                     )
-                else:
-                    raise GeminiAPIError(
-                        f"Image generation API error ({error_code}): {error_message}",
-                        status_code=error_code,
+
+                    # Extract images and text from response parts
+                    parts = getattr(response, "parts", None) or []
+                    found_image = False
+                    for part in parts:
+                        inline_data = getattr(part, "inline_data", None)
+                        if inline_data is not None:
+                            mime_type = str(getattr(inline_data, "mime_type", "") or "").strip()
+                            if mime_type.startswith("image/"):
+                                raw_bytes = getattr(inline_data, "data", None)
+                                image_bytes = (
+                                    bytes(raw_bytes)
+                                    if isinstance(raw_bytes, (bytes, bytearray, memoryview))
+                                    else b""
+                                )
+                                all_images.append({
+                                    "bytes": image_bytes,
+                                    "mime_type": mime_type,
+                                    "width": 0,
+                                    "height": 0,
+                                })
+                                found_image = True
+
+                        text_content = getattr(part, "text", None)
+                        if text_content and isinstance(text_content, str) and text_content.strip():
+                            text_responses.append(text_content.strip())
+
+                    if not found_image:
+                        raise GeminiClientError(
+                            "Image generation response contained no image data"
+                        )
+
+                    last_exception = None
+                    break
+
+                except genai_errors.APIError as e:
+                    error_code = getattr(e, "code", None)
+                    error_message = getattr(e, "message", None)
+                    if not isinstance(error_message, str) or not error_message.strip():
+                        details = getattr(e, "details", None)
+                        error_message = str(details) if details else str(e)
+                    error_message = str(error_message).strip() or "Gemini image request failed."
+
+                    if error_code == 429:
+                        last_exception = GeminiRateLimitError(
+                            f"Image generation rate limit exceeded: {error_message}",
+                            status_code=429,
+                        )
+                    elif error_code in (500, 502, 503, 504):
+                        last_exception = GeminiServerError(
+                            f"Image generation server error ({error_code}): {error_message}",
+                            status_code=error_code,
+                        )
+                    else:
+                        raise GeminiAPIError(
+                            f"Image generation API error ({error_code}): {error_message}",
+                            status_code=error_code,
+                        ) from e
+                except GeminiClientError:
+                    raise
+                except Exception as e:
+                    detail = str(e).strip()
+                    if detail:
+                        raise GeminiClientError(f"Image generation failed: {detail}") from e
+                    raise GeminiClientError(
+                        f"Image generation failed with no details ({e.__class__.__name__})"
                     ) from e
-            except Exception as e:
-                detail = str(e).strip()
-                if detail:
-                    raise GeminiClientError(f"Image generation failed: {detail}") from e
-                raise GeminiClientError(
-                    f"Image generation failed with no details ({e.__class__.__name__})"
-                ) from e
 
-            if attempt < self.max_retries:
-                logger.info("Retrying image request in %.1f seconds...", delay)
-                time.sleep(delay)
-                delay = min(delay * self.BACKOFF_MULTIPLIER, self.MAX_BACKOFF_DELAY)
+                if attempt < self.max_retries:
+                    logger.info("Retrying image request in %.1f seconds...", delay)
+                    time.sleep(delay)
+                    delay = min(delay * self.BACKOFF_MULTIPLIER, self.MAX_BACKOFF_DELAY)
 
-        if last_exception:
-            raise last_exception
-        raise GeminiClientError("All image generation retry attempts failed")
+            if last_exception:
+                raise last_exception
+
+        return {
+            "model": model_name,
+            "images": all_images,
+            "text_responses": text_responses,
+        }
     
     def _execute_with_retry(
         self,
@@ -772,6 +1029,25 @@ class GeminiClient:
                 logger.debug(f"Parsed text response: {len(response.text)} chars")
         except (ValueError, AttributeError):
             pass
+
+        # Fallback: extract text from candidates when .text property is unavailable
+        if result["text"] is None:
+            try:
+                candidates = getattr(response, 'candidates', None) or []
+                if candidates:
+                    content = getattr(candidates[0], 'content', None)
+                    if content:
+                        parts = getattr(content, 'parts', None) or []
+                        text_parts = [
+                            getattr(part, 'text', None)
+                            for part in parts
+                            if getattr(part, 'text', None)
+                        ]
+                        if text_parts:
+                            result["text"] = "".join(text_parts)
+                            logger.debug(f"Parsed text from candidates: {len(result['text'])} chars")
+            except (ValueError, AttributeError, IndexError):
+                pass
         
         if result["text"] is None and result["function_call"] is None:
             logger.warning("Empty response from Gemini API")

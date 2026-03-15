@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  AppDelegate.swift
 //  AIAgentUI
@@ -61,6 +62,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Check and request permissions
         checkPermissions()
         
+        // Re-register global hotkey when Accessibility is granted mid-session
+        permissionsManager.onPermissionChange = { [weak self] permissionType, newStatus in
+            guard self != nil, permissionType == .accessibility, newStatus == .authorized else { return }
+            // Accessibility was just granted — enable the global NSEvent monitor
+            HotKeyMonitor.shared.startMonitoring(includeGlobalMonitor: true)
+        }
+        
         // Set up the floating panel
         setupFloatingPanel()
 
@@ -121,21 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             try process.run()
-            // Give the child a moment to start; if it exits immediately
-            // the build likely failed — fall through to current process.
-            Thread.sleep(forTimeInterval: 0.5)
-            if process.isRunning {
-                return true
-            }
-
-            let status = process.terminationStatus
-            if status != 0 {
-                NSLog(
-                    "Bootstrap rebuild exited (status=%d). Continuing with current build.",
-                    status
-                )
-            }
-            return false
+            return true
         } catch {
             NSLog("Bootstrap relaunch failed: %@", error.localizedDescription)
             return false
@@ -341,6 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 }
+#endif
 
 // MARK: - Runtime Preference Application
 

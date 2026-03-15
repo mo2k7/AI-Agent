@@ -35,6 +35,7 @@ class SessionRecord:
     updated_at: float
     last_activity: float
     status: str = "active"
+    store_version: int = 0
 
 
 @dataclass(frozen=True)

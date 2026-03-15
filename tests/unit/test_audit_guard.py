@@ -108,6 +108,9 @@ async def test_run_server_fails_when_embedding_service_is_unavailable(
     class FakeGeminiClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self._client = object()
+            
+        def resolve_text_model(self, requested_model: str | None = None) -> str:
+            return requested_model or "gemini-test"
 
     class FailingEmbeddingService:
         def __init__(self, _client: object) -> None:
@@ -168,6 +171,9 @@ def test_main_fails_when_embedding_service_is_unavailable(
     class FakeGeminiClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self._client = object()
+
+        def resolve_text_model(self, requested_model: str | None = None) -> str:
+            return requested_model or "gemini-test"
 
     class FailingEmbeddingService:
         def __init__(self, _client: object) -> None:

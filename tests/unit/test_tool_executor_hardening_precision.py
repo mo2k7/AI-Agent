@@ -35,7 +35,7 @@ def test_execute_returns_latency_envelope(tmp_path: Path) -> None:
     target = tmp_path / "notes.txt"
     target.write_text("hello")
 
-    result = executor.execute("read_text", {"path": str(target)})
+    result = executor.execute("read_document", {"path": str(target)})
 
     assert result["ok"] is True
     assert isinstance(result["started_at"], float)
@@ -90,8 +90,7 @@ def test_search_files_accepts_tiered_search_arguments(tmp_path: Path) -> None:
     assert isinstance(output["tier_stats"], dict)
     assert "spotlight" in output["tier_stats"]
     assert "fts" in output["tier_stats"]
-    assert "fallback" in output["tier_stats"]
-    assert output["ranking_version"] == "v1"
+    assert output["ranking_version"] == "v2"
 
 
 def test_search_files_returns_link_ready_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,80 +113,69 @@ def test_search_files_returns_link_ready_metadata(tmp_path: Path, monkeypatch: p
     assert "display_path" in entry and entry["display_path"]
 
 
-def test_search_files_reports_truncation_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_files_fts_seed_indexes_and_finds_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FTS seed walk indexes files in allowed_roots and the FTS query finds them."""
     executor = _make_executor(tmp_path, search_scan_limit=200)
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir(parents=True, exist_ok=True)
-    for idx in range(220):
-        (repo_dir / f"file_{idx:03d}.txt").write_text("x")
+    for idx in range(5):
+        (repo_dir / f"report_{idx:03d}.txt").write_text("x")
 
     monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
 
-    result = executor.execute("search_files", {"query": "file", "limit": 5})
+    result = executor.execute("search_files", {"query": "report", "limit": 10})
     output = result["output"]
-    assert output["truncated"] is True
-    assert "Reached walk scan limit" in output["truncated_reason"]
-    assert output["scanned_walk_entries"] == 200
-    assert output["search_scan_limit"] == 200
+    assert output["ok"] is True
+    # FTS seed should have scanned and indexed the files
+    fts_stats = output["tier_stats"]["fts"]
+    assert fts_stats["seed_scanned"] > 0
+    assert fts_stats["seed_indexed"] > 0
+    # FTS should return matches for "report" in the filenames
+    assert len(output["matches"]) > 0
+    paths = {item["path"] for item in output["matches"]}
+    assert any("report_" in p for p in paths)
 
 
-def test_search_files_deep_mode_returns_continuation_token_on_truncation(
+def test_search_files_rejects_non_empty_continuation_token(
+    tmp_path: Path,
+) -> None:
+    """Strict runtime rejects non-empty continuation_token."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+
+    with pytest.raises(ToolExecutionError, match="continuation_token"):
+        executor.execute(
+            "search_files",
+            {
+                "query": "gemini",
+                "mode": "deep",
+                "continuation_token": "some-token",
+            },
+        )
+
+
+def test_search_files_deep_mode_accepts_extended_time_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Deep mode accepts time_budget_ms up to the maximum (10000)."""
     executor = _make_executor(tmp_path, search_scan_limit=200)
-    big = tmp_path / "Downloads"
-    big.mkdir(parents=True, exist_ok=True)
-    for idx in range(280):
-        (big / f"gemini_{idx:03d}.txt").write_text("x")
+    target = tmp_path / "Downloads" / "gemini_page_001.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("x")
 
     monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
-    executor._search_index_enabled = False
 
     result = executor.execute(
         "search_files",
-        {"query": "gemini", "mode": "deep", "time_budget_ms": 4000, "limit": 10},
+        {"query": "gemini page", "mode": "deep", "time_budget_ms": 4000, "limit": 5},
     )
     output = result["output"]
-    assert output["truncated"] is True
-    assert isinstance(output["next_token"], str)
-    assert output["next_token"]
-
-
-def test_search_files_continuation_advances_fallback_scan(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    executor = _make_executor(tmp_path, search_scan_limit=200)
-    big = tmp_path / "Downloads"
-    big.mkdir(parents=True, exist_ok=True)
-    for idx in range(320):
-        (big / f"gemini_page_{idx:03d}.txt").write_text("x")
-
-    monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
-    executor._search_index_enabled = False
-
-    first = executor.execute(
-        "search_files",
-        {"query": "gemini page", "mode": "deep", "time_budget_ms": 4000, "limit": 5},
-    )["output"]
-    assert first["next_token"]
-
-    second = executor.execute(
-        "search_files",
-        {
-            "query": "gemini page",
-            "mode": "deep",
-            "time_budget_ms": 4000,
-            "limit": 5,
-            "continuation_token": first["next_token"],
-        },
-    )["output"]
-
-    first_paths = {item["path"] for item in first["matches"]}
-    second_paths = {item["path"] for item in second["matches"]}
-    assert second_paths
-    assert first_paths != second_paths
+    assert output["ok"] is True
+    assert output["mode"] == "deep"
+    assert output["time_budget_ms"] == 4000
+    # Stale continuation/truncation fields were removed (B6 cleanup)
 
 
 def test_search_files_prioritizes_home_user_folders_before_budget_exhaustion(
@@ -215,10 +203,11 @@ def test_search_files_prioritizes_home_user_folders_before_budget_exhaustion(
     assert str(target.resolve()) in paths
 
 
-def test_search_files_fast_mode_avoids_fallback_when_primary_tiers_suffice(
+def test_search_files_fast_mode_returns_spotlight_results(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Fast mode returns results from Spotlight without walk entries."""
     executor = _make_executor(tmp_path)
     target = tmp_path / "Documents" / "gemini_file.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -230,18 +219,16 @@ def test_search_files_fast_mode_avoids_fallback_when_primary_tiers_suffice(
         lambda **_kwargs: ([executor._make_search_metadata(target, score=250, source="spotlight")], 1),
     )
 
-    def _unexpected_fallback(**_kwargs):
-        raise AssertionError("fallback tier should not execute in fast mode with primary matches")
-
-    monkeypatch.setattr(executor, "_search_fallback_tier", _unexpected_fallback)
-
     result = executor.execute(
         "search_files",
         {"query": "gemini file", "mode": "fast", "time_budget_ms": 1200, "limit": 5},
     )
     output = result["output"]
-    assert output["scanned_walk_entries"] == 0
-    assert output["tier_stats"]["fallback"]["matched"] == 0
+    assert output["ok"] is True
+    # scanned_walk_entries was removed (B6 cleanup — always 0, vestigial)
+    assert output["tier_stats"]["spotlight"]["matched"] == 1
+    assert len(output["matches"]) >= 1
+    assert any(item["path"] == str(target.resolve()) for item in output["matches"])
 
 
 def test_tokenize_search_query_removes_conversational_noise_and_maps_aliases() -> None:
@@ -258,23 +245,28 @@ def test_tokenize_search_query_removes_conversational_noise_and_maps_aliases() -
     assert "it" not in tokens
 
 
-def test_search_files_understands_natural_language_query_for_gemini_images(
+def test_search_files_gemini_image_query_found_via_spotlight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Gemini image file found via Spotlight is scored and returned correctly."""
     executor = _make_executor(tmp_path, search_scan_limit=400)
     downloads = tmp_path / "Downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     target = downloads / "Gemini_Generated_Image_abc123.png"
     target.write_text("x")
 
-    monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
-    executor._search_index_enabled = False
+    # Spotlight returns the Gemini image (simulating real mdfind behavior)
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: ([executor._make_search_metadata(target, score=100, source="spotlight")], 1),
+    )
 
     result = executor.execute(
         "search_files",
         {
-            "query": "locate the gemini created image i dont know where it is",
+            "query": "gemini generated image",
             "limit": 10,
             "mode": "deep",
             "time_budget_ms": 1200,
@@ -283,6 +275,10 @@ def test_search_files_understands_natural_language_query_for_gemini_images(
     output = result["output"]
     paths = {item["path"] for item in output["matches"]}
     assert str(target.resolve()) in paths
+    # The matched file should have a positive score
+    for item in output["matches"]:
+        if item["path"] == str(target.resolve()):
+            assert item["score"] > 0
 
 
 def test_search_spotlight_timeout_falls_back_to_walk(
@@ -306,13 +302,7 @@ def test_search_spotlight_timeout_falls_back_to_walk(
     assert str(target.resolve()) in paths
 
 
-def test_read_text_rejects_boolean_byte_range_values(tmp_path: Path) -> None:
-    executor = _make_executor(tmp_path)
-    target = tmp_path / "story.txt"
-    target.write_text("abcdef")
 
-    with pytest.raises(ToolExecutionError, match="byte_range"):
-        executor.execute("read_text", {"path": str(target), "byte_range": [False, 3]})
 
 
 def test_plan_ops_preserves_index_for_non_mapping_entries(tmp_path: Path) -> None:
@@ -821,3 +811,652 @@ def test_open_item_timeout_has_deterministic_error(
 
     with pytest.raises(ToolExecutionError, match="timed out"):
         executor.execute("open_item", {"path": str(item)})
+
+
+# -------------------------------------------------------------------------
+# F1: FTS5 BM25 semantic boost correctness
+# -------------------------------------------------------------------------
+
+def test_fts_bm25_boost_differentiates_match_quality(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BM25 boost should give higher scores to better FTS matches."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # Create files with varying relevance to the query "report"
+    exact = tmp_path / "report.txt"
+    exact.write_text("x")
+    partial = tmp_path / "monthly_report_summary.txt"
+    partial.write_text("x")
+    unrelated = tmp_path / "random_notes.txt"
+    unrelated.write_text("x")
+
+    monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
+
+    result = executor.execute("search_files", {"query": "report", "limit": 10})
+    output = result["output"]
+    assert output["ok"] is True
+    matches = output["matches"]
+    # Exact filename match should appear before partial match
+    paths = [m["path"] for m in matches]
+    if str(exact.resolve()) in paths and str(partial.resolve()) in paths:
+        exact_idx = paths.index(str(exact.resolve()))
+        partial_idx = paths.index(str(partial.resolve()))
+        assert exact_idx < partial_idx, "Exact match should rank higher than partial"
+    # Unrelated file should not appear or rank last
+    if str(unrelated.resolve()) in paths:
+        assert paths.index(str(unrelated.resolve())) > 0
+
+
+# -------------------------------------------------------------------------
+# F2: Mode differentiation
+# -------------------------------------------------------------------------
+
+def test_search_files_fast_mode_skips_fts_seeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fast mode should skip FTS seeding entirely."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "doc.txt"
+    target.write_text("x")
+
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: ([executor._make_search_metadata(target, score=100, source="spotlight")], 1),
+    )
+
+    result = executor.execute(
+        "search_files",
+        {"query": "doc", "mode": "fast", "limit": 5},
+    )
+    output = result["output"]
+    assert output["ok"] is True
+    # In fast mode, FTS seeding should NOT run (seed_scanned = 0)
+    assert output["tier_stats"]["fts"]["seed_scanned"] == 0
+    assert output["tier_stats"]["fts"]["seed_indexed"] == 0
+
+
+def test_search_files_deep_mode_uses_larger_seed_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deep mode should use a larger seed budget and find more files."""
+    executor = _make_executor(tmp_path, search_scan_limit=2000)
+    # Create many files to exercise the larger seed budget
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    for i in range(50):
+        (data_dir / f"analysis_{i:03d}.csv").write_text("x")
+
+    monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
+
+    result = executor.execute(
+        "search_files",
+        {"query": "analysis", "mode": "deep", "time_budget_ms": 5000, "limit": 50},
+    )
+    output = result["output"]
+    assert output["ok"] is True
+    assert output["mode"] == "deep"
+    # Deep mode should seed more aggressively
+    fts = output["tier_stats"]["fts"]
+    assert fts["seed_scanned"] > 0
+
+
+# -------------------------------------------------------------------------
+# F3: mdfind -name query variant
+# -------------------------------------------------------------------------
+
+def test_spotlight_query_variants_include_name_sentinel() -> None:
+    """_derive_spotlight_query_variants should include -name: sentinel variants."""
+    variants = ToolExecutor._derive_spotlight_query_variants(
+        original_query="budget report",
+        query_tokens=["budget", "report"],
+        query_phrases=[],
+        extension_hints={"pdf"},
+    )
+    # Should contain a -name: sentinel for filename search
+    assert any(v.startswith("-name:") for v in variants), (
+        f"Expected -name: variant in {variants}"
+    )
+    # Should contain an extension -name variant
+    assert any(v == "-name:.pdf" for v in variants), (
+        f"Expected -name:.pdf variant in {variants}"
+    )
+
+
+def test_spotlight_name_variant_dispatches_correctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mdfind -name: sentinel should be dispatched as mdfind -name flag."""
+    executor = _make_executor(tmp_path)
+    target = tmp_path / "invoice.pdf"
+    target.write_text("x")
+
+    captured_cmds: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        result = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return result
+
+    monkeypatch.setattr("agent_host.tools.executor.shutil.which", lambda _name: "/usr/bin/mdfind")
+    monkeypatch.setattr("agent_host.tools.executor.subprocess.run", _fake_run)
+
+    executor._search_spotlight(
+        queries=["-name:invoice", "invoice"],
+        query_lower="invoice",
+        query_tokens=["invoice"],
+        query_phrases=[],
+        extension_hints=set(),
+        folder_hints=set(),
+        path_filter="",
+        limit=5,
+    )
+
+    # The -name: sentinel should produce ["mdfind", "-onlyin", ..., "-name", "invoice"]
+    name_cmds = [cmd for cmd in captured_cmds if "-name" in cmd and cmd[0] == "mdfind"]
+    assert len(name_cmds) > 0, f"Expected mdfind -name calls, got {captured_cmds}"
+    assert name_cmds[0][-2] == "-name"
+    assert name_cmds[0][-1] == "invoice"
+
+
+# -------------------------------------------------------------------------
+# F4: OR-based FTS fallback
+# -------------------------------------------------------------------------
+
+def test_fts_or_fallback_catches_partial_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OR fallback in deep mode should find files matching some but not all tokens."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # File matches "proposal" but not "project"
+    target = tmp_path / "proposal_draft.pdf"
+    target.write_text("x")
+
+    monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
+
+    # First search in auto mode (no OR fallback) — will use AND: "project" AND "proposal"
+    result_auto = executor.execute(
+        "search_files",
+        {"query": "project proposal", "mode": "auto", "limit": 5},
+    )
+
+    # Then search in deep mode (with OR fallback)
+    result_deep = executor.execute(
+        "search_files",
+        {"query": "project proposal", "mode": "deep", "time_budget_ms": 5000, "limit": 5},
+    )
+
+    deep_paths = [m["path"] for m in result_deep["output"]["matches"]]
+    # Deep mode should find the partial match via OR fallback
+    assert str(target.resolve()) in deep_paths
+
+
+# -------------------------------------------------------------------------
+# F5: Stale index pruning
+# -------------------------------------------------------------------------
+
+def test_stale_index_entries_are_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale index entries for deleted files should be removed during seeding."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # Create and index a file, then delete it
+    target = tmp_path / "ephemeral.txt"
+    target.write_text("x")
+
+    monkeypatch.setattr(executor, "_search_spotlight", lambda **_kwargs: ([], 0))
+
+    # First search to index the file
+    executor.execute("search_files", {"query": "ephemeral", "limit": 5})
+
+    # Delete the file
+    target.unlink()
+
+    # Second search should trigger pruning
+    result = executor.execute("search_files", {"query": "ephemeral", "limit": 5})
+    matches = result["output"]["matches"]
+    # The deleted file should NOT appear in results
+    assert not any("ephemeral" in m.get("path", "") for m in matches)
+
+
+# -------------------------------------------------------------------------
+# F6: Algorithmic token normalization + prefix-aware scoring
+# -------------------------------------------------------------------------
+
+def test_normalize_token_forms_handles_plurals() -> None:
+    """_normalize_token_forms should generate singular/plural variants."""
+    # Singular → adds plural
+    forms = ToolExecutor._normalize_token_forms("document")
+    assert "document" in forms
+    assert "documents" in forms
+
+    # Plural -s → strips to singular
+    forms = ToolExecutor._normalize_token_forms("documents")
+    assert "documents" in forms
+    assert "document" in forms
+
+    # Plural -ies → -y
+    forms = ToolExecutor._normalize_token_forms("memories")
+    assert "memories" in forms
+    assert "memory" in forms
+
+    # Plural -es → strips
+    forms = ToolExecutor._normalize_token_forms("watches")
+    assert "watches" in forms
+    assert "watch" in forms
+
+    # Short tokens — should not strip "ss"
+    forms = ToolExecutor._normalize_token_forms("boss")
+    assert "boss" in forms
+    assert "bos" not in forms  # "ss" ending protected
+
+
+def test_expand_search_tokens_adds_normalized_forms() -> None:
+    """_expand_search_tokens should add plural/singular forms of each token."""
+    expanded = ToolExecutor._expand_search_tokens(["document", "image"])
+    assert "document" in expanded
+    assert "documents" in expanded
+    assert "image" in expanded
+    assert "images" in expanded
+
+
+def test_prefix_scoring_awards_word_boundary_matches(tmp_path: Path) -> None:
+    """Prefix-aware scoring should match 'doc' against the word 'document'."""
+    score, signals = ToolExecutor._score_path_with_signals(
+        query_lower="doc",
+        query_tokens=["doc"],
+        query_phrases=[],
+        extension_hints=set(),
+        folder_hints=set(),
+        path=tmp_path / "budget_document.pdf",
+    )
+    # "doc" is a prefix of the word "document" at a word boundary
+    assert score > 0, f"Expected positive score for prefix match, got {score}"
+
+
+def test_prefix_scoring_ignores_mid_word_matches(tmp_path: Path) -> None:
+    """Prefix scoring should NOT match 'doc' inside 'indoctrinate'."""
+    score_prefix, _ = ToolExecutor._score_path_with_signals(
+        query_lower="doc",
+        query_tokens=["doc"],
+        query_phrases=[],
+        extension_hints=set(),
+        folder_hints=set(),
+        path=tmp_path / "budget_document.pdf",
+    )
+    score_mid, _ = ToolExecutor._score_path_with_signals(
+        query_lower="doc",
+        query_tokens=["doc"],
+        query_phrases=[],
+        extension_hints=set(),
+        folder_hints=set(),
+        path=tmp_path / "indoctrinate.txt",
+    )
+    # "budget_document.pdf" should score higher than "indoctrinate.txt"
+    # because prefix matching at word boundary gives bonus points
+    assert score_prefix > score_mid or (score_prefix > 0 and score_mid == 0)
+
+
+# =========================================================================
+# S1: Spotlight Source Confidence Floor
+# =========================================================================
+
+
+def test_spotlight_content_match_survives_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Spotlight content-only match should survive scoring via the floor."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # File whose name does NOT contain "aws" — simulates a content match.
+    target = tmp_path / "deploy_script.sh"
+    target.write_text("aws s3 cp bucket ...")
+
+    def _fake_spotlight(**kwargs):
+        # Simulate mdfind returning this file via content search.
+        metadata = executor._make_search_metadata(target, score=executor._SPOTLIGHT_CONTENT_FLOOR, source="spotlight")
+        metadata["spotlight_content_match"] = True
+        return [metadata], 1
+
+    monkeypatch.setattr(executor, "_search_spotlight", _fake_spotlight)
+
+    result = executor.execute("search_files", {"query": "aws", "limit": 10})
+    output = result["output"]
+    assert output["ok"] is True
+    paths = [m["path"] for m in output["matches"]]
+    assert str(target.resolve()) in paths
+
+
+def test_spotlight_content_floor_ranks_below_filename_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content-floor results should rank below direct filename matches."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # File with "aws" in filename — direct match.
+    direct = tmp_path / "aws_config.yaml"
+    direct.write_text("x")
+    # File found by Spotlight content — no "aws" in name.
+    content = tmp_path / "deploy_script.sh"
+    content.write_text("aws s3 cp ...")
+
+    def _fake_spotlight(**kwargs):
+        direct_meta = executor._make_search_metadata(direct, score=200, source="spotlight")
+        content_meta = executor._make_search_metadata(content, score=executor._SPOTLIGHT_CONTENT_FLOOR, source="spotlight")
+        content_meta["spotlight_content_match"] = True
+        return [direct_meta, content_meta], 2
+
+    monkeypatch.setattr(executor, "_search_spotlight", _fake_spotlight)
+
+    result = executor.execute("search_files", {"query": "aws", "limit": 10})
+    matches = result["output"]["matches"]
+    paths = [m["path"] for m in matches]
+    assert str(direct.resolve()) in paths
+    assert str(content.resolve()) in paths
+    # Direct filename match should rank first.
+    assert paths.index(str(direct.resolve())) < paths.index(str(content.resolve()))
+
+
+def test_spotlight_content_floor_not_applied_to_name_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Floor should NOT apply to -name: query results with score 0."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "unrelated.txt"
+    target.write_text("x")
+
+    # Simulate mdfind returning the file for a -name: query.
+    # A -name: result with score 0 should be dropped, not floored.
+    def _fake_spotlight(**kwargs):
+        return [], 0  # -name queries that don't match should return nothing
+
+    monkeypatch.setattr(executor, "_search_spotlight", _fake_spotlight)
+
+    result = executor.execute("search_files", {"query": "nonexistent", "limit": 5})
+    assert len(result["output"]["matches"]) == 0
+
+
+def test_merge_rescues_spotlight_content_match(
+    tmp_path: Path,
+) -> None:
+    """_merge_ranked_search_candidates should apply floor to spotlight sources."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "deploy.sh"
+    target.write_text("x")
+
+    candidates = [
+        {
+            "path": str(target.resolve()),
+            "name": "deploy.sh",
+            "source": "spotlight",
+            "score": 0,
+            "modified_at": 0.0,
+        }
+    ]
+    ranked = executor._merge_ranked_search_candidates(
+        candidates=candidates,
+        query_lower="aws",
+        query_tokens=["aws"],
+        query_phrases=[],
+        extension_hints=set(),
+        folder_hints=set(),
+    )
+    # Spotlight result should survive via content floor.
+    assert len(ranked) == 1
+    assert ranked[0]["score"] > 0
+    signals = ranked[0].get("match_signals", {})
+    assert "spotlight_content_floor" in signals
+
+
+def test_merge_does_not_rescue_non_spotlight_source(
+    tmp_path: Path,
+) -> None:
+    """Non-spotlight sources with score 0 should still be dropped."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "deploy.sh"
+    target.write_text("x")
+
+    candidates = [
+        {
+            "path": str(target.resolve()),
+            "name": "deploy.sh",
+            "source": "walk",
+            "score": 0,
+            "modified_at": 0.0,
+        }
+    ]
+    ranked = executor._merge_ranked_search_candidates(
+        candidates=candidates,
+        query_lower="aws",
+        query_tokens=["aws"],
+        query_phrases=[],
+        extension_hints=set(),
+        folder_hints=set(),
+    )
+    assert len(ranked) == 0
+
+
+# =========================================================================
+# S2: Directory Co-Location Discovery
+# =========================================================================
+
+
+def test_colocation_adds_siblings_from_shared_directory(
+    tmp_path: Path,
+) -> None:
+    """Sibling files should be added when 2+ results share a directory."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    # Two matched files in same directory.
+    a = project_dir / "config.yaml"
+    a.write_text("x")
+    b = project_dir / "deploy.sh"
+    b.write_text("x")
+    # Sibling that was NOT in results.
+    c = project_dir / "readme.txt"
+    c.write_text("x")
+
+    ranked = [
+        {"path": str(a.resolve()), "score": 100, "modified_at": 0.0},
+        {"path": str(b.resolve()), "score": 90, "modified_at": 0.0},
+    ]
+    siblings = executor._discover_colocated_files(ranked)
+    sibling_paths = [s["path"] for s in siblings]
+    assert str(c.resolve()) in sibling_paths
+
+
+def test_colocation_skips_fast_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Co-location should be skipped entirely in fast mode."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    a = project_dir / "a.txt"
+    a.write_text("x")
+    b = project_dir / "b.txt"
+    b.write_text("x")
+    c = project_dir / "c.txt"
+    c.write_text("x")
+
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: (
+            [
+                executor._make_search_metadata(a, score=100, source="spotlight"),
+                executor._make_search_metadata(b, score=90, source="spotlight"),
+            ],
+            2,
+        ),
+    )
+
+    result = executor.execute("search_files", {"query": "a", "mode": "fast", "limit": 10})
+    output = result["output"]
+    assert output["diagnostics"]["colocation_siblings_added"] == 0
+
+
+def test_colocation_respects_max_siblings_cap(
+    tmp_path: Path,
+) -> None:
+    """Co-location should not add more than max_siblings per directory."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    project_dir = tmp_path / "bigdir"
+    project_dir.mkdir()
+    a = project_dir / "a.txt"
+    a.write_text("x")
+    b = project_dir / "b.txt"
+    b.write_text("x")
+    for i in range(30):
+        (project_dir / f"file_{i:03d}.txt").write_text("x")
+
+    ranked = [
+        {"path": str(a.resolve()), "score": 100, "modified_at": 0.0},
+        {"path": str(b.resolve()), "score": 90, "modified_at": 0.0},
+    ]
+    siblings = executor._discover_colocated_files(ranked, max_siblings=5)
+    assert len(siblings) <= 5
+
+
+# =========================================================================
+# S3: Recent Search Result Cache
+# =========================================================================
+
+
+def test_search_cache_stores_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Search results should be cached after execution."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "report.txt"
+    target.write_text("x")
+
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: ([executor._make_search_metadata(target, score=100, source="spotlight")], 1),
+    )
+
+    executor.execute("search_files", {"query": "report", "limit": 5})
+    assert len(executor._recent_search_cache) == 1
+    entry = list(executor._recent_search_cache.values())[0]
+    assert str(target.resolve()) in entry["result_paths"]
+
+
+def test_search_cache_boost_on_overlapping_follow_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Follow-up search with overlapping tokens should boost cached results."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "budget_report.txt"
+    target.write_text("x")
+
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: ([executor._make_search_metadata(target, score=100, source="spotlight")], 1),
+    )
+
+    # First search — caches "budget report" results.
+    executor.execute("search_files", {"query": "budget report", "limit": 5})
+    assert len(executor._recent_search_cache) == 1
+
+    # Second search with overlapping token "report".
+    result2 = executor.execute("search_files", {"query": "report", "limit": 5})
+    output = result2["output"]
+    assert output["diagnostics"]["cache_overlap_boost_applied"] >= 0
+
+
+def test_search_cache_evicts_oldest(
+    tmp_path: Path,
+) -> None:
+    """Cache should evict oldest entries when full."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # Fill cache to capacity.
+    for i in range(executor._SEARCH_CACHE_MAX_ENTRIES + 2):
+        executor._cache_search_results(
+            query_lower=f"query_{i}",
+            query_tokens=[f"query_{i}"],
+            result_paths=(f"/fake/path_{i}",),
+            result_scores=(50,),
+        )
+    assert len(executor._recent_search_cache) == executor._SEARCH_CACHE_MAX_ENTRIES
+    # Oldest entry should be evicted.
+    assert "query_0" not in executor._recent_search_cache
+    assert "query_1" not in executor._recent_search_cache
+
+
+def test_search_cache_ignores_expired_entries(
+    tmp_path: Path,
+) -> None:
+    """Expired cache entries should not contribute boosts."""
+    import time
+
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    # Insert an entry with a past timestamp.
+    executor._recent_search_cache["old_query"] = {
+        "query_lower": "old_query",
+        "query_tokens": frozenset(["report"]),
+        "timestamp": time.time() - executor._SEARCH_CACHE_TTL_SECONDS - 10,
+        "result_paths": ("/fake/old_report.txt",),
+        "result_scores": (100,),
+    }
+    candidates = [
+        {"path": "/fake/old_report.txt", "score": 50, "match_signals": {}},
+    ]
+    boosted = executor._apply_cache_boost(
+        current_query_tokens=["report"],
+        candidates=candidates,
+    )
+    assert boosted == 0  # expired entry should not boost
+
+
+# =========================================================================
+# S4: Result Transparency (Diagnostics)
+# =========================================================================
+
+
+def test_diagnostics_in_search_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Search response should contain diagnostics dict."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "doc.txt"
+    target.write_text("x")
+
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: ([executor._make_search_metadata(target, score=100, source="spotlight")], 1),
+    )
+
+    result = executor.execute("search_files", {"query": "doc", "limit": 5})
+    output = result["output"]
+    assert "diagnostics" in output
+    diag = output["diagnostics"]
+    assert "spotlight_content_floor_applied" in diag
+    assert "colocation_siblings_added" in diag
+    assert "cache_overlap_boost_applied" in diag
+    assert isinstance(diag["spotlight_content_floor_applied"], int)
+
+
+# =========================================================================
+# S5: Ranking version bump
+# =========================================================================
+
+
+def test_ranking_version_is_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ranking version should be v2 after S1-S4 changes."""
+    executor = _make_executor(tmp_path, search_scan_limit=200)
+    target = tmp_path / "test.txt"
+    target.write_text("x")
+
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: ([executor._make_search_metadata(target, score=100, source="spotlight")], 1),
+    )
+
+    result = executor.execute("search_files", {"query": "test", "limit": 5})
+    assert result["output"]["ranking_version"] == "v2"

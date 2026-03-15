@@ -31,9 +31,7 @@ class TestSchemaLoading:
         
         expected_tools = [
             "search_files",
-            "get_metadata",
-            "read_text",
-            "extract_content",
+            "read_document",
             "plan_ops",
             "planner",
             "apply_ops",
@@ -179,47 +177,7 @@ class TestToolCallValidation:
         assert "'query' is a required property" in str(exc_info.value)
         assert len(exc_info.value.errors) > 0
     
-    def test_validate_get_metadata_valid(self, schemas_dir: Path) -> None:
-        """Test validating a valid get_metadata call."""
-        validator = SchemaValidator(schemas_dir)
-        
-        result = validator.validate_tool_call("get_metadata", {
-            "paths": ["/Users/test/file.txt", "/Users/test/another.txt"]
-        })
-        
-        assert result is True
-    
-    def test_validate_get_metadata_wrong_type(self, schemas_dir: Path) -> None:
-        """Test get_metadata with wrong type for paths."""
-        validator = SchemaValidator(schemas_dir)
-        
-        with pytest.raises(ValidationFailedError) as exc_info:
-            validator.validate_tool_call("get_metadata", {
-                "paths": "not-an-array"  # Should be array
-            })
-        
-        assert "not of type 'array'" in str(exc_info.value)
-    
-    def test_validate_read_text_valid(self, schemas_dir: Path) -> None:
-        """Test validating a valid read_text call."""
-        validator = SchemaValidator(schemas_dir)
-        
-        result = validator.validate_tool_call("read_text", {
-            "path": "/Users/test/document.txt"
-        })
-        
-        assert result is True
-    
-    def test_validate_extract_content_valid(self, schemas_dir: Path) -> None:
-        """Test validating a valid extract_content call."""
-        validator = SchemaValidator(schemas_dir)
-        
-        result = validator.validate_tool_call("extract_content", {
-            "path": "/Users/test/document.pdf",
-            "mode": "pdf",
-        })
-        
-        assert result is True
+
     
     def test_validate_plan_ops_valid(self, schemas_dir: Path) -> None:
         """Test validating a valid plan_ops call."""
@@ -450,9 +408,7 @@ class TestGeminiFormat:
         
         expected_tools = [
             "search_files",
-            "get_metadata",
-            "read_text",
-            "extract_content",
+            "read_document",
             "plan_ops",
             "planner",
             "apply_ops",
@@ -523,7 +479,7 @@ class TestEdgeCases:
         validator = SchemaValidator(schemas_dir)
         
         # Missing required and wrong type in same call
-        is_valid, errors = validator.validate_tool_call_safe("get_metadata", {
+        is_valid, errors = validator.validate_tool_call_safe("search_files", {
             # paths is missing and we have invalid extra field
         })
         

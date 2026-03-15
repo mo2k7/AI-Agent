@@ -59,3 +59,20 @@ func toolResultFormatterRendersGenerateImageEmptyPayloadClearly() {
     #expect(normalized.contains("**Image Generation**"))
     #expect(normalized.contains("No saved images were returned."))
 }
+
+@Test
+func toolResultFormatterRendersBrowseWebWarningsCompactly() {
+    let content = """
+    {"tool":"browse_web","ok":true,"output":{"final_url":"https://example.com/article","title":"Example Article","effective_browse_profile":"flexible","policy_warnings":["Access restriction warning: URL appears to require login.","Security attestation warning: stale"],"content":"Article body text."}}
+    """
+
+    let normalized = ToolResultFormatter.normalizeContent(content)
+
+    #expect(normalized.contains("**Web Browse**"))
+    #expect(normalized.contains("Source: [Example Article](https://example.com/article)"))
+    #expect(normalized.contains("Browse profile: `flexible`"))
+    #expect(normalized.contains("Policy notice: `flexible` browsing allowed this result with policy warnings."))
+    #expect(normalized.contains("Policy notice: `flexible` browsing allowed this result with policy warnings.\n\nCaution:"))
+    #expect(normalized.contains("Caution: Access restriction warning: URL appears to require login. (+1 more)"))
+    #expect(normalized.contains("Article body text."))
+}

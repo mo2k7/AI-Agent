@@ -6,11 +6,11 @@ import asyncio
 import importlib.util
 import json
 import sys
-import uuid
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+from websockets.asyncio.server import serve
 
 
 def _load_script_module(script_name: str, module_name: str) -> ModuleType:
@@ -38,72 +38,69 @@ def test_build_worker_plan_is_deterministic_for_same_seed() -> None:
 @pytest.mark.anyio
 async def test_stress_harness_smoke_with_fake_backend(tmp_path: Path) -> None:
     module = _load_script_module("stress_rpc.py", "stress_rpc_for_test_smoke")
-    socket_path = Path(f"/tmp/ai-agent-stress-smoke-{uuid.uuid4().hex[:8]}.sock")
+    backend_url_holder: dict[str, str] = {}
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                raw = line.decode("utf-8", errors="replace").strip()
-                if not raw:
-                    continue
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": "global",
-                        "type": "error",
-                        "error": {"code": -32700, "message": "Parse error"},
-                    }
-                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                    await writer.drain()
-                    continue
+    async def handle(connection) -> None:
+        async for raw in connection:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": "global",
+                    "type": "error",
+                    "error": {"code": -32700, "message": "Parse error"},
+                }
+                await connection.send(json.dumps(response))
+                continue
 
-                request_id = payload.get("id", "global")
-                method = payload.get("method")
-                if method == "ping":
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "type": "result",
-                        "result": {"content": "pong"},
-                    }
-                elif method == "session.create":
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "type": "result",
-                        "result": {
-                            "content": json.dumps(
-                                {
-                                    "session_id": "session-smoke",
-                                    "title": "smoke",
-                                    "memory_mode": "on",
-                                    "created_at": 0.0,
-                                }
-                            )
-                        },
-                    }
-                else:
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "type": "error",
-                        "error": {"code": -32601, "message": f"Method not found: {method}"},
-                    }
-                writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+            request_id = payload.get("id", "global")
+            method = payload.get("method")
+            if method == "ping":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "type": "result",
+                    "result": {"content": "pong"},
+                }
+            elif method == "session.create":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "type": "result",
+                    "result": {
+                        "content": json.dumps(
+                            {
+                                "session_id": "session-smoke",
+                                "title": "smoke",
+                                "memory_mode": "on",
+                                "created_at": 0.0,
+                            }
+                        )
+                    },
+                }
+            else:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "type": "error",
+                    "error": {"code": -32601, "message": f"Method not found: {method}"},
+                }
+            await connection.send(json.dumps(response))
 
-    server = await asyncio.start_unix_server(handle, path=str(socket_path))
+    server = await serve(handle, "127.0.0.1", 0)
+    sock = server.sockets[0]
+    host, port = sock.getsockname()[:2]
+    backend_url_holder["url"] = f"ws://{host}:{port}"
     try:
         harness = module.StressHarness(
-            socket_path=str(socket_path),
+            backend_url=backend_url_holder["url"],
+            auth_token=None,
             duration=1,
             concurrency=2,
             seed=42,
@@ -117,4 +114,3 @@ async def test_stress_harness_smoke_with_fake_backend(tmp_path: Path) -> None:
     finally:
         server.close()
         await server.wait_closed()
-        socket_path.unlink(missing_ok=True)

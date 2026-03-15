@@ -7,7 +7,7 @@ func promptRequestEncodesPromptKeyAndModel() throws {
     let request = PromptRequest(
         id: "prompt-1",
         text: "hello",
-        model: "gemini-3-flash-preview"
+        model: "gemini-2.5-flash"
     )
 
     let payload = try decodeJSONObject(from: request)
@@ -17,7 +17,7 @@ func promptRequestEncodesPromptKeyAndModel() throws {
     #expect(payload["method"] as? String == "prompt")
     #expect(params?["prompt"] as? String == "hello")
     #expect(params?["text"] == nil)
-    #expect(params?["model"] as? String == "gemini-3-flash-preview")
+    #expect(params?["model"] as? String == "gemini-2.5-flash")
     #expect(params?["stream"] == nil)
 }
 
@@ -26,7 +26,7 @@ func promptRequestEncodesSessionAndMemoryModeWhenProvided() throws {
     let request = PromptRequest(
         id: "prompt-2",
         text: "remember this",
-        model: "gemini-3-pro-preview",
+        model: "gemini-2.5-pro",
         sessionId: "session-abc",
         memoryMode: "ephemeral",
         executionMode: "plan",
@@ -34,6 +34,7 @@ func promptRequestEncodesSessionAndMemoryModeWhenProvided() throws {
         verbosity: "high",
         presentationStyle: "readable_pro",
         streamingAnimation: "wave_reveal",
+        browseProfile: "flexible",
         deepThink: true,
         correlationId: "corr-123"
     )
@@ -48,6 +49,7 @@ func promptRequestEncodesSessionAndMemoryModeWhenProvided() throws {
     #expect(params?["verbosity"] as? String == "high")
     #expect(params?["presentation_style"] as? String == "readable_pro")
     #expect(params?["stream_animation"] as? String == "wave_reveal")
+    #expect(params?["browse_profile"] as? String == "flexible")
     #expect(params?["deep_think"] as? Bool == true)
     #expect(params?["correlation_id"] as? String == "corr-123")
 }
@@ -124,6 +126,34 @@ func ipcMessageParserParsesStatusAndErrorMessages() throws {
     case .failure(let error):
         Issue.record("Error JSON was not parsed: \(error.localizedDescription)")
     }
+}
+
+@Test
+func geminiModelCatalogDecodesLiveMetadata() throws {
+    let json = """
+    {
+      "default_model": "gemini-2.5-flash",
+      "models": [
+        {
+          "name": "gemini-2.5-flash",
+          "display_name": "Gemini 2.5 Flash",
+          "description": "Stable fast model",
+          "supported_actions": ["generateContent"],
+          "input_token_limit": 1048576,
+          "output_token_limit": 65536,
+          "is_preview": false,
+          "supports_deep_think": true
+        }
+      ]
+    }
+    """
+
+    let decoded = try JSONDecoder().decode(IPCModelCatalog.self, from: Data(json.utf8))
+
+    #expect(decoded.defaultModel == "gemini-2.5-flash")
+    #expect(decoded.models.count == 1)
+    #expect(decoded.models.first?.resolvedDisplayName == "Gemini 2.5 Flash")
+    #expect(decoded.models.first?.supportsDeepThink == true)
 }
 
 @Test

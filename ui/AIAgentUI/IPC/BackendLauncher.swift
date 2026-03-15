@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  BackendLauncher.swift
 //  AIAgentUI
@@ -6,11 +7,106 @@
 //  Status: Active - Python backend process management
 //
 
+import Darwin
 import Foundation
 
 struct BackendReadyContext: Sendable {
-    let socketPath: String
+    let endpointURL: String
     let authToken: String
+}
+
+struct TailscaleIdentity: Sendable, Equatable {
+    let dnsName: String?
+    let ipAddress: String?
+}
+
+struct CapturedProcessResult: Sendable {
+    let terminationStatus: Int32
+    let stdout: String
+    let stderr: String
+}
+
+enum ChildProcessCapture {
+    static func run(
+        executableURL: URL,
+        arguments: [String],
+        currentDirectoryURL: URL,
+        environment: [String: String]
+    ) async throws -> CapturedProcessResult {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = executableURL
+                process.arguments = arguments
+                process.currentDirectoryURL = currentDirectoryURL
+                process.environment = environment
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                do {
+                    try process.run()
+                } catch {
+                    stdoutPipe.fileHandleForReading.closeFile()
+                    stdoutPipe.fileHandleForWriting.closeFile()
+                    stderrPipe.fileHandleForReading.closeFile()
+                    stderrPipe.fileHandleForWriting.closeFile()
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                let group = DispatchGroup()
+                let stdoutData = DataCaptureBox()
+                let stderrData = DataCaptureBox()
+
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    stdoutData.store(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
+                    group.leave()
+                }
+
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    stderrData.store(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+                    group.leave()
+                }
+
+                process.waitUntilExit()
+                stdoutPipe.fileHandleForWriting.closeFile()
+                stderrPipe.fileHandleForWriting.closeFile()
+                group.wait()
+                stdoutPipe.fileHandleForReading.closeFile()
+                stderrPipe.fileHandleForReading.closeFile()
+
+                continuation.resume(
+                    returning: CapturedProcessResult(
+                        terminationStatus: process.terminationStatus,
+                        stdout: String(data: stdoutData.load(), encoding: .utf8) ?? "",
+                        stderr: String(data: stderrData.load(), encoding: .utf8) ?? ""
+                    )
+                )
+            }
+        }
+    }
+}
+
+private final class DataCaptureBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func store(_ newValue: Data) {
+        lock.lock()
+        data = newValue
+        lock.unlock()
+    }
+
+    func load() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
 }
 
 /// Manages the lifecycle of the Python backend process
@@ -35,11 +131,169 @@ final class BackendLauncher {
     /// The running process (wrapped in unchecked for Sendable isolation)
     private var processRef: ProcessRef?
     
-    /// Socket path for the backend
-    private(set) var socketPath: String?
+    /// WebSocket endpoint URL for the backend
+    private(set) var endpointURL: String?
 
     /// Per-process IPC auth token required by backend auth.hello.
     private(set) var authToken: String?
+
+    /// Stable pairing token shared with the background daemon.
+    var pairingAuthToken: String? { try? Self.loadOrCreatePairingAuthToken() }
+
+    /// Detected Tailscale identity for remote pairing.
+    var tailscaleIdentity: TailscaleIdentity? { Self.detectTailscaleIdentity() }
+
+    /// Detected Tailscale MagicDNS hostname for remote pairing.
+    var tailscaleDNSName: String? { tailscaleIdentity?.dnsName }
+
+    /// Detected Tailscale IP address for remote pairing.
+    var tailscaleIP: String? { tailscaleIdentity?.ipAddress }
+
+    /// Full Tailscale WebSocket endpoint URL for iOS pairing.
+    var tailscaleEndpointURL: String? {
+        if let dnsName = tailscaleDNSName {
+            return "wss://\(dnsName):8765"
+        }
+        if let ip = tailscaleIP {
+            return "wss://\(ip):8765"
+        }
+        return nil
+    }
+
+    /// Detect the Tailscale network interface IP (100.x.x.x CGNAT range).
+    nonisolated static func detectTailscaleIdentity() -> TailscaleIdentity? {
+        if let cliURL = tailscaleCLIExecutableURL(),
+           let statusData = captureProcessOutput(
+                executableURL: cliURL,
+                arguments: ["status", "--json"]
+           ),
+           let identity = parseTailscaleIdentity(fromStatusData: statusData) {
+            return identity
+        }
+
+        if let ipAddress = detectTailscaleIPFromInterfaces() {
+            return TailscaleIdentity(dnsName: nil, ipAddress: ipAddress)
+        }
+
+        return nil
+    }
+
+    nonisolated static func parseTailscaleIdentity(fromStatusData data: Data) -> TailscaleIdentity? {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+
+        let selfNode = root["Self"] as? [String: Any]
+        let dnsName = normalizeTailscaleDNSName(selfNode?["DNSName"] as? String)
+        let selfIPs = selfNode?["TailscaleIPs"] as? [String] ?? []
+        let rootIPs = root["TailscaleIPs"] as? [String] ?? []
+        let ipAddress = (selfIPs + rootIPs).first(where: isTailscaleIP)
+
+        if dnsName == nil, ipAddress == nil {
+            return nil
+        }
+
+        return TailscaleIdentity(dnsName: dnsName, ipAddress: ipAddress)
+    }
+
+    nonisolated static func isTailscaleIP(_ input: String) -> Bool {
+        let parts = input.split(separator: ".")
+        guard parts.count == 4,
+              let first = Int(parts[0]),
+              let second = Int(parts[1]),
+              (0...255).contains(first),
+              (0...255).contains(second),
+              first == 100,
+              (64...127).contains(second) else {
+            return false
+        }
+        return parts[2...3].allSatisfy { octet in
+            guard let value = Int(octet) else { return false }
+            return (0...255).contains(value)
+        }
+    }
+
+    private nonisolated static func detectTailscaleIPFromInterfaces() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        var tailscaleIP: String?
+        var current: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let addr = current {
+            let interface = addr.pointee
+            let family = interface.ifa_addr.pointee.sa_family
+            if family == UInt8(AF_INET) {  // IPv4
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(
+                    interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                    &hostname, socklen_t(hostname.count),
+                    nil, 0, NI_NUMERICHOST
+                )
+                let ip = hostname.withUnsafeBufferPointer { buffer in
+                    let scalars = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                    return String(decoding: scalars, as: UTF8.self)
+                }
+                if isTailscaleIP(ip) {
+                    tailscaleIP = ip
+                    break
+                }
+            }
+            current = interface.ifa_next
+        }
+        return tailscaleIP
+    }
+
+    private nonisolated static func normalizeTailscaleDNSName(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        let normalized = trimmed.hasSuffix(".") ? String(trimmed.dropLast()) : trimmed
+        return normalized.hasSuffix(".ts.net") ? normalized : nil
+    }
+
+    private nonisolated static func tailscaleCLIExecutableURL(
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let candidates = [
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+            "/opt/homebrew/bin/tailscale",
+            "/usr/local/bin/tailscale",
+            "/usr/bin/tailscale",
+        ]
+        for path in candidates where fileManager.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    private nonisolated static func captureProcessOutput(
+        executableURL: URL,
+        arguments: [String]
+    ) -> Data? {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.environment = ProcessInfo.processInfo.environment
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+        return stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    }
 
     /// Whether the server ready callback has been fired
     private var serverReadyNotified: Bool = false
@@ -61,32 +315,35 @@ final class BackendLauncher {
     nonisolated init() {}
     
     deinit {
-        // Cleanup is synchronous and handles Process termination
-        processRef?.terminateSync()
+        processRef?.requestTermination()
     }
     
     // MARK: - Public Methods
     
     /// Starts the Python backend server
-    /// - Parameter customSocketPath: Optional custom socket path
-    func start(customSocketPath: String? = nil) async throws {
+    /// - Parameter customEndpointURL: Optional custom WebSocket endpoint URL.
+    func start(customEndpointURL: String? = nil) async throws {
         guard state == .notStarted || state == .terminated || state.isFailed else {
             return  // Already running or starting
         }
         
         updateState(.starting)
         serverReadyNotified = false
-        let generatedAuthToken = UUID().uuidString
+        let generatedAuthToken = try Self.loadOrCreatePairingAuthToken()
 
         // Find the Python executable and project path
-        let (pythonPath, projectPath) = try findPythonEnvironment()
+        let (pythonPath, projectPath) = try await findPythonEnvironment()
         
         // Set up arguments
-        var args = ["-m", "agent_host.main", "--server"]
-        if let socketPath = customSocketPath {
-            args.append("--socket-path")
-            args.append(socketPath)
-        }
+        let endpoint = try Self.resolveEndpointURL(customEndpointURL)
+        let host = endpoint.host ?? "127.0.0.1"
+        let port = endpoint.port ?? 8765
+        let args = [
+            "-m", "agent_host.main",
+            "--server",
+            "--host", host,
+            "--port", String(port),
+        ]
         let finalArgs = args  // Capture as let for Sendable
         
         // Create process reference with callbacks
@@ -94,29 +351,25 @@ final class BackendLauncher {
         self.processRef = ref
         
         // Store callbacks in ref for thread-safe access
-        ref.onTermination = { [weak self] status in
+        ref.onTermination = { [weak self, weak ref] status in
             Task { @MainActor in
-                guard let self = self else { return }
-                if status == 0 {
-                    self.updateState(.terminated)
-                } else {
-                    self.updateState(.failed("Backend exited with code \(status)"))
-                }
+                guard let self, let ref else { return }
+                self.handleProcessTermination(for: ref, status: status)
             }
         }
         
-        ref.onOutput = { [weak self] string in
+        ref.onOutput = { [weak self, weak ref] string in
             Task { @MainActor in
-                guard let self = self else { return }
+                guard let self, let ref else { return }
                 self.onLogOutput?(string)
                 
                 // Check for server ready message
-                if string.contains("IPC Server started") {
-                    if let socketPath = self.socketPath {
+                if self.processRef === ref, string.contains("IPC Server started") {
+                    if let endpointURL = self.endpointURL {
                         do {
-                            try self.notifyServerReady(socketPath)
+                            try self.notifyServerReady(endpointURL)
                         } catch {
-                            self.updateState(.failed(error.localizedDescription))
+                            self.failLaunch(for: ref, message: error.localizedDescription)
                         }
                     }
                 }
@@ -130,37 +383,59 @@ final class BackendLauncher {
             }
         }
         
+        // Resolve the API key: prefer UserDefaults (set from the UI), then env vars
+        let storedAPIKey = UserDefaults.standard.string(forKey: "gemini_api_key")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let envGoogleKey = ProcessInfo.processInfo.environment["GOOGLE_API_KEY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let envGeminiKey = ProcessInfo.processInfo.environment["GEMINI_API_KEY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKey = [storedAPIKey, envGoogleKey, envGeminiKey]
+            .compactMap { $0 }
+            .first(where: { !$0.isEmpty }) ?? ""
+
         // Start the process
+        var extraEnv: [String: String] = [
+            "AI_AGENT_IPC_AUTH_TOKEN": generatedAuthToken,
+            "AI_AGENT_ENV": ProcessInfo.processInfo.environment["AI_AGENT_ENV"] ?? "production",
+            "AI_AGENT_IPC_HOST": "0.0.0.0",
+        ]
+        if !apiKey.isEmpty {
+            extraEnv["GOOGLE_API_KEY"] = apiKey
+        }
+        if Self.shouldEnableTLS(for: endpoint) {
+            let tlsConfig = try await Self.loadPairingTLSConfig(projectPath: projectPath)
+            extraEnv["AI_AGENT_TLS_CERT"] = tlsConfig.certPath
+            extraEnv["AI_AGENT_TLS_KEY"] = tlsConfig.keyPath
+            extraEnv["AI_AGENT_REQUIRE_TLS"] = "1"
+        }
+
         let result = await ref.startProcess(
             pythonPath: pythonPath,
             projectPath: projectPath,
             arguments: finalArgs,
-            extraEnvironment: [
-                "AI_AGENT_IPC_AUTH_TOKEN": generatedAuthToken,
-                "AI_AGENT_ENV": ProcessInfo.processInfo.environment["AI_AGENT_ENV"] ?? "production",
-            ]
+            extraEnvironment: extraEnv
         )
         
         switch result {
         case .success(let pid):
             updateState(.running(pid: pid))
             
-            // Calculate socket path
-            let socketPath = customSocketPath ?? "/tmp/ai-agent-\(pid).sock"
-            self.socketPath = socketPath
+            self.endpointURL = endpoint.absoluteString
             self.authToken = generatedAuthToken
             
-            // Wait for socket to be ready
+            // Wait for the WebSocket server to become ready.
             do {
-                try await waitForSocket(path: socketPath, timeout: 10.0)
+                try await waitForServerReady(timeout: 10.0)
             } catch {
-                processRef?.terminateSync()
-                processRef = nil
-                updateState(.failed(error.localizedDescription))
+                failLaunch(for: ref, message: error.localizedDescription)
                 throw error
             }
             
         case .failure(let error):
+            if processRef === ref {
+                processRef = nil
+            }
             updateState(.failed("Failed to start backend: \(error.localizedDescription)"))
             throw BackendError.launchFailed(error.localizedDescription)
         }
@@ -168,11 +443,13 @@ final class BackendLauncher {
     
     /// Terminates the backend server
     func terminate() {
-        processRef?.terminateSync()
+        let ref = processRef
         processRef = nil
-        socketPath = nil
+        endpointURL = nil
         authToken = nil
+        serverReadyNotified = false
         updateState(.terminated)
+        ref?.requestTermination()
     }
     
     /// Checks if the backend is running
@@ -184,14 +461,125 @@ final class BackendLauncher {
     }
     
     // MARK: - Private Methods
-    
+
     private func updateState(_ newState: State) {
         state = newState
         onStateChange?(newState)
     }
+
+    private struct PairingTLSConfig: Sendable {
+        let certPath: String
+        let keyPath: String
+    }
+
+    private nonisolated static func shouldEnableTLS(for endpoint: URL) -> Bool {
+        if endpoint.scheme?.lowercased() == "wss" {
+            return true
+        }
+        guard let host = endpoint.host?.lowercased() else {
+            return false
+        }
+        return !["127.0.0.1", "localhost"].contains(host)
+    }
+
+    private nonisolated static func pairingRuntimeDirectory(fileManager: FileManager = .default) throws -> URL {
+        let base = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let runtimeDir = base.appendingPathComponent("AIAgent", isDirectory: true)
+        try fileManager.createDirectory(
+            at: runtimeDir,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+        try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: runtimeDir.path)
+        return runtimeDir
+    }
+
+    private nonisolated static func loadOrCreatePairingAuthToken(
+        fileManager: FileManager = .default
+    ) throws -> String {
+        let runtimeDir = try pairingRuntimeDirectory(fileManager: fileManager)
+        let tokenURL = runtimeDir.appendingPathComponent("pairing-auth-token", isDirectory: false)
+
+        if let existing = try? String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
+            return existing
+        }
+
+        let token = UUID().uuidString
+        try token.write(to: tokenURL, atomically: true, encoding: .utf8)
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenURL.path)
+        return token
+    }
+
+    private nonisolated static func loadPairingTLSConfig(projectPath: String) async throws -> PairingTLSConfig {
+        let scriptURL = URL(fileURLWithPath: projectPath)
+            .appendingPathComponent("scripts/ensure-backend-tls.sh")
+        let result = try await ChildProcessCapture.run(
+            executableURL: URL(fileURLWithPath: "/bin/bash"),
+            arguments: [scriptURL.path],
+            currentDirectoryURL: URL(fileURLWithPath: projectPath),
+            environment: ProcessInfo.processInfo.environment
+        )
+
+        let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.terminationStatus != 0 {
+            let reason = stderrText.isEmpty ? "TLS provisioning script failed." : stderrText
+            throw BackendError.launchFailed(reason)
+        }
+
+        var certPath: String?
+        var keyPath: String?
+        for rawLine in result.stdout.split(whereSeparator: \.isNewline) {
+            let line = String(rawLine)
+            let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            switch parts[0] {
+            case "TLS_CERT_PATH":
+                certPath = parts[1]
+            case "TLS_KEY_PATH":
+                keyPath = parts[1]
+            default:
+                continue
+            }
+        }
+
+        guard let certPath, !certPath.isEmpty, let keyPath, !keyPath.isEmpty else {
+            throw BackendError.launchFailed("TLS provisioning script did not return cert/key paths.")
+        }
+        return PairingTLSConfig(certPath: certPath, keyPath: keyPath)
+    }
     
     /// Finds the Python environment and project path
-    private nonisolated func findPythonEnvironment() throws -> (pythonPath: String, projectPath: String) {
+    private func handleProcessTermination(for ref: ProcessRef, status: Int32) {
+        guard processRef === ref else { return }
+        processRef = nil
+        endpointURL = nil
+        authToken = nil
+        serverReadyNotified = false
+        if status == 0 {
+            updateState(.terminated)
+        } else {
+            updateState(.failed("Backend exited with code \(status)"))
+        }
+    }
+
+    private func failLaunch(for ref: ProcessRef, message: String) {
+        guard processRef === ref else { return }
+        processRef = nil
+        endpointURL = nil
+        authToken = nil
+        serverReadyNotified = false
+        ref.requestTermination()
+        updateState(.failed(message))
+    }
+
+    private nonisolated func findPythonEnvironment() async throws -> (pythonPath: String, projectPath: String) {
         let fileManager = FileManager.default
 
         if let configuredRoot = ProcessInfo.processInfo.environment["AI_AGENT_PROJECT_ROOT"]?
@@ -202,7 +590,7 @@ final class BackendLauncher {
             guard fileManager.fileExists(atPath: pyprojectPath.path) else {
                 throw BackendError.projectNotFound
             }
-            let pythonPath = try resolvePythonPath(root: rootURL, fileManager: fileManager)
+            let pythonPath = try await resolvePythonPath(root: rootURL, fileManager: fileManager)
             return (pythonPath, rootURL.path)
         }
         
@@ -227,7 +615,7 @@ final class BackendLauncher {
             throw BackendError.projectNotFound
         }
 
-        let pythonPath = try resolvePythonPath(root: root, fileManager: fileManager)
+        let pythonPath = try await resolvePythonPath(root: root, fileManager: fileManager)
         
         return (pythonPath, root.path)
     }
@@ -235,7 +623,7 @@ final class BackendLauncher {
     private nonisolated func resolvePythonPath(
         root: URL,
         fileManager: FileManager
-    ) throws -> String {
+    ) async throws -> String {
         let venvPython = root.appendingPathComponent(".venv/bin/python").path
         let venvPython3 = root.appendingPathComponent(".venv/bin/python3").path
         if fileManager.fileExists(atPath: venvPython) {
@@ -245,7 +633,7 @@ final class BackendLauncher {
             return venvPython3
         }
         do {
-            if let poetry = try findPoetryPython(in: root.path) {
+            if let poetry = try await findPoetryPython(in: root.path) {
                 return poetry
             }
             throw BackendError.pythonNotFound
@@ -253,48 +641,35 @@ final class BackendLauncher {
             throw BackendError.launchFailed("Poetry python lookup failed: \(error.localizedDescription)")
         }
     }
-    
-    /// Finds Poetry-managed Python environment
-    private nonisolated func findPoetryPython(in projectPath: String) throws -> String? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        task.arguments = ["poetry", "env", "info", "-p"]
-        task.currentDirectoryURL = URL(fileURLWithPath: projectPath)
-        
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        let errorPipe = Pipe()
-        task.standardError = errorPipe
-        
-        try task.run()
-        task.waitUntilExit()
 
-        let stderrData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrText = String(data: stderrData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if task.terminationStatus != 0 {
+    /// Finds Poetry-managed Python environment
+    private nonisolated func findPoetryPython(in projectPath: String) async throws -> String? {
+        let result = try await ChildProcessCapture.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: ["poetry", "env", "info", "-p"],
+            currentDirectoryURL: URL(fileURLWithPath: projectPath),
+            environment: ProcessInfo.processInfo.environment
+        )
+
+        let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.terminationStatus != 0 {
             let reason = stderrText.isEmpty ? "unknown poetry error" : stderrText
             throw BackendError.launchFailed(reason)
         }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        if let envPath = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !envPath.isEmpty {
+        let envPath = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !envPath.isEmpty {
             return envPath + "/bin/python"
         }
         
         return nil
     }
     
-    /// Waits for a valid Unix socket file to appear
-    private func waitForSocket(path: String, timeout: TimeInterval) async throws {
+    private func waitForServerReady(timeout: TimeInterval) async throws {
         let startTime = Date()
         
         while Date().timeIntervalSince(startTime) < timeout {
-            if Self.isSocketPath(path) {
-                // Additional delay to ensure server is listening
-                try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
-                try notifyServerReady(path)
+            if serverReadyNotified {
                 return
             }
             try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
@@ -303,24 +678,62 @@ final class BackendLauncher {
         throw BackendError.socketTimeout
     }
 
-    private static func isSocketPath(_ path: String) -> Bool {
-        let fileManager = FileManager.default
-        guard let attributes = try? fileManager.attributesOfItem(atPath: path) else {
-            return false
-        }
-        guard let fileType = attributes[.type] as? FileAttributeType else {
-            return false
-        }
-        return fileType == .typeSocket
-    }
-
-    private func notifyServerReady(_ path: String) throws {
+    private func notifyServerReady(_ endpointURL: String) throws {
         guard !serverReadyNotified else { return }
         guard let authToken, !authToken.isEmpty else {
             throw BackendError.launchFailed("Missing backend auth token during startup")
         }
         serverReadyNotified = true
-        onServerReady?(.init(socketPath: path, authToken: authToken))
+        onServerReady?(.init(endpointURL: endpointURL, authToken: authToken))
+    }
+
+    private static func resolveEndpointURL(_ rawURL: String?) throws -> URL {
+        if let rawURL, !rawURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let endpoint = URL(string: rawURL),
+                  let scheme = endpoint.scheme?.lowercased(),
+                  ["ws", "wss"].contains(scheme),
+                  endpoint.host != nil else {
+                throw BackendError.launchFailed("Invalid backend endpoint URL: \(rawURL)")
+            }
+            return endpoint
+        }
+
+        let port = findAvailableLoopbackPort()
+        return URL(string: "ws://127.0.0.1:\(port)")!
+    }
+
+    private static func findAvailableLoopbackPort() -> Int {
+        let socketFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { return 8765 }
+        defer { Darwin.close(socketFD) }
+
+        var value: Int32 = 1
+        _ = withUnsafePointer(to: &value) {
+            setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, $0, socklen_t(MemoryLayout<Int32>.size))
+        }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.stride)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(0).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.stride))
+            }
+        }
+        guard bindResult == 0 else { return 8765 }
+
+        var boundAddress = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.stride)
+        let nameResult = withUnsafeMutablePointer(to: &boundAddress) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(socketFD, $0, &length)
+            }
+        }
+        guard nameResult == 0 else { return 8765 }
+        return Int(UInt16(bigEndian: boundAddress.sin_port))
     }
 }
 
@@ -389,8 +802,11 @@ final class ProcessRef: @unchecked Sendable {
                 let outputCallback = self.onOutput
                 outputPipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
-                    guard !data.isEmpty,
-                          let string = String(data: data, encoding: .utf8) else {
+                    guard !data.isEmpty else {
+                        handle.readabilityHandler = nil
+                        return
+                    }
+                    guard let string = String(data: data, encoding: .utf8) else {
                         return
                     }
                     outputCallback?(string)
@@ -400,8 +816,11 @@ final class ProcessRef: @unchecked Sendable {
                 let errorCallback = self.onError
                 errorPipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
-                    guard !data.isEmpty,
-                          let string = String(data: data, encoding: .utf8) else {
+                    guard !data.isEmpty else {
+                        handle.readabilityHandler = nil
+                        return
+                    }
+                    guard let string = String(data: data, encoding: .utf8) else {
                         return
                     }
                     errorCallback?(string)
@@ -412,39 +831,66 @@ final class ProcessRef: @unchecked Sendable {
                     let pid = process.processIdentifier
                     continuation.resume(returning: .success(pid))
                 } catch {
+                    outputPipe.fileHandleForReading.readabilityHandler = nil
+                    errorPipe.fileHandleForReading.readabilityHandler = nil
+                    process.terminationHandler = nil
+                    outputPipe.fileHandleForReading.closeFile()
+                    outputPipe.fileHandleForWriting.closeFile()
+                    errorPipe.fileHandleForReading.closeFile()
+                    errorPipe.fileHandleForWriting.closeFile()
+                    lock.lock()
+                    if self.process === process {
+                        self.process = nil
+                        self.outputPipe = nil
+                        self.errorPipe = nil
+                    }
+                    lock.unlock()
                     continuation.resume(returning: .failure(error))
                 }
             }
         }
     }
     
-    func terminateSync() {
+    func requestTermination(gracePeriod: TimeInterval = 2.0) {
+        let snapshot: (process: Process, outputPipe: Pipe?, errorPipe: Pipe?)
         lock.lock()
-        defer { lock.unlock() }
-        
-        guard let process = process, process.isRunning else {
+        guard let process else {
+            lock.unlock()
             return
         }
-        
-        // Clean up handlers
+        process.terminationHandler = nil
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         errorPipe?.fileHandleForReading.readabilityHandler = nil
-        
-        // Send SIGTERM first for graceful shutdown
-        process.terminate()
-        
-        // Wait briefly for graceful shutdown
-        let deadline = Date().addingTimeInterval(2)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        
-        // Force kill if still running
-        if process.isRunning {
-            process.interrupt()
-        }
-        
+        snapshot = (process, outputPipe, errorPipe)
         self.process = nil
+        self.outputPipe = nil
+        self.errorPipe = nil
+        lock.unlock()
+
+        DispatchQueue.global(qos: .utility).async {
+            defer {
+                snapshot.outputPipe?.fileHandleForReading.closeFile()
+                snapshot.outputPipe?.fileHandleForWriting.closeFile()
+                snapshot.errorPipe?.fileHandleForReading.closeFile()
+                snapshot.errorPipe?.fileHandleForWriting.closeFile()
+            }
+
+            guard snapshot.process.isRunning else { return }
+
+            snapshot.process.terminate()
+            let deadline = Date().addingTimeInterval(gracePeriod)
+            while snapshot.process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+
+            if snapshot.process.isRunning {
+                Darwin.kill(snapshot.process.processIdentifier, SIGKILL)
+                let killDeadline = Date().addingTimeInterval(1.0)
+                while snapshot.process.isRunning && Date() < killDeadline {
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+            }
+        }
     }
 }
 
@@ -487,3 +933,4 @@ extension BackendLauncher.State {
         return nil
     }
 }
+#endif

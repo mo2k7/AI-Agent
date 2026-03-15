@@ -1,0 +1,78 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "manage_notes",
+    "title": "manage_notes",
+    "description": "Create, update, reorder, or delete notes in the session's notes panel. Use for summaries, key findings, action items, flashcards, or study guides.",
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "create",
+                "update",
+                "delete",
+                "reorder"
+            ],
+            "description": "The action to perform on the notes database."
+        },
+        "note_id": {
+            "type": "string",
+            "description": "Required for 'update' and 'delete'. The exact note ID or its 8-character prefix."
+        },
+        "content": {
+            "type": "string",
+            "description": "Required for 'create'. Optional for 'update'. The markdown text of the note. For flashcards or quizzes, format them nicely using Markdown headers and bold text.",
+            "maxLength": 16000
+        },
+        "title": {
+            "type": "string",
+            "description": "Optional title for a new tab/note or title update for an existing note.",
+            "maxLength": 200
+        },
+        "note_type": {
+            "type": "string",
+            "enum": [
+                "summary",
+                "key_points",
+                "study_guide",
+                "comparison_table",
+                "timeline",
+                "formula_sheet",
+                "flashcards",
+                "cheat_sheet"
+            ],
+            "description": "Optional semantic type for categorizing the note."
+        },
+        "tags": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "maxLength": 50
+            },
+            "maxItems": 10,
+            "description": "Optional list of tags."
+        },
+        "target": {
+            "type": "string",
+            "description": "Target destination for 'create' only: 'session_pad', 'new_tab', or a specific note_id to append to.",
+            "maxLength": 64
+        },
+        "is_pinned": {
+            "type": "boolean",
+            "description": "Optional flag for 'update' to pin/unpin the note."
+        },
+        "note_ids_in_order": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "minItems": 2,
+            "maxItems": 50,
+            "description": "Required for 'reorder'. The ordered list of note IDs."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "action"
+    ]
+}

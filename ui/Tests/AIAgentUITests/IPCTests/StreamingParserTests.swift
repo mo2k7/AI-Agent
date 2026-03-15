@@ -119,7 +119,7 @@ func messageDispatcherEmitsStreamingAndCompletion() {
     var streamSnapshots: [(requestId: String, text: String, done: Bool)] = []
     var completion: (requestId: String, content: String?)?
 
-    dispatcher.onStreamingUpdate = { requestId, text, done in
+    dispatcher.onStreamingUpdate = { requestId, _delta, text, done in
         streamSnapshots.append((requestId, text, done))
     }
     dispatcher.onComplete = { requestId, content in
@@ -174,7 +174,7 @@ func messageDispatcherSkipsNoOpEmptyStreamChunks() {
     let dispatcher = MessageDispatcher()
     var streamSnapshots: [(requestId: String, text: String, done: Bool)] = []
 
-    dispatcher.onStreamingUpdate = { requestId, text, done in
+    dispatcher.onStreamingUpdate = { requestId, _delta, text, done in
         streamSnapshots.append((requestId, text, done))
     }
 
@@ -210,10 +210,10 @@ func messageDispatcherSkipsNoOpEmptyStreamChunks() {
 @Test
 func messageDispatcherEmitsErrorWithCode() {
     let dispatcher = MessageDispatcher()
-    var receivedError: (requestId: String, message: String, code: Int?)?
+    var receivedError: (requestId: String, message: String, code: Int?, data: [String: Any]?)?
 
-    dispatcher.onError = { requestId, message, code in
-        receivedError = (requestId, message, code)
+    dispatcher.onError = { requestId, message, code, data in
+        receivedError = (requestId, message, code, data)
     }
 
     dispatcher.dispatch(
@@ -223,7 +223,7 @@ func messageDispatcherEmitsErrorWithCode() {
                 id: "req-3",
                 type: "error",
                 result: nil,
-                error: .init(code: -32001, message: "API error")
+                error: .init(code: -32001, message: "API error", data: nil)
             )
         )
     )
@@ -231,4 +231,40 @@ func messageDispatcherEmitsErrorWithCode() {
     #expect(receivedError?.requestId == "req-3")
     #expect(receivedError?.message == "API error")
     #expect(receivedError?.code == -32001)
+    #expect(receivedError?.data == nil)
+}
+
+@Test
+func messageDispatcherEmitsStructuredErrorData() {
+    let dispatcher = MessageDispatcher()
+    var receivedError: (requestId: String, message: String, code: Int?, data: [String: Any]?)?
+
+    dispatcher.onError = { requestId, message, code, data in
+        receivedError = (requestId, message, code, data)
+    }
+
+    dispatcher.dispatch(
+        .error(
+            ResultResponse(
+                jsonrpc: "2.0",
+                id: "req-timeout",
+                type: "error",
+                result: nil,
+                error: .init(
+                    code: -32014,
+                    message: "Request timed out",
+                    data: [
+                        "code": AnyCodable("model_timeout"),
+                        "phase": AnyCodable("model_generation"),
+                        "timeout_seconds": AnyCodable(180.0),
+                    ]
+                )
+            )
+        )
+    )
+
+    #expect(receivedError?.requestId == "req-timeout")
+    #expect(receivedError?.message == "Request timed out")
+    #expect(receivedError?.code == -32014)
+    #expect(receivedError?.data?["code"] as? String == "model_timeout")
 }

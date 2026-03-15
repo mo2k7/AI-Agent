@@ -10,6 +10,7 @@ It also provides IPC server mode for communication with the SwiftUI frontend.
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -46,7 +47,7 @@ from agent_host.system_prompt import SystemPromptLoadError
 from agent_host.memory.embeddings import EmbeddingService
 from agent_host.memory.manager import MemoryManager
 from agent_host.memory.migration import MemoryMigrationError, run_preflight_migration
-from agent_host.memory.store import get_db_metrics_snapshot
+from agent_host.memory.store import MemoryStoreError, get_db_metrics_snapshot
 from agent_host.tools._helpers import (
     _build_teacher_note_body,
     _normalize_note_tags,
@@ -63,14 +64,8 @@ from agent_host.tools.registry import (
     dispatch_screen_tool,
 )
 # Import tool modules to trigger handler self-registration.
-import agent_host.tools.take_note  # noqa: F401
-import agent_host.tools.update_note  # noqa: F401
-import agent_host.tools.delete_note  # noqa: F401
-import agent_host.tools.format_note  # noqa: F401
-import agent_host.tools.merge_notes  # noqa: F401
-import agent_host.tools.reorder_notes  # noqa: F401
-import agent_host.tools.generate_quiz  # noqa: F401
-import agent_host.tools.summarize_note  # noqa: F401
+import agent_host.tools.manage_notes  # noqa: F401
+import agent_host.tools.read_document  # noqa: F401
 import agent_host.tools.generate_image  # noqa: F401
 import agent_host.tools.read_screen  # noqa: F401
 from agent_host.memory.types import MemoryMode
@@ -154,6 +149,11 @@ _STREAM_ANIMATION_STYLE_NAMES: set[str] = {
     "typewriter_luxe",
     "minimal_motion",
 }
+_BROWSE_PROFILE_NAMES: set[str] = {
+    "strict",
+    "standard",
+    "flexible",
+}
 _PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT = 20
 _PLAN_MODE_CLARIFICATION_REQUIRED_DEFAULT = True
 _PLAN_MODE_CLARIFICATION_MIN_MISSING_DEFAULT = 3
@@ -164,9 +164,7 @@ _PLAN_MODE_CLARIFICATION_CONFIDENCE_TARGET_DEFAULT = 0.72
 _PLAN_MODE_OPTION_KEYS = ("A", "B", "C", "D")
 _PLAN_MODE_DISCOVERY_TOOLS = {
     "search_files",
-    "read_text",
-    "extract_content",
-    "get_metadata",
+    "read_document",
 }
 _PLAN_MODE_PLANNER_TOOLS = {"planner", "plan_ops"}
 _PLAN_MODE_OP_VERB_PATTERN = re.compile(
@@ -219,11 +217,6 @@ _PLAN_MODE_ANSWER_Q_PATTERN = re.compile(
 _PLAN_MODE_SINGLE_OPTION_PATTERN = re.compile(r"^\s*([A-D])(?:[\)\].:\-]|\s|$)", re.IGNORECASE)
 _PLAN_MODE_CLARIFICATION_PREFIX_PATTERN = re.compile(r"^(?:notes|q\s*\d+)\s*[:=\-]", re.IGNORECASE)
 _PLAN_MODE_TOKEN_PATTERN = re.compile(r"[a-z0-9]{3,}")
-_PLAN_MODE_STRUCTURED_QUESTION_PATTERN = re.compile(r"\bQ\s*\d+\.", re.IGNORECASE)
-_PLAN_MODE_STRUCTURED_OPTION_BLOCK_PATTERN = re.compile(
-    r"\bA\)\s+.+\bB\)\s+.+\bC\)\s+.+\bD\)\s+",
-    re.IGNORECASE | re.DOTALL,
-)
 _PLAN_MODE_FOLLOWUP_CLARIFY_SIGNAL_PATTERN = re.compile(
     r"\b(clarif(?:y|ication|ying)|question(?:s)?|please\s+answer|to\s+tailor|to\s+ensure|before\s+writing\s+the\s+plan)\b",
     re.IGNORECASE,
@@ -302,26 +295,7 @@ _PLAN_MODE_TOPIC_HINT_ALLOWLIST = (
     "privacy",
     "cleanup",
 )
-def _plan_mode_nlp_model_candidates() -> tuple[str, ...]:
-    primary = os.environ.get("AI_AGENT_PLAN_MODE_NLP_MODEL", "en_core_web_trf").strip()
-    ordered: list[str] = []
-    for candidate in (
-        primary,
-        "en_core_web_trf",
-        "en_core_web_lg",
-        "en_core_web_md",
-        "en_core_web_sm",
-    ):
-        normalized = candidate.strip()
-        if not normalized or normalized in ordered:
-            continue
-        ordered.append(normalized)
-    return tuple(ordered)
-
-
-_PLAN_MODE_CLARIFICATION_INTENT_CLASSIFIER = PlanClarificationIntentClassifier(
-    model_candidates=_plan_mode_nlp_model_candidates(),
-)
+_PLAN_MODE_CLARIFICATION_INTENT_CLASSIFIER = PlanClarificationIntentClassifier()
 
 
 class ExecutionMode(str, Enum):
@@ -371,15 +345,9 @@ def _preload_plan_mode_nlp_classifier(logger: logging.Logger) -> str:
         pending_dimension="goal",
         question_count=2,
     )
-    if result.source == "spacy":
-        model_name = result.model_name or "unknown"
-        logger.info("Plan-mode NLP preloaded with spaCy model '%s'", model_name)
-        return model_name
-
-    load_error = _PLAN_MODE_CLARIFICATION_INTENT_CLASSIFIER.load_error or (
-        "spaCy model unavailable for plan-mode classification"
-    )
-    raise RuntimeError(load_error)
+    classifier_name = result.model_name or "builtin"
+    logger.info("Plan clarification classifier ready: %s", classifier_name)
+    return classifier_name
 
 
 def _normalize_session_id(raw_value: object, *, fallback: str) -> str:
@@ -440,10 +408,18 @@ def _parse_deep_think_flag_strict(raw_value: object) -> bool | None:
     return None
 
 
+def _parse_browse_profile_strict(raw_value: object) -> str | None:
+    """Parse browse profile values strictly, returning None when invalid."""
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in _BROWSE_PROFILE_NAMES:
+            return normalized
+    return None
+
+
 def _model_supports_native_deep_think(model_name: str) -> bool:
     """Return whether a model supports strict deep-think controls."""
-    normalized = model_name.strip().lower()
-    return "gemini-3" in normalized or "gemini-2.5" in normalized
+    return GeminiClient._supports_native_deep_think(model_name)
 
 
 def _resolve_model_timeout_seconds(
@@ -501,7 +477,7 @@ def _parse_plan_mode_discovery_budget() -> int:
         parsed = int(str(raw).strip())
     except ValueError:
         return _PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT
-    return max(0, min(8, parsed))
+    return max(0, min(_PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT, parsed))
 
 
 def _parse_plan_mode_clarification_required() -> bool:
@@ -770,6 +746,8 @@ _NOTE_FOLLOWUP_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_FINAL_ANSWER_READY_PREFIX = "FINAL_ANSWER_READY:"
+
 
 def _is_plan_mode_followup(prompt: str, session_has_plan: bool) -> bool:
     """Detect follow-up messages to an existing plan (vs new planning requests)."""
@@ -792,6 +770,22 @@ def _is_plan_mode_followup(prompt: str, session_has_plan: bool) -> bool:
     if _NOTE_FOLLOWUP_PATTERN.search(normalized):
         return True
     return False
+
+
+def _build_live_web_audit_instruction(*, root_prompt: str, draft_response: str) -> str:
+    compact_prompt = re.sub(r"\s+", " ", root_prompt.strip())
+    compact_draft = draft_response.strip()
+    return (
+        "Audit the draft answer against the original request and the available tools.\n"
+        "Use recent conversation/session context first.\n"
+        "Only call `browse_web` if the answer materially depends on current external facts, live availability, or explicit web verification.\n"
+        "Do not call `browse_web` for ordinary follow-ups, rewrites, summaries, or note refinements that can be answered from existing context.\n"
+        "If live web browsing is not needed, return the final answer again and begin it with the exact prefix "
+        f"`{_FINAL_ANSWER_READY_PREFIX}`.\n"
+        "Do not describe this audit step to the user.\n\n"
+        f"Original request: {compact_prompt}\n\n"
+        f"Draft answer to audit:\n{compact_draft}"
+    )
 
 
 _PLAN_MODE_APPROVAL_PATTERN = re.compile(
@@ -1203,12 +1197,6 @@ def _looks_like_plan_clarification_reply(prompt: str, state: PlanClarificationSt
     threshold = 0.34 if question_count > 1 else 0.42
     if state.domain == "files":
         threshold += 0.06
-    if intent_result.source != "spacy":
-        logger.warning(
-            "Plan clarification classifier unavailable (source=%s); refusing fallback path",
-            intent_result.source,
-        )
-        return False
     return intent_result.is_clarification_reply and score >= threshold
 
 
@@ -1609,11 +1597,11 @@ def _plan_mode_text_requests_structured_clarification(text: str) -> bool:
     if not normalized:
         return False
     lowered = normalized.lower()
-    if (
-        _PLAN_MODE_STRUCTURED_QUESTION_PATTERN.search(lowered)
-        and _PLAN_MODE_STRUCTURED_OPTION_BLOCK_PATTERN.search(lowered)
-    ):
-        return False
+    # P6: Removed false-negative early-return that rejected text matching
+    # both Q-numbering ("Q1.") and option blocks ("A) B) C) D)").  That
+    # is the exact format the backend's own clarification uses, so the
+    # model may imitate it.  The has_clarify_signal check below is the
+    # reliable indicator regardless of formatting.
 
     question_marks = lowered.count("?")
     bullet_question_lines = len(_PLAN_MODE_BULLET_QUESTION_LINE_PATTERN.findall(normalized))
@@ -1817,10 +1805,17 @@ Exit Codes:
     )
     
     parser.add_argument(
-        "--socket-path",
+        "--host",
         type=str,
-        default=None,
-        help="Custom socket path for IPC server (default: /tmp/ai-agent-<pid>.sock)",
+        default="127.0.0.1",
+        help="WebSocket host/interface for IPC server",
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="WebSocket TCP port for IPC server",
     )
     
     return parser
@@ -1874,7 +1869,7 @@ def run_dry_run(config: Config, no_color: bool = False) -> None:
     """
     print_info("Dry run mode - showing configuration:", no_color)
     print()
-    print(f"Model: {config.model_name}")
+    print(f"Model: {config.model_name or '<auto-resolve from live catalog>'}")
     print(f"Require No-Training: {config.require_no_training}")
     print(f"Use Vertex AI: {config.use_vertexai}")
     if config.use_vertexai:
@@ -1899,16 +1894,17 @@ def run_dry_run(config: Config, no_color: bool = False) -> None:
 
 async def run_server(
     config: Config,
-    socket_path: Optional[str] = None,
+    host: str = "127.0.0.1",
+    port: int = 8765,
     verbose: bool = False,
 ) -> int:
     """Run the IPC server for SwiftUI frontend communication.
     
     Args:
         config: Configuration instance.
-        socket_path: Optional custom socket path.
+        host: WebSocket host/interface to bind.
+        port: WebSocket TCP port to bind.
         verbose: Whether verbose mode is enabled.
-    
     Returns:
         Exit code (0 for success, non-zero for errors).
     """
@@ -1923,7 +1919,7 @@ async def run_server(
         ErrorMessage,
         SystemMessage,
     )
-    from agent_host.ipc.hot_reload import init_reload_manager, ReloadEvent
+    from agent_host.ipc.hot_reload import init_reload_manager, is_hot_reload_enabled, ReloadEvent
     
     logger = logging.getLogger(__name__)
     if verbose:
@@ -1934,8 +1930,8 @@ async def run_server(
             EventType.STARTUP,
             {
                 "mode": "ipc_server",
-                "model": config.model_name,
-                "socket_path": socket_path or "default",
+                "model": config.model_name or "<auto-resolve-from-live-catalog>",
+                "endpoint": f"ws://{host}:{port}",
             },
         )
     except AuditLogError as e:
@@ -2005,6 +2001,7 @@ async def run_server(
             vertex_project=config.vertex_project,
             vertex_location=config.vertex_location,
         )
+        config.model_name = gemini_client.resolve_text_model(config.model_name or None)
         logger.info("Gemini client initialized")
     except Exception as e:
         logger.error(f"Failed to initialize Gemini client: {e}")
@@ -2036,7 +2033,8 @@ async def run_server(
     # Create IPC server
     server_max_clients = max(1, _safe_env_int("AI_AGENT_IPC_MAX_CLIENTS", 128))
     server = IPCServer(
-        socket_path=socket_path,
+        host=host,
+        port=port,
         max_clients=server_max_clients,
         require_auth=True,
         auth_token=ipc_auth_token,
@@ -2060,31 +2058,24 @@ async def run_server(
     active_prompt_tasks: dict[str, asyncio.Task[None]] = {}
     cancelled_prompt_requests: set[str] = set()
     client_prompt_index: dict[str, set[str]] = {}
+    device_registry: dict[str, dict[str, Any]] = {}
     pending_tool_confirmations: dict[str, tuple[str, asyncio.Future[bool]]] = {}
     pending_screen_captures: dict[str, tuple[str, asyncio.Future[dict | None]]] = {}
+    pending_tool_proxies: dict[str, tuple[str, asyncio.Future[dict[str, Any]]]] = {}
     plan_mode_clarification_states: dict[str, PlanClarificationState] = {}
-    plan_mode_sessions_with_plan: dict[str, bool] = {}
+    plan_mode_sessions_with_plan: dict[str, float] = {}  # session_id → timestamp
     # Runtime-only planner preference learning. Not persisted to memory DB.
     plan_mode_option_learning_by_session: dict[str, dict[str, dict[str, float]]] = {}
     plan_mode_option_learning_global: dict[str, dict[str, float]] = {}
-    destructive_tool_names = {"apply_ops", "run_automation"}
+    destructive_tool_names = {"apply_ops"}
     plan_mode_allowed_tools = {
         "planner",
         "plan_ops",
         "search_files",
-        "read_text",
-        "extract_content",
-        "get_metadata",
+        "read_document",
         "read_screen",
-        "take_note",
-        "update_note",
-        "delete_note",
-        "format_note",
-        "merge_notes",
-        "reorder_notes",
+        "manage_notes",
         "generate_image",
-        "generate_quiz",
-        "summarize_note",
         "browse_web",
     }
     confirmation_timeout_seconds = 60.0
@@ -2123,11 +2114,79 @@ async def run_server(
     plan_mode_nlp_error: str | None = None
     plan_mode_nlp_preload_ms: float | None = None
     plan_mode_nlp_preload_task: asyncio.Task[None] | None = None
-    unhealthy_shutdown_requested = asyncio.Event()
-    blocking_timeout_grace_seconds = 0.25
 
-    class BlockingCallTimeoutError(TimeoutError):
-        """Raised when a blocking operation timeout escalates process health failure."""
+    def _client_capabilities_for(client_address: str) -> set[str]:
+        entry = device_registry.get(client_address)
+        if not isinstance(entry, dict):
+            return set()
+        raw_capabilities = entry.get("capabilities", [])
+        if not isinstance(raw_capabilities, list):
+            return set()
+        return {
+            capability.strip()
+            for capability in raw_capabilities
+            if isinstance(capability, str) and capability.strip()
+        }
+
+    class RequestTimeoutError(TimeoutError):
+        """Raised when a blocking operation exceeds timeout for a single request."""
+
+        def __init__(self, message: str, *, error_data: dict[str, Any]):
+            super().__init__(message)
+            self.error_data = error_data
+
+    def _build_timeout_error_data(
+        *,
+        request_id: str,
+        label: str,
+        timeout_seconds: float,
+        elapsed_seconds: float,
+    ) -> dict[str, Any]:
+        operation = label.strip() or "unknown"
+        if operation.startswith("model.generate_content.continuation"):
+            timeout_code = "model_timeout"
+            phase = "model_continuation"
+            user_message = (
+                "The model exceeded its continuation timeout. "
+                "Your backend connection is still active, so you can retry this request."
+            )
+        elif operation.startswith("model.generate_content"):
+            timeout_code = "model_timeout"
+            phase = "model_generation"
+            user_message = (
+                "The model took too long to respond. "
+                "Your backend connection is still active, so you can retry this request."
+            )
+        elif operation.startswith("tool."):
+            timeout_code = "tool_timeout"
+            phase = "tool_execution"
+            user_message = (
+                "A tool execution exceeded its timeout budget for this request. "
+                "Your backend connection is still active."
+            )
+        elif operation.startswith("db."):
+            timeout_code = "database_timeout"
+            phase = "database"
+            user_message = (
+                "A database operation exceeded its timeout budget for this request. "
+                "Your backend connection is still active."
+            )
+        else:
+            timeout_code = "request_timeout"
+            phase = "request"
+            user_message = (
+                "This request exceeded its timeout budget. "
+                "Your backend connection is still active."
+            )
+        return {
+            "code": timeout_code,
+            "request_id": request_id,
+            "phase": phase,
+            "operation": operation,
+            "timeout_seconds": round(float(timeout_seconds), 3),
+            "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
+            "user_message": user_message,
+        }
 
     async def _run_blocking_with_timeout(
         *,
@@ -2161,8 +2220,15 @@ async def run_server(
             return result
         except asyncio.TimeoutError as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            elapsed_seconds = elapsed_ms / 1000.0
+            timeout_data = _build_timeout_error_data(
+                request_id=request_id,
+                label=label,
+                timeout_seconds=timeout_seconds,
+                elapsed_seconds=elapsed_seconds,
+            )
             logger.error(
-                "%s timeout; marking backend unhealthy",
+                "%s timeout; request will fail without backend shutdown",
                 label,
                 extra={
                     "component": label,
@@ -2171,12 +2237,13 @@ async def run_server(
                     "duration_ms": round(elapsed_ms, 3),
                     "error_type": "TimeoutError",
                     "error_message": f"{label} timed out after {timeout_seconds}s",
+                    "timeout_code": timeout_data["code"],
+                    "timeout_phase": timeout_data["phase"],
                 },
             )
-            unhealthy_shutdown_requested.set()
-            await asyncio.sleep(blocking_timeout_grace_seconds)
-            raise BlockingCallTimeoutError(
-                f"{label} timed out after {timeout_seconds}s; backend marked unhealthy"
+            raise RequestTimeoutError(
+                f"{label} timed out after {timeout_seconds}s",
+                error_data=timeout_data,
             ) from exc
 
     async def _resolve_note_id(
@@ -2199,6 +2266,16 @@ async def run_server(
         raw_id = raw_id.strip() if isinstance(raw_id, str) else ""
         if not raw_id:
             return None
+        if raw_id.lower() in {"session_pad", "default", "default_tab"}:
+            pad = await _run_blocking_with_timeout(
+                label="notes.resolve_session_pad",
+                timeout_seconds=timeout,
+                func=mgr.get_or_create_session_pad,
+                args=(session_id,),
+                request_id=request_id,
+                method=method,
+            )
+            return str(pad.get("note_id", "") or "")
         if notes_cache is not None:
             notes = notes_cache
         else:
@@ -2229,7 +2306,6 @@ async def run_server(
         return None
 
     db_metrics_task: asyncio.Task[None] | None = None
-    unhealthy_shutdown_task: asyncio.Task[None] | None = None
 
     def _track_prompt_task(
         request_id: str,
@@ -2337,13 +2413,14 @@ async def run_server(
         code: int,
         message: str,
         *,
+        data: dict[str, Any] | None = None,
         require_in_flight: bool = False,
     ) -> None:
         """Send a structured error and terminal status updates for a request."""
         await _send_request_message(
             client=client,
             request_id=request_id,
-            payload=ErrorMessage.create(request_id, code, message).to_bytes(),
+            payload=ErrorMessage.create(request_id, code, message, data=data).to_bytes(),
             require_in_flight=require_in_flight,
         )
         await _send_request_message(
@@ -2369,7 +2446,10 @@ async def run_server(
             "updated_at": getattr(session, "updated_at"),
             "last_activity": getattr(session, "last_activity"),
             "status": getattr(session, "status"),
+            "store_version": getattr(session, "store_version", 0),
         }
+
+    _lifecycle_seq = itertools.count(1)
 
     async def _broadcast_system_message(message: SystemMessage) -> None:
         """Broadcast a system message to all connected IPC clients."""
@@ -2379,13 +2459,13 @@ async def run_server(
             logger.warning("Failed to broadcast system event: %s", exc)
 
     async def _broadcast_session_event(*, action: str, session: dict[str, object]) -> None:
-        await _broadcast_system_message(
-            SystemMessage.session_event(
-                str(uuid.uuid4()),
-                action=action,
-                session=session,
-            )
+        msg = SystemMessage.session_event(
+            str(uuid.uuid4()),
+            action=action,
+            session=session,
         )
+        msg.system["seq"] = next(_lifecycle_seq)
+        await _broadcast_system_message(msg)
 
     async def _broadcast_notes_event(
         *,
@@ -2394,15 +2474,15 @@ async def run_server(
         note: dict[str, object] | None = None,
         note_id: str | None = None,
     ) -> None:
-        await _broadcast_system_message(
-            SystemMessage.notes_event(
-                str(uuid.uuid4()),
-                action=action,
-                session_id=session_id,
-                note=note,
-                note_id=note_id,
-            )
+        msg = SystemMessage.notes_event(
+            str(uuid.uuid4()),
+            action=action,
+            session_id=session_id,
+            note=note,
+            note_id=note_id,
         )
+        msg.system["seq"] = next(_lifecycle_seq)
+        await _broadcast_system_message(msg)
 
     async def _broadcast_memory_event(
         *,
@@ -2410,14 +2490,14 @@ async def run_server(
         session_id: str,
         memory_id: str | None = None,
     ) -> None:
-        await _broadcast_system_message(
-            SystemMessage.memory_event(
-                str(uuid.uuid4()),
-                action=action,
-                session_id=session_id,
-                memory_id=memory_id,
-            )
+        msg = SystemMessage.memory_event(
+            str(uuid.uuid4()),
+            action=action,
+            session_id=session_id,
+            memory_id=memory_id,
         )
+        msg.system["seq"] = next(_lifecycle_seq)
+        await _broadcast_system_message(msg)
 
     async def _broadcast_session_refresh(
         *,
@@ -2451,6 +2531,7 @@ async def run_server(
         verbosity_level: int,
         presentation_style: str,
         stream_animation_style: str,
+        browse_profile: str,
         deep_think: bool,
         correlation_id: str,
     ) -> None:
@@ -2460,6 +2541,7 @@ async def run_server(
             correlation_id=correlation_id,
             request_id=request_id,
             method=request.method,
+            browse_profile=browse_profile,
         )
 
         try:
@@ -2496,7 +2578,7 @@ async def run_server(
             logger.info(
                 (
                     "Prompt context: session_id=%s memory_mode=%s execution_mode=%s verbosity=%s deep_think=%s "
-                    "presentation_style=%s stream_animation=%s input_paths=%s"
+                    "presentation_style=%s stream_animation=%s browse_profile=%s input_paths=%s"
                 ),
                 session_id,
                 memory_mode.value,
@@ -2505,15 +2587,16 @@ async def run_server(
                 deep_think,
                 presentation_style,
                 stream_animation_style,
+                browse_profile,
                 len(input_paths),
             )
 
-            if execution_mode == ExecutionMode.PLAN:
-                await _send_mode_status("Loading session context...")
-            elif execution_mode == ExecutionMode.TEACHER:
-                await _send_mode_status("Loading study context...")
-            else:
-                await _send_mode_status("Loading context...")
+            from .modes import get_mode_handler
+            mode_handler = get_mode_handler(execution_mode)
+
+            pre_gen_msg = mode_handler.get_pre_generation_status_message()
+            if pre_gen_msg:
+                await _send_mode_status(pre_gen_msg)
 
             prepared = await _run_blocking_with_timeout(
                 label="db.prepare_prompt_context",
@@ -2543,90 +2626,20 @@ async def run_server(
                     {},
                 )
             global_learning_for_ranking = plan_mode_option_learning_global if memory_mode != MemoryMode.OFF else None
-            teacher_mode_note_captured = False
-
-            async def _ensure_teacher_note_capture(response_text: str) -> bool:
-                nonlocal teacher_mode_note_captured
-                if execution_mode != ExecutionMode.TEACHER or teacher_mode_note_captured:
-                    return True
-                await _send_mode_status("Capturing key highlights in study notes...")
-                try:
-                    note_body = _build_teacher_note_body(
-                        prompt=resolved_user_prompt,
-                        response_text=response_text,
-                    )
-                    note_tags = _normalize_note_tags(
-                        [],
-                        extra_tags=TEACHER_DEFAULT_NOTE_TAGS,
-                    )
-                    tagged_content = f"<!-- note-type:{TEACHER_DEFAULT_NOTE_TYPE} -->\n{note_body}"
-                    if note_tags:
-                        tagged_content = (
-                            f"<!-- tags:{','.join(note_tags)} -->\n{tagged_content}"
-                        )
-                    created_note = await _run_blocking_with_timeout(
-                        label="notes.teacher_autocapture",
-                        timeout_seconds=db_timeout_seconds,
-                        func=memory_manager.create_note,
-                        args=(session_id,),
-                        kwargs={"content": tagged_content, "source": "agent"},
-                        request_id=request_id,
-                        method=request.method,
-                    )
-                    teacher_mode_note_captured = True
-                    await _send_request_message(
-                        client=client,
-                        request_id=request_id,
-                        payload=ToolCallNotification.success(
-                            request_id,
-                            "take_note",
-                            {
-                                "title": "Study Session",
-                                "note_type": TEACHER_DEFAULT_NOTE_TYPE,
-                                "tags": note_tags,
-                            },
-                            (
-                                f"Teacher note saved (id={created_note['note_id'][:8]}) "
-                                "with key highlights."
-                            ),
-                        ).to_bytes(),
-                        require_in_flight=True,
-                    )
-                    return True
-                except Exception as exc:
-                    message = f"Teacher mode requires note capture and failed: {exc}"
-                    await _send_request_error(
-                        client=client,
-                        request_id=request_id,
-                        code=ErrorMessage.INTERNAL_ERROR,
-                        message=message,
-                        require_in_flight=True,
-                    )
-                    if _is_request_in_flight(request_id):
-                        await _run_blocking_with_timeout(
-                            label="db.record_interaction",
-                            timeout_seconds=db_timeout_seconds,
-                            func=memory_manager.record_interaction,
-                            args=(),
-                            kwargs={
-                                "session_id": session_id,
-                                "memory_mode": memory_mode,
-                                "user_prompt": prompt,
-                                "assistant_response": message,
-                                "model_name": model or config.model_name,
-                            },
-                            request_id=request_id,
-                            method=request.method,
-                        )
-                    return False
 
             if execution_mode != ExecutionMode.PLAN:
                 plan_mode_clarification_states.pop(session_id, None)
                 plan_mode_sessions_with_plan.pop(session_id, None)
 
+            # P4: Use TTL-based check (600s) instead of simple membership
+            # to avoid stale follow-up detection after plans expire.
+            _plan_ts = plan_mode_sessions_with_plan.get(session_id, 0)
+            _session_has_live_plan = (time.time() - _plan_ts) < 600 if _plan_ts else False
+            if not _session_has_live_plan:
+                plan_mode_sessions_with_plan.pop(session_id, None)
             plan_mode_is_followup = (
                 execution_mode == ExecutionMode.PLAN
-                and _is_plan_mode_followup(prompt, session_id in plan_mode_sessions_with_plan)
+                and _is_plan_mode_followup(prompt, _session_has_live_plan)
             )
             plan_mode_auto_execute = (
                 plan_mode_is_followup
@@ -2634,6 +2647,7 @@ async def run_server(
             )
             if plan_mode_auto_execute:
                 execution_mode = ExecutionMode.DIRECT
+                mode_handler = get_mode_handler(execution_mode)
                 logger.info(
                     "Plan Mode auto-switch to DIRECT for request %s (user approved execution)",
                     request_id,
@@ -2683,60 +2697,78 @@ async def run_server(
                             global_learning=global_learning_for_ranking,
                         )
                         if not accepted:
-                            score = _compute_plan_mode_clarification_score(
-                                prompt=clarification_state.root_prompt,
-                                missing_dimensions=_plan_mode_missing_clarification_dimensions(
-                                    clarification_state.root_prompt
-                                ),
-                                asked_rounds=clarification_state.asked_rounds,
-                            )
-                            clarification_text = _build_plan_mode_clarification_turn_response(
-                                state=clarification_state,
-                                session_learning=session_learning_for_ranking,
-                                global_learning=global_learning_for_ranking,
-                                score=score,
-                            )
-                            await _send_request_message(
-                                client=client,
-                                request_id=request_id,
-                                payload=StatusUpdate.planning(
-                                    request_id,
-                                    "I couldn't confidently parse that answer. Quick retry:",
-                                ).to_bytes(),
-                                require_in_flight=True,
-                            )
-                            if _is_request_in_flight(request_id) and _client_is_connected(client):
-                                streamer = server.create_streaming_handler(client, request_id)
-                                await streamer.stream_words(clarification_text)
-                            await _send_request_message(
-                                client=client,
-                                request_id=request_id,
-                                payload=ResultMessage.create(request_id, clarification_text).to_bytes(),
-                                require_in_flight=True,
-                            )
-                            if _is_request_in_flight(request_id):
-                                await _run_blocking_with_timeout(
-                                    label="db.record_interaction",
-                                    timeout_seconds=db_timeout_seconds,
-                                    func=memory_manager.record_interaction,
-                                    args=(),
-                                    kwargs={
-                                        "session_id": session_id,
-                                        "memory_mode": memory_mode,
-                                        "user_prompt": prompt,
-                                        "assistant_response": clarification_text,
-                                        "model_name": model or config.model_name,
-                                    },
+                            # P2: Count rejections toward the global max-rounds
+                            # limit so the user cannot get stuck in an infinite
+                            # "I couldn't parse your answer" loop.
+                            clarification_state.asked_rounds += 1
+                            max_rounds = _parse_plan_mode_clarification_max_rounds()
+                            if clarification_state.asked_rounds >= max_rounds:
+                                # Force-resolve: treat raw text as free-form
+                                # answer for all unanswered dimensions.
+                                for dim in (clarification_state.question_dimensions or []):
+                                    if dim not in clarification_state.answered_dimensions:
+                                        clarification_state.answered_dimensions[dim] = prompt.strip()
+                                logger.info(
+                                    "Plan clarification force-resolved after %d rounds (session %s)",
+                                    clarification_state.asked_rounds,
+                                    session_id,
+                                )
+                                # Fall through to the accepted path below (line 2741+)
+                            else:
+                                score = _compute_plan_mode_clarification_score(
+                                    prompt=clarification_state.root_prompt,
+                                    missing_dimensions=_plan_mode_missing_clarification_dimensions(
+                                        clarification_state.root_prompt
+                                    ),
+                                    asked_rounds=clarification_state.asked_rounds,
+                                )
+                                clarification_text = _build_plan_mode_clarification_turn_response(
+                                    state=clarification_state,
+                                    session_learning=session_learning_for_ranking,
+                                    global_learning=global_learning_for_ranking,
+                                    score=score,
+                                )
+                                await _send_request_message(
+                                    client=client,
                                     request_id=request_id,
-                                    method=request.method,
+                                    payload=StatusUpdate.planning(
+                                        request_id,
+                                        "I couldn't confidently parse that answer. Quick retry:",
+                                    ).to_bytes(),
+                                    require_in_flight=True,
                                 )
-                            await _send_request_message(
-                                client=client,
-                                request_id=request_id,
-                                payload=StatusUpdate.complete(request_id).to_bytes(),
-                                require_in_flight=True,
+                                if _is_request_in_flight(request_id) and _client_is_connected(client):
+                                    streamer = server.create_streaming_handler(client, request_id)
+                                    await streamer.stream_words(clarification_text)
+                                await _send_request_message(
+                                    client=client,
+                                    request_id=request_id,
+                                    payload=ResultMessage.create(request_id, clarification_text).to_bytes(),
+                                    require_in_flight=True,
                                 )
-                            return
+                                if _is_request_in_flight(request_id):
+                                    await _run_blocking_with_timeout(
+                                        label="db.record_interaction",
+                                        timeout_seconds=db_timeout_seconds,
+                                        func=memory_manager.record_interaction,
+                                        args=(),
+                                        kwargs={
+                                            "session_id": session_id,
+                                            "memory_mode": memory_mode,
+                                            "user_prompt": prompt,
+                                            "assistant_response": clarification_text,
+                                            "model_name": model or config.model_name,
+                                        },
+                                        request_id=request_id,
+                                        method=request.method,
+                                    )
+                                await _send_request_message(
+                                    client=client,
+                                    request_id=request_id,
+                                    payload=StatusUpdate.complete(request_id).to_bytes(),
+                                    require_in_flight=True,
+                                    )
+                                return
 
                         for answered_dimension, selected_option in clarification_state.option_answers.items():
                             if not selected_option:
@@ -2778,8 +2810,9 @@ async def run_server(
                         plan_mode_sessions_with_plan.pop(session_id, None)
                         new_state = _initialize_plan_clarification_state(prompt)
                         if len(plan_mode_clarification_states) > 100:
-                            oldest_key = next(iter(plan_mode_clarification_states))
-                            plan_mode_clarification_states.pop(oldest_key, None)
+                            _evict = list(plan_mode_clarification_states)[:20]
+                            for _ek in _evict:
+                                plan_mode_clarification_states.pop(_ek, None)
                         plan_mode_clarification_states[session_id] = new_state
                         score = _compute_plan_mode_clarification_score(
                             prompt=prompt,
@@ -2954,107 +2987,76 @@ async def run_server(
                 presentation_style=presentation_style,
                 deep_think=deep_think,
             )
-            if execution_mode == ExecutionMode.PLAN:
-                if plan_mode_is_followup:
-                    plan_mode_header = (
-                        "## PLAN MODE — Conversation Follow-up\n\n"
-                        "Current mode: **PLAN** (responding to an existing plan).\n\n"
-                        "The user is responding to a plan you previously produced in this session.\n"
-                        "Check [RECENT_SESSION_CONTEXT] for the full conversation history.\n"
-                        "Respond conversationally to their follow-up:\n"
-                        "- If they confirm/approve, summarize the next concrete steps.\n"
-                        "- If they ask to revise, adjust the plan.\n"
-                        "- If they ask a question, answer it in context.\n"
-                        "- If they reference notes (e.g. 'elaborate on the notes', 'make them detailed'),\n"
-                        "  use the [SESSION_NOTES] section in the prompt — the notes are already there.\n"
-                        "  Do NOT call `read_screen` or `search_files` to find note content.\n"
-                        "  Use `update_note` or `take_note` to modify or add notes directly.\n"
-                        "Do NOT restart the planning process. Do NOT ask clarification questions.\n"
-                        "Only call `plan_ops` if they explicitly request a revised or new plan.\n"
-                    )
-                else:
-                    plan_mode_header = (
-                        "## EXECUTION MODE\n\n"
-                        "Current mode: **PLAN**.\n"
-                        "This mode is planning-only. Unified-planning context is preloaded.\n\n"
-                        "**MANDATORY**: You MUST produce a structured plan by calling `plan_ops`.\n"
-                        "Workflow: (1) optionally gather context with discovery tools, then "
-                        "(2) call `plan_ops` to create the phased execution plan.\n"
-                        "NEVER return only discovery results or empty text without a plan.\n"
-                        "Your text response must be a human-readable plan summary — not raw tool output.\n\n"
-                        "Blend advanced planning rigor with concise, user-friendly communication.\n"
-                        "Make assumptions explicit and easy to revise.\n"
-                        "Do not execute destructive tools in this mode (`apply_ops`, `run_automation`).\n"
-                    )
-                    if plan_mode_requires_unified_planning:
-                        plan_mode_header += (
-                            "This prompt indicates actionable file-operations.\n"
-                            "Use unified planning via `planner`/`plan_ops` early.\n"
-                            "Limit pre-planning discovery calls (`search_files`, `get_metadata`, "
-                            "`read_text`, `extract_content`) to "
-                            f"{plan_mode_discovery_budget} before producing a plan.\n"
-                        )
-                system_instruction = f"{plan_mode_header}\n\n{system_instruction}"
-            elif execution_mode == ExecutionMode.TEACHER:
-                teacher_mode_header = (
-                    "## EXECUTION MODE\n\n"
-                    "Current mode: **TEACHER**.\n"
-                    "You are the user's tutor and autonomous study-note assistant.\n"
-                    "Teach clearly, then ensure the turn produces structured notes with key highlights.\n"
-                    "If you call note tools, prefer concise study formatting and include key takeaways.\n"
-                    "Do not skip note capture in this mode.\n"
+            # Inject device context so the AI knows which device is connected
+            from .system_prompt import build_device_context_block
+            _device_info = device_registry.get(client.address)
+            _device_context = build_device_context_block(_device_info)
+            if _device_context:
+                system_instruction = f"{_device_context}\n\n{system_instruction}"
+
+            # Modes Architecture: Route prompts and tool filters through the active handler
+            from .modes import get_mode_handler
+            from .modes.plan.handler import PlanModeHandler
+            from .modes.teacher.handler import TeacherModeHandler
+            
+            mode_handler = get_mode_handler(execution_mode)
+            
+            # Inject dynamic context needed for specific handlers
+            if isinstance(mode_handler, PlanModeHandler):
+                mode_handler.set_context(
+                    is_followup=plan_mode_is_followup,
+                    requires_unified_planning=plan_mode_requires_unified_planning,
+                    discovery_budget=plan_mode_discovery_budget,
+                    allowed_tools=plan_mode_allowed_tools
                 )
-                system_instruction = f"{teacher_mode_header}\n\n{system_instruction}"
-            elif plan_mode_auto_execute:
-                auto_exec_header = (
-                    "## EXECUTION MODE — Plan Approved\n\n"
-                    "Current mode: **DIRECT** (auto-switched from plan after user approval).\n\n"
-                    "The user approved a plan you produced earlier in this session.\n"
-                    "Check [RECENT_SESSION_CONTEXT] for the plan and conversation history.\n"
-                    "Execute the plan now using all available tools.\n"
-                    "Start with the first concrete step. Be safe and confirm destructive actions.\n"
-                    "Report progress as you go.\n"
+            elif isinstance(mode_handler, TeacherModeHandler):
+                mode_handler.set_context(
+                    memory_manager=memory_manager,
+                    send_status=_send_mode_status,
+                    session_id=session_id
                 )
-                system_instruction = f"{auto_exec_header}\n\n{system_instruction}"
+                        
+            # System prompt override
+            if plan_mode_auto_execute:
+                from .modes.plan.prompts import get_auto_exec_header
+                system_instruction = f"{get_auto_exec_header()}\n\n{system_instruction}"
             else:
-                direct_mode_header = (
-                    "## EXECUTION MODE\n\n"
-                    "Current mode: **DIRECT**.\n"
-                    "Execute tools when needed to complete the request safely.\n"
-                    "Using `plan_ops` is optional in this mode.\n"
-                )
-                system_instruction = f"{direct_mode_header}\n\n{system_instruction}"
-            active_tools = tools
-            if execution_mode == ExecutionMode.PLAN:
-                active_tools = [
-                    tool
-                    for tool in tools
-                    if isinstance(tool, dict) and tool.get("name") in plan_mode_allowed_tools
-                ]
+                system_instruction = f"{mode_handler.get_system_prompt_addition()}\n\n{system_instruction}"
+                
+            active_tools = mode_handler.filter_active_tools(tools)
 
             def _decorate_mode_result(text: str) -> str:
                 if execution_mode != ExecutionMode.PLAN:
                     return text
                 stripped = text.lstrip()
+                from .modes.plan.prompts import normalize_plan_mode_banner
                 if stripped.startswith("PLAN MODE (Planning Only)") or stripped.startswith(
                     "PLAN MODE (Quick Clarification)"
                 ):
-                    return _normalize_plan_mode_banner(text)
+                    return normalize_plan_mode_banner(text)
                 decorated = (
                     "PLAN MODE (Planning Only)\n"
                     "No destructive tools were executed in this response.\n"
                     "If assumptions look wrong, ask to revise and I will replan.\n\n"
                     f"{text}"
                 )
-                return _normalize_plan_mode_banner(decorated)
+                return normalize_plan_mode_banner(decorated)
 
             parser_instance = ToolCallParser()
             conversation_history: list[types.Content] = [
                 types.Content(role="user", parts=[types.Part.from_text(text=prompt_for_model)])
             ]
+            active_tool_names = {
+                str(tool.get("name", "")).strip()
+                for tool in active_tools
+                if isinstance(tool, dict) and str(tool.get("name", "")).strip()
+            }
+            browse_web_available = "browse_web" in active_tool_names
             chain_depth = 0
             final_assistant_response: str | None = None
             last_non_terminal_result: tuple[str, dict[str, object]] | None = None
+            browse_web_called_this_turn = False
+            live_web_audit_used = False
             # The planner bootstrap at line ~2364 already called `planner`
             # for Plan Mode requests, so mark it as used to avoid false
             # discovery budget enforcement in the tool chain loop.
@@ -3066,6 +3068,7 @@ async def run_server(
             plan_mode_discovery_calls = 0
             plan_mode_alignment_retry_used = False
             plan_mode_post_clarification_retry_used = False
+            plan_mode_nudge_used = False
 
             def _model_timeout_for_turn(*, continuation: bool) -> float:
                 return _resolve_model_timeout_seconds(
@@ -3074,7 +3077,7 @@ async def run_server(
                     execution_mode=execution_mode,
                     is_continuation=continuation,
                     deep_think_multiplier=deep_think_model_timeout_multiplier,
-                    teacher_multiplier=teacher_model_timeout_multiplier,
+                    teacher_multiplier=mode_handler.get_timeout_multiplier(),
                     continuation_multiplier=continuation_model_timeout_multiplier,
                     max_timeout_seconds=model_timeout_max_seconds,
                 )
@@ -3085,7 +3088,7 @@ async def run_server(
                 # Determine once per iteration whether to show tool call
                 # cards in the frontend.  In Plan Mode the cards are hidden
                 # and the status bar shows phase descriptions instead.
-                show_tool_call_card = execution_mode != ExecutionMode.PLAN
+                show_tool_call_card = mode_handler.should_show_tool_call_card()
 
                 if not _is_request_in_flight(request_id):
                     logger.info("Skipping late prompt response for inactive request: %s", request_id)
@@ -3100,21 +3103,9 @@ async def run_server(
                     max_tool_chain_depth,
                     request_id,
                 )
-                if chain_depth == 1:
-                    if execution_mode == ExecutionMode.TEACHER:
-                        await _send_mode_status("Understanding your question...")
-                    else:
-                        await _send_mode_status("Analyzing your request...")
-                elif chain_depth == 2:
-                    if execution_mode == ExecutionMode.TEACHER:
-                        await _send_mode_status("Preparing explanation and key highlights...")
-                    else:
-                        await _send_mode_status("Evaluating initial findings...")
-                else:
-                    if execution_mode == ExecutionMode.TEACHER:
-                        await _send_mode_status("Refining explanation and study notes...")
-                    else:
-                        await _send_mode_status("Refining plan with new data...")
+                status_msg = mode_handler.get_chain_status_message(chain_depth)
+                if status_msg:
+                    await _send_mode_status(status_msg)
 
                 if chain_depth == 1:
                     response = await _run_blocking_with_timeout(
@@ -3168,17 +3159,48 @@ async def run_server(
                 if tool_call is None:
                     if response.get("text"):
                         raw_text = str(response["text"])
+                        continuation_callable = getattr(gemini_client, "send_continuation", None)
+                        can_retry_with_continuation = callable(continuation_callable)
+                        if (
+                            browse_web_available
+                            and not browse_web_called_this_turn
+                            and not live_web_audit_used
+                            and can_retry_with_continuation
+                            and chain_depth < max_tool_chain_depth
+                        ):
+                            live_web_audit_used = True
+                            conversation_history.append(
+                                types.Content(
+                                    role="model",
+                                    parts=[types.Part.from_text(text=raw_text or "Draft answer prepared.")],
+                                )
+                            )
+                            conversation_history.append(
+                                types.Content(
+                                    role="user",
+                                    parts=[
+                                        types.Part.from_text(
+                                            text=_build_live_web_audit_instruction(
+                                                root_prompt=resolved_user_prompt,
+                                                draft_response=raw_text,
+                                            )
+                                        )
+                                    ],
+                                )
+                            )
+                            await _send_mode_status("Verifying whether live web lookup is needed...")
+                            continue
                         text = (
                             sanitize_user_visible_response(raw_text)
                             if looks_like_json_payload(raw_text)
                             else raw_text
                         )
+                        if text.startswith(_FINAL_ANSWER_READY_PREFIX):
+                            text = text[len(_FINAL_ANSWER_READY_PREFIX):].lstrip()
                         if execution_mode == ExecutionMode.PLAN:
                             asks_structured_clarification = _plan_mode_text_requests_structured_clarification(
                                 text
                             )
-                            continuation_callable = getattr(gemini_client, "send_continuation", None)
-                            can_retry_with_continuation = callable(continuation_callable)
 
                             if asks_structured_clarification and plan_mode_clarification_resolved_this_turn:
                                 if (
@@ -3209,6 +3231,9 @@ async def run_server(
                                         "Using your clarification answers to finalize the plan..."
                                     )
                                     continue
+                                # P3: Post-clarification retry exhausted — prevent
+                                # re-entering the followup clarification branch below.
+                                asks_structured_clarification = False
 
                             if asks_structured_clarification:
                                 # Reset retry flag so a new clarification round can use it.
@@ -3227,6 +3252,31 @@ async def run_server(
                                 )
                                 if not should_continue:
                                     plan_mode_clarification_states.pop(session_id, None)
+                                    # P1-A: Redirect to planning instead of sending
+                                    # the model's stale clarification text.
+                                    conversation_history.append(
+                                        types.Content(
+                                            role="model",
+                                            parts=[types.Part.from_text(text=raw_text)],
+                                        )
+                                    )
+                                    conversation_history.append(
+                                        types.Content(
+                                            role="user",
+                                            parts=[
+                                                types.Part.from_text(
+                                                    text=_build_plan_mode_post_clarification_instruction(
+                                                        root_prompt=resolved_user_prompt,
+                                                        clarification_context_block=clarification_context_block,
+                                                    )
+                                                )
+                                            ],
+                                        )
+                                    )
+                                    await _send_mode_status(
+                                        "Clarification complete — building your plan..."
+                                    )
+                                    continue
                                 else:
                                     followup_state = _prepare_plan_mode_followup_clarification_state(
                                         root_prompt=resolved_user_prompt,
@@ -3252,6 +3302,31 @@ async def run_server(
                                         )
                                     else:
                                         plan_mode_clarification_states.pop(session_id, None)
+                                        # P1-B: No more dimensions — redirect to
+                                        # planning instead of sending clarification text.
+                                        conversation_history.append(
+                                            types.Content(
+                                                role="model",
+                                                parts=[types.Part.from_text(text=raw_text)],
+                                            )
+                                        )
+                                        conversation_history.append(
+                                            types.Content(
+                                                role="user",
+                                                parts=[
+                                                    types.Part.from_text(
+                                                        text=_build_plan_mode_post_clarification_instruction(
+                                                            root_prompt=resolved_user_prompt,
+                                                            clarification_context_block=clarification_context_block,
+                                                        )
+                                                    )
+                                                ],
+                                            )
+                                        )
+                                        await _send_mode_status(
+                                            "Clarification complete — building your plan..."
+                                        )
+                                        continue
                             else:
                                 alignment_score = _compute_plan_mode_alignment_score(
                                     root_prompt=resolved_user_prompt,
@@ -3291,8 +3366,7 @@ async def run_server(
                                     )
                                     continue
                         text = _decorate_mode_result(text)
-                        if not await _ensure_teacher_note_capture(text):
-                            return
+                        await mode_handler.post_generation_hook(response_text=text)
                         await _send_mode_status("Drafting response...")
                         if _is_request_in_flight(request_id) and _client_is_connected(client):
                             streamer = server.create_streaming_handler(client, request_id)
@@ -3324,9 +3398,11 @@ async def run_server(
                         if (
                             execution_mode == ExecutionMode.PLAN
                             and not plan_mode_plan_produced
+                            and not plan_mode_nudge_used
                             and can_retry_with_continuation
                             and chain_depth < max_tool_chain_depth
                         ):
+                            plan_mode_nudge_used = True
                             # Insert a minimal model turn so the Gemini API sees
                             # proper user/model alternation in the history.
                             conversation_history.append(
@@ -3399,8 +3475,7 @@ async def run_server(
                                 "help with on your Mac!"
                             )
                         fallback_text = _decorate_mode_result(fallback_text)
-                        if not await _ensure_teacher_note_capture(fallback_text):
-                            return
+                        await mode_handler.post_generation_hook(response_text=fallback_text)
                         await _send_mode_status("Drafting response...")
                         if _is_request_in_flight(request_id) and _client_is_connected(client):
                             streamer = server.create_streaming_handler(client, request_id)
@@ -3458,6 +3533,9 @@ async def run_server(
                         )
                     return
 
+                if tool_call.name == "browse_web":
+                    browse_web_called_this_turn = True
+
                 if execution_mode == ExecutionMode.PLAN and tool_call.name in _PLAN_MODE_PLANNER_TOOLS:
                     plan_mode_planner_used = True
                     # Only mark plan as produced for plan_ops or planner
@@ -3467,10 +3545,11 @@ async def run_server(
                         and tool_call.arguments.get("mode") in ("create", "replan")
                     ):
                         plan_mode_plan_produced = True
-                        plan_mode_sessions_with_plan[session_id] = True
+                        plan_mode_sessions_with_plan[session_id] = time.time()
                     if len(plan_mode_sessions_with_plan) > 100:
-                        oldest = next(iter(plan_mode_sessions_with_plan))
-                        plan_mode_sessions_with_plan.pop(oldest, None)
+                        _evict_sp = list(plan_mode_sessions_with_plan)[:20]
+                        for _ek_sp in _evict_sp:
+                            plan_mode_sessions_with_plan.pop(_ek_sp, None)
                 elif (
                     execution_mode == ExecutionMode.PLAN
                     and plan_mode_requires_unified_planning
@@ -3533,23 +3612,14 @@ async def run_server(
                     # phase description so the status bar stays dynamic.
                     _tool_phase_labels = {
                         "search_files": "Scanning your files...",
-                        "read_text": "Reading file contents...",
-                        "extract_content": "Extracting document content...",
-                        "get_metadata": "Inspecting file metadata...",
+                        "read_document": "Reading document contents...",
                         "planner": "Initializing the planner...",
                         "plan_ops": "Building the execution plan...",
                         "apply_ops": "Executing the plan...",
                         "read_screen": "Reading screen contents...",
-                        "take_note": "Saving a note...",
-                        "update_note": "Updating a note...",
-                        "delete_note": "Removing a note...",
-                        "format_note": "Formatting a note...",
-                        "merge_notes": "Merging notes...",
-                        "reorder_notes": "Reordering notes...",
+                        "manage_notes": "Managing your notes...",
                         "generate_image": "Generating an image...",
-                        "generate_quiz": "Creating a quiz...",
-                        "summarize_note": "Summarizing a note...",
-                        "browse_web": "Browsing web page...",
+                        "browse_web": "Fetching live web sources...",
                     }
                     _phase = _tool_phase_labels.get(
                         tool_call.name,
@@ -3753,11 +3823,26 @@ async def run_server(
                             require_in_flight=True,
                         )
 
+                    async def _screen_send_capture_request(rid: str) -> None:
+                        await _send_request_message(
+                            client=client,
+                            request_id=rid,
+                            payload=SystemMessage.lifecycle_event(
+                                rid,
+                                domain="device",
+                                action="screen_capture_requested",
+                                payload={"request_id": rid},
+                            ).to_bytes(),
+                            require_in_flight=True,
+                        )
+
                     _screen_ctx = ScreenToolContext(
                         request_id=request_id,
                         client_address=client.address,
                         pending_screen_captures=pending_screen_captures,
                         send_status=_screen_send_status,
+                        send_capture_request=_screen_send_capture_request,
+                        client_capabilities=_client_capabilities_for,
                         resolved_user_prompt=resolved_user_prompt,
                         read_screen_ocr_max_chars=read_screen_ocr_max_chars,
                         read_screen_ocr_max_lines=read_screen_ocr_max_lines,
@@ -3877,7 +3962,12 @@ async def run_server(
                         and bool(note_execution.get("ok"))
                         and tool_call.name in TEACHER_NOTE_COMPLETION_TOOLS
                     ):
-                        teacher_mode_note_captured = True
+                        try:
+                            from .modes.teacher.handler import TeacherModeHandler
+                            if isinstance(mode_handler, TeacherModeHandler):
+                                mode_handler.record_tool_call(tool_call.name)
+                        except Exception as e:
+                            logger.error(f"Failed to record manual teacher node completion: {e}")
 
                     # Feed result back into conversation
                     conversation_history.append(model_content)
@@ -3955,14 +4045,59 @@ async def run_server(
                 execution_summary: str
                 plan_mode_result_override: str | None = None
                 try:
-                    execution = await _run_blocking_with_timeout(
-                        label="tool.execute",
-                        timeout_seconds=tool_timeout_seconds,
-                        func=tool_executor.execute,
-                        args=(tool_call.name, tool_call.arguments),
-                        request_id=request_id,
-                        method=request.method,
+                    # Device-aware routing: proxy to mobile or execute locally
+                    from .ipc.device_tool_router import DeviceToolRouter as _DTR
+                    _device_info = device_registry.get(client.address)
+                    _is_mobile_client = (
+                        isinstance(_device_info, dict)
+                        and _device_info.get("platform", "").lower() in {"ios", "ipados"}
                     )
+                    _device_supported = set(
+                        _device_info.get("supported_tools", [])
+                        if isinstance(_device_info, dict) else []
+                    )
+
+                    if _is_mobile_client and tool_call.name in _device_supported:
+                        # Proxy tool to iOS device
+                        _proxy_key = f"{request_id}:{tool_call.name}:{time.monotonic_ns()}"
+                        _proxy_future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+                        pending_tool_proxies[_proxy_key] = (client.address, _proxy_future)
+
+                        await _send_request_message(
+                            client=client,
+                            request_id=request_id,
+                            payload=SystemMessage.lifecycle_event(
+                                request_id,
+                                domain="device",
+                                action="tool_execute_request",
+                                payload={
+                                    "proxy_key": _proxy_key,
+                                    "tool_name": tool_call.name,
+                                    "arguments": dict(tool_call.arguments) if tool_call.arguments else {},
+                                },
+                            ).to_bytes(),
+                            require_in_flight=True,
+                        )
+
+                        try:
+                            execution = await asyncio.wait_for(_proxy_future, timeout=30.0)
+                        except asyncio.TimeoutError:
+                            pending_tool_proxies.pop(_proxy_key, None)
+                            execution = {
+                                "tool": tool_call.name,
+                                "ok": False,
+                                "output": {"error": "Device tool execution timed out after 30s", "status": "failed"},
+                            }
+                    else:
+                        # Local execution on Mac backend
+                        execution = await _run_blocking_with_timeout(
+                            label="tool.execute",
+                            timeout_seconds=tool_timeout_seconds,
+                            func=tool_executor.execute,
+                            args=(tool_call.name, tool_call.arguments),
+                            request_id=request_id,
+                            method=request.method,
+                        )
                     if not _is_request_in_flight(request_id):
                         logger.info(
                             "Skipping late tool execution response for inactive request: %s",
@@ -4065,8 +4200,7 @@ async def run_server(
                     else {}
                 )
                 if plan_mode_result_override is not None:
-                    if not await _ensure_teacher_note_capture(plan_mode_result_override):
-                        return
+                    await mode_handler.post_generation_hook(response_text=plan_mode_result_override)
                     await _send_request_message(
                         client=client,
                         request_id=request_id,
@@ -4080,8 +4214,7 @@ async def run_server(
                     final_assistant_response = plan_mode_result_override
                     break
                 if tool_call.name in destructive_tool_names:
-                    if not await _ensure_teacher_note_capture(execution_content):
-                        return
+                    await mode_handler.post_generation_hook(response_text=execution_content)
                     await _send_request_message(
                         client=client,
                         request_id=request_id,
@@ -4097,11 +4230,27 @@ async def run_server(
 
                 last_non_terminal_result = (execution_content, tool_call_payload)
                 conversation_history.append(model_content)
+
+                # Sanitize the function response for Gemini API compatibility
+                _fn_output = execution.get("output")
+                if isinstance(_fn_output, dict):
+                    # Deep-convert to ensure JSON-primitives only
+                    import json as _json
+                    try:
+                        _serialized = _json.dumps(_fn_output, default=str)
+                        _fn_output = _json.loads(_serialized)
+                        _sz = len(_serialized)
+                        if _sz > 5000:
+                            logger.info("Function response payload: %d bytes for %s", _sz, tool_call.name)
+                    except Exception as _ser_err:
+                        logger.warning("Function response serialization failed: %s", _ser_err)
+                        _fn_output = {"status": "success", "note": "Results available but could not be serialized"}
+
                 function_response = types.Part.from_function_response(
                     name=tool_call.name,
                     response={
                         "ok": bool(execution.get("ok")),
-                        "output": execution.get("output"),
+                        "output": _fn_output,
                     },
                 )
                 conversation_history.append(
@@ -4118,8 +4267,7 @@ async def run_server(
                             f"({max_tool_chain_depth}) before a final model answer."
                         )
                     final_assistant_response = _decorate_mode_result(final_assistant_response)
-                    if not await _ensure_teacher_note_capture(final_assistant_response):
-                        return
+                    await mode_handler.post_generation_hook(response_text=final_assistant_response)
                     await _send_request_message(
                         client=client,
                         request_id=request_id,
@@ -4136,8 +4284,7 @@ async def run_server(
                         "before producing a final response."
                     )
                     final_assistant_response = _decorate_mode_result(final_assistant_response)
-                    if not await _ensure_teacher_note_capture(final_assistant_response):
-                        return
+                    await mode_handler.post_generation_hook(response_text=final_assistant_response)
                     await _send_request_message(
                         client=client,
                         request_id=request_id,
@@ -4192,6 +4339,20 @@ async def run_server(
                 message="Request cancelled by user",
             )
             raise
+        except RequestTimeoutError as e:
+            timeout_data = dict(getattr(e, "error_data", {}) or {})
+            timeout_message = str(timeout_data.get("user_message", "")).strip() or _format_exception_message(
+                e,
+                fallback="Request timed out",
+            )
+            await _send_request_error(
+                client=client,
+                request_id=request_id,
+                code=ErrorMessage.REQUEST_TIMEOUT,
+                message=timeout_message,
+                data=timeout_data or None,
+                require_in_flight=True,
+            )
         except GeminiRateLimitError as e:
             await _send_request_error(
                 client=client,
@@ -4257,6 +4418,7 @@ async def run_server(
             presentation_style_provided = "presentation_style" in request.params
             stream_animation_style_provided = "stream_animation" in request.params
             deep_think_provided = "deep_think" in request.params
+            browse_profile_provided = "browse_profile" in request.params
             input_paths_raw = request.params.get("input_paths")
 
             if not isinstance(prompt_raw, str) or not prompt_raw.strip():
@@ -4376,7 +4538,7 @@ async def run_server(
                         )
                         return
                 if not plan_mode_nlp_ready:
-                    reason = plan_mode_nlp_error or "spaCy classifier failed to initialize"
+                    reason = plan_mode_nlp_error or "plan clarification classifier failed to initialize"
                     await client.send(
                         ErrorMessage.invalid_request(
                             request_id,
@@ -4436,6 +4598,22 @@ async def run_server(
                     return
             else:
                 deep_think = False
+
+            if browse_profile_provided:
+                browse_profile = _parse_browse_profile_strict(request.params.get("browse_profile"))
+                if browse_profile is None:
+                    await client.send(
+                        ErrorMessage.invalid_request(
+                            request_id,
+                            (
+                                f"Invalid browse_profile: {request.params.get('browse_profile')} "
+                                "(expected: strict, standard, flexible)"
+                            ),
+                        ).to_bytes()
+                    )
+                    return
+            else:
+                browse_profile = "standard"
 
             if deep_think:
                 requested_model = model if isinstance(model, str) and model.strip() else config.model_name
@@ -4547,17 +4725,31 @@ async def run_server(
                             verbosity_level,
                             presentation_style,
                             stream_animation_style,
+                            browse_profile,
                             deep_think,
                             correlation_id,
                         ),
                         timeout=effective_prompt_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
+                    timeout_data = {
+                        "code": "prompt_timeout",
+                        "request_id": request_id,
+                        "phase": "prompt",
+                        "operation": "prompt",
+                        "timeout_seconds": round(float(effective_prompt_timeout_seconds), 3),
+                        "elapsed_seconds": round(float(effective_prompt_timeout_seconds), 3),
+                        "user_message": (
+                            "The request exceeded the overall prompt timeout budget. "
+                            "Your backend connection is still active, so you can retry."
+                        ),
+                    }
                     await _send_request_error(
                         client=client,
                         request_id=request_id,
-                        code=ErrorMessage.INTERNAL_ERROR,
-                        message=f"Prompt timed out after {effective_prompt_timeout_seconds}s",
+                        code=ErrorMessage.REQUEST_TIMEOUT,
+                        message=str(timeout_data["user_message"]),
+                        data=timeout_data,
                     )
 
             task = asyncio.create_task(_run_prompt_with_timeout())
@@ -4717,9 +4909,130 @@ async def run_server(
         await client.send(acknowledgement.to_bytes())
         await client.send(StatusUpdate.complete(request.id).to_bytes())
 
+    async def handle_device_register(request: IncomingRequest, client: ClientConnection) -> None:
+        """Register the connected device manifest for capability-aware tool routing."""
+        device_id = request.params.get("device_id")
+        platform = request.params.get("platform")
+        device_name = request.params.get("device_name")
+        app_version = request.params.get("app_version")
+        raw_capabilities = request.params.get("capabilities", [])
+
+        if not isinstance(device_id, str) or not device_id.strip():
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "device_id is required").to_bytes()
+            )
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+        if not isinstance(platform, str) or not platform.strip():
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "platform is required").to_bytes()
+            )
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+        if not isinstance(device_name, str) or not device_name.strip():
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "device_name is required").to_bytes()
+            )
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+        if not isinstance(app_version, str) or not app_version.strip():
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "app_version is required").to_bytes()
+            )
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+        if not isinstance(raw_capabilities, list):
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "capabilities must be a list").to_bytes()
+            )
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+
+        capabilities = sorted(
+            {
+                capability.strip()
+                for capability in raw_capabilities
+                if isinstance(capability, str) and capability.strip()
+            }
+        )
+        raw_supported_tools = request.params.get("supported_tools", [])
+        supported_tools = sorted(
+            {
+                t.strip()
+                for t in (raw_supported_tools if isinstance(raw_supported_tools, list) else [])
+                if isinstance(t, str) and t.strip()
+            }
+        )
+        payload = {
+            "device_id": device_id.strip(),
+            "platform": platform.strip(),
+            "device_name": device_name.strip(),
+            "app_version": app_version.strip(),
+            "capabilities": capabilities,
+            "supported_tools": supported_tools,
+            "registered_at": time.time(),
+        }
+        device_registry[client.address] = payload
+        await client.send(
+            ResultMessage.create(request.id, json.dumps(payload)).to_bytes()
+        )
+        await client.send(StatusUpdate.complete(request.id).to_bytes())
+
     async def handle_ping(request: IncomingRequest, client: ClientConnection) -> None:
         """Handles ping requests for health check."""
         result = ResultMessage.create(request.id, "pong")
+        await client.send(result.to_bytes())
+
+    async def handle_system_diagnostics(request: IncomingRequest, client: ClientConnection) -> None:
+        """Handles comprehensive end-to-end system diagnostics checks."""
+        diagnostics = {
+            "status": "ok",
+            "api_key_valid": False,
+            "db_connected": False,
+            "tools_ready": False,
+            "errors": []
+        }
+
+        # 1. Check API Key
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+        if api_key and len(api_key) > 10:
+            diagnostics["api_key_valid"] = True
+        else:
+            diagnostics["status"] = "error"
+            diagnostics["errors"].append("GEMINI_API_KEY or GOOGLE_API_KEY environment variable is missing or invalid.")
+
+        # 2. Check Database Connection
+        try:
+            # We assume MemoryManager is initialized and the local SQLite/VectorDB is responsive
+            # A simple query or checking if the instance exists is sufficient for a quick health check.
+            if memory_manager is not None:
+                # Ping the db by listing sessions
+                import asyncio
+                await asyncio.to_thread(memory_manager.list_sessions, limit=1)
+                diagnostics["db_connected"] = True
+            else:
+                diagnostics["status"] = "error"
+                diagnostics["errors"].append("MemoryManager is not initialized.")
+        except Exception as e:
+            diagnostics["status"] = "error"
+            diagnostics["errors"].append(f"Database connection failed: {e}")
+
+        # 3. Check Tools Readiness
+        try:
+            # Check if core tools like search_files and browse_web are registered
+            core_tools = ["search_files", "browse_web"]
+            registered_tools = list(tool_executor._handlers.keys())
+            missing_tools = [t for t in core_tools if t not in registered_tools]
+            if not missing_tools:
+                diagnostics["tools_ready"] = True
+            else:
+                diagnostics["status"] = "error"
+                diagnostics["errors"].append(f"Core tools missing: {', '.join(missing_tools)}")
+        except Exception as e:
+            diagnostics["status"] = "error"
+            diagnostics["errors"].append(f"Tool registry check failed: {e}")
+
+        result = ResultMessage.create(request.id, json.dumps(diagnostics))
         await client.send(result.to_bytes())
 
     async def handle_session_create(request: IncomingRequest, client: ClientConnection) -> None:
@@ -4758,17 +5071,45 @@ async def run_server(
             limit = int(limit_raw)
         except (TypeError, ValueError):
             limit = 50
+        resolved_limit: int | None = None if limit <= 0 else max(1, min(limit, 5000))
         sessions = await _run_blocking_with_timeout(
             label="db.list_sessions",
             timeout_seconds=db_timeout_seconds,
             func=memory_manager.list_sessions,
             args=(),
-            kwargs={"limit": max(1, min(limit, 200))},
+            kwargs={"limit": resolved_limit},
             request_id=request.id,
             method=request.method,
         )
         payload = [_session_payload(session) for session in sessions]
         await client.send(ResultMessage.create(request.id, json.dumps(payload)).to_bytes())
+
+    async def handle_session_list_since(request: IncomingRequest, client: ClientConnection) -> None:
+        """Return sessions changed since a given store_version cursor."""
+        since_raw = request.params.get("since_version", 0)
+        try:
+            since_version = int(since_raw)
+        except (TypeError, ValueError):
+            since_version = 0
+        limit_raw = request.params.get("limit", 200)
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 200
+        records, max_version = await _run_blocking_with_timeout(
+            label="db.list_sessions_since",
+            timeout_seconds=db_timeout_seconds,
+            func=memory_manager.list_sessions_since,
+            args=(max(0, since_version),),
+            kwargs={"limit": max(1, min(limit, 500))},
+            request_id=request.id,
+            method=request.method,
+        )
+        result = {
+            "sessions": [_session_payload(s) for s in records],
+            "max_version": max_version,
+        }
+        await client.send(ResultMessage.create(request.id, json.dumps(result)).to_bytes())
 
     async def handle_session_history(request: IncomingRequest, client: ClientConnection) -> None:
         """List persisted chat messages for a session."""
@@ -4835,6 +5176,139 @@ async def run_server(
                 ).to_bytes()
             )
             return
+        except MemoryStoreError as exc:
+            await client.send(
+                ErrorMessage.internal_error(
+                    request.id,
+                    _format_exception_message(exc, fallback="Session data corrupted"),
+                ).to_bytes()
+            )
+            return
+        await client.send(ResultMessage.create(request.id, json.dumps(payload)).to_bytes())
+
+    async def handle_session_history_page(request: IncomingRequest, client: ClientConnection) -> None:
+        """List a bounded page of persisted chat messages for a session."""
+        session_id = _normalize_session_id(
+            request.params.get("session_id"),
+            fallback="",
+        )
+        if not session_id:
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "Missing session_id").to_bytes()
+            )
+            return
+
+        direction = str(request.params.get("direction", "latest") or "latest").strip().lower()
+        if direction not in {"latest", "older"}:
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id,
+                    f"Unsupported session.history_page direction: {direction}",
+                ).to_bytes()
+            )
+            return
+
+        limit_raw = request.params.get("limit", 120)
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 120
+
+        anchor_raw = request.params.get("anchor_turn_index")
+        anchor_turn_index: int | None = None
+        if anchor_raw is not None:
+            try:
+                anchor_turn_index = int(anchor_raw)
+            except (TypeError, ValueError):
+                await client.send(
+                    ErrorMessage.invalid_request(
+                        request.id,
+                        "anchor_turn_index must be an integer",
+                    ).to_bytes()
+                )
+                return
+
+        if direction == "older" and anchor_turn_index is None:
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id,
+                    "anchor_turn_index is required for older history pages",
+                ).to_bytes()
+            )
+            return
+
+        session_exists = await _run_blocking_with_timeout(
+            label="db.get_session",
+            timeout_seconds=db_timeout_seconds,
+            func=memory_manager.get_session,
+            args=(session_id,),
+            request_id=request.id,
+            method=request.method,
+        )
+        if session_exists is None:
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id,
+                    f"Unknown session_id: {session_id}",
+                ).to_bytes()
+            )
+            return
+
+        try:
+            payload = await _run_blocking_with_timeout(
+                label="db.list_session_messages_page",
+                timeout_seconds=db_timeout_seconds,
+                func=memory_manager.list_session_messages_page,
+                args=(),
+                kwargs={
+                    "session_id": session_id,
+                    "direction": direction,
+                    "limit": max(1, min(limit, 120)),
+                    "anchor_turn_index": anchor_turn_index,
+                },
+                request_id=request.id,
+                method=request.method,
+            )
+        except ValueError as exc:
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id,
+                    _format_exception_message(exc, fallback="Unknown session"),
+                ).to_bytes()
+            )
+            return
+        except MemoryStoreError as exc:
+            await client.send(
+                ErrorMessage.internal_error(
+                    request.id,
+                    _format_exception_message(exc, fallback="Session data corrupted"),
+                ).to_bytes()
+            )
+            return
+        await client.send(ResultMessage.create(request.id, json.dumps(payload)).to_bytes())
+
+    async def handle_models_list(request: IncomingRequest, client: ClientConnection) -> None:
+        """Return the live Gemini text-model catalog for the frontend."""
+        force_refresh = bool(request.params.get("force_refresh"))
+        try:
+            models = await asyncio.to_thread(
+                gemini_client.list_text_models,
+                force_refresh=force_refresh,
+            )
+            default_model = await asyncio.to_thread(gemini_client.resolve_text_model)
+        except GeminiClientError as exc:
+            await client.send(
+                ErrorMessage.internal_error(
+                    request.id,
+                    _format_exception_message(exc, fallback="Failed to load Gemini model catalog"),
+                ).to_bytes()
+            )
+            return
+
+        payload = {
+            "default_model": default_model,
+            "models": models,
+        }
         await client.send(ResultMessage.create(request.id, json.dumps(payload)).to_bytes())
 
     async def handle_session_set_mode(request: IncomingRequest, client: ClientConnection) -> None:
@@ -5075,6 +5549,14 @@ async def run_server(
                 ).to_bytes()
             )
             return
+        except MemoryStoreError as exc:
+            await client.send(
+                ErrorMessage.internal_error(
+                    request.id,
+                    _format_exception_message(exc, fallback="Session data corrupted"),
+                ).to_bytes()
+            )
+            return
         await client.send(ResultMessage.create(request.id, json.dumps(memories)).to_bytes())
 
     async def handle_memory_delete(request: IncomingRequest, client: ClientConnection) -> None:
@@ -5186,13 +5668,53 @@ async def run_server(
         source = request.params.get("source", "user")
         if source not in ("user", "agent"):
             source = "user"
+        title = request.params.get("title")
+        if title is not None and not isinstance(title, str):
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "Invalid title: expected string when provided").to_bytes()
+            )
+            return
+        workspace_kind = request.params.get("workspace_kind")
+        if workspace_kind is not None:
+            if not isinstance(workspace_kind, str) or workspace_kind.strip().lower() not in {"session_pad", "tab"}:
+                await client.send(
+                    ErrorMessage.invalid_request(
+                        request.id,
+                        "Invalid workspace_kind: expected 'session_pad' or 'tab'",
+                    ).to_bytes()
+                )
+                return
+            workspace_kind = workspace_kind.strip().lower()
+        is_default_tab = request.params.get("is_default_tab")
+        if is_default_tab is not None and not isinstance(is_default_tab, bool):
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id, "Invalid is_default_tab: expected boolean when provided",
+                ).to_bytes()
+            )
+            return
+        tab_order = request.params.get("tab_order")
+        if tab_order is not None and not isinstance(tab_order, int):
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id, "Invalid tab_order: expected integer when provided",
+                ).to_bytes()
+            )
+            return
         try:
             note = await _run_blocking_with_timeout(
                 label="db.create_note",
                 timeout_seconds=db_timeout_seconds,
                 func=memory_manager.create_note,
                 args=(session_id,),
-                kwargs={"content": content.strip(), "source": source},
+                kwargs={
+                    "content": content.strip(),
+                    "source": source,
+                    "title": title,
+                    "workspace_kind": workspace_kind,
+                    "is_default_tab": bool(is_default_tab),
+                    "tab_order": tab_order,
+                },
                 request_id=request.id,
                 method=request.method,
             )
@@ -5240,6 +5762,14 @@ async def run_server(
                 ).to_bytes()
             )
             return
+        title = request.params.get("title")
+        if title is not None and not isinstance(title, str):
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request.id, "Invalid title: expected string when provided",
+                ).to_bytes()
+            )
+            return
         try:
             updated = await _run_blocking_with_timeout(
                 label="db.update_note",
@@ -5249,6 +5779,7 @@ async def run_server(
                 kwargs={
                     "content": content,
                     "is_pinned": is_pinned,
+                    "title": title,
                 },
                 request_id=request.id,
                 method=request.method,
@@ -5407,6 +5938,7 @@ async def run_server(
 
     async def handle_client_disconnect(disconnected_client: ClientConnection) -> None:
         cancelled = _cancel_requests_for_client(disconnected_client.address)
+        device_registry.pop(disconnected_client.address, None)
         if cancelled > 0:
             logger.info(
                 "Cancelled %s in-flight request(s) after client disconnect: %s",
@@ -5420,13 +5952,22 @@ async def run_server(
         """Handles reload requests from the SwiftUI frontend."""
         request_id = request.id
         trigger = request.params.get("trigger", "ipc")
-        
+
         logger.info(f"Reload requested via IPC (trigger: {trigger})")
-        
+
+        if not is_hot_reload_enabled():
+            await client.send(
+                ErrorMessage.invalid_request(
+                    request_id,
+                    "Hot reload is disabled in this environment",
+                ).to_bytes()
+            )
+            return
+
         # Send reload started notification
         started_msg = SystemMessage.reload_started(request_id, trigger)
         await client.send(started_msg.to_bytes())
-        
+
         # Perform the reload
         event = reload_manager.reload_modules(trigger=trigger)
         
@@ -5452,18 +5993,23 @@ async def run_server(
             code_version=reload_manager.version,
             features=[
                 "auth.hello",
+                "device.register",
                 "prompt",
                 "prompt.execution_mode",
                 "prompt.input_paths",
                 "cancel",
                 "tool.confirm",
+                "tool.execute_response",
                 "screen.capture_response",
                 "ping",
                 "reload",
                 "version",
                 "session.create",
                 "session.list",
+                "session.list_since",
                 "session.history",
+                "session.history_page",
+                "models.list",
                 "session.set_mode",
                 "session.rename",
                 "session.delete",
@@ -5488,10 +6034,94 @@ async def run_server(
     server.register_handler("cancel", handle_cancel)
     server.register_handler("tool.confirm", handle_tool_confirm)
     server.register_handler("screen.capture_response", handle_screen_capture)
+    server.register_handler("device.register", handle_device_register)
+
+    def _sanitize_proxy_result(obj: Any) -> Any:
+        """Recursively sanitize proxy result to ensure JSON-serializable values."""
+        import math
+        if obj is None:
+            return ""
+        if isinstance(obj, bool):
+            return obj
+        if isinstance(obj, (int, float)):
+            if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return 0
+            return obj
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            return {str(k): _sanitize_proxy_result(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize_proxy_result(item) for item in obj]
+        # Fallback: convert to string
+        return str(obj)
+
+    async def handle_tool_execute_response(request: IncomingRequest, client: ClientConnection) -> None:
+        """Handle tool execution result proxied back from the mobile device."""
+        proxy_key = request.params.get("proxy_key", "")
+        result = request.params.get("result", {})
+        if not isinstance(proxy_key, str) or not proxy_key.strip():
+            await client.send(
+                ErrorMessage.invalid_request(request.id, "proxy_key is required").to_bytes()
+            )
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+
+        pending = pending_tool_proxies.pop(proxy_key, None)
+        if pending is None:
+            logger.warning("No pending tool proxy for key: %s", proxy_key)
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+
+        owner_addr, proxy_future = pending
+        if owner_addr != client.address:
+            logger.warning(
+                "Tool proxy response from wrong client: expected %s, got %s",
+                owner_addr, client.address,
+            )
+            # Re-insert so the correct client can still resolve it
+            pending_tool_proxies[proxy_key] = pending
+            await client.send(StatusUpdate.complete(request.id).to_bytes())
+            return
+
+        if not proxy_future.done():
+            # Normalize result to match ToolExecutor output format
+            if not isinstance(result, dict):
+                result = {"status": "failed", "error": "Invalid result from device"}
+            # Sanitize the result to remove non-JSON-serializable values
+            result = _sanitize_proxy_result(result)
+            tool_name = proxy_key.split(":")[1] if ":" in proxy_key else "unknown"
+            import json as _json
+            try:
+                _payload_size = len(_json.dumps(result, default=str))
+                logger.info("Proxy result payload size: %d bytes for %s", _payload_size, proxy_key)
+            except Exception:
+                pass
+            proxy_future.set_result({
+                "tool": tool_name,
+                "ok": result.get("status") == "success",
+                "timestamp": time.time(),
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "latency_ms": 0,
+                "output": result,
+            })
+            logger.info("Resolved tool proxy %s ok=%s", proxy_key, result.get("status") == "success")
+
+        await client.send(
+            ResultMessage.create(request.id, "Tool execution result received.").to_bytes()
+        )
+        await client.send(StatusUpdate.complete(request.id).to_bytes())
+
+    server.register_handler("tool.execute_response", handle_tool_execute_response)
     server.register_handler("ping", handle_ping)
+    server.register_handler("system.diagnostics", handle_system_diagnostics)
     server.register_handler("session.create", handle_session_create)
     server.register_handler("session.list", handle_session_list)
+    server.register_handler("session.list_since", handle_session_list_since)
     server.register_handler("session.history", handle_session_history)
+    server.register_handler("session.history_page", handle_session_history_page)
+    server.register_handler("models.list", handle_models_list)
     server.register_handler("session.set_mode", handle_session_set_mode)
     server.register_handler("session.rename", handle_session_rename)
     server.register_handler("session.delete", handle_session_delete)
@@ -5531,7 +6161,7 @@ async def run_server(
             plan_mode_nlp_ready = True
             plan_mode_nlp_error = None
             logger.info(
-                "Plan-mode NLP preload complete",
+                "Plan clarification classifier warmup complete",
                 extra={
                     "component": "plan_mode_nlp_preload",
                     "method": "startup",
@@ -5545,10 +6175,10 @@ async def run_server(
             plan_mode_nlp_ready = False
             plan_mode_nlp_error = _format_exception_message(
                 exc,
-                fallback="spaCy model unavailable",
+                fallback="plan clarification classifier unavailable",
             )
             logger.error(
-                "Plan-mode NLP preload failed: %s",
+                "Plan clarification classifier warmup failed: %s",
                 plan_mode_nlp_error,
             )
         finally:
@@ -5564,11 +6194,6 @@ async def run_server(
                 },
             )
 
-    async def _watch_unhealthy_shutdown() -> None:
-        await unhealthy_shutdown_requested.wait()
-        logger.critical("Unhealthy blocking timeout detected; shutting down IPC server")
-        await server.stop()
-    
     # Start server
     try:
         socket_bind_started = time.perf_counter()
@@ -5584,7 +6209,6 @@ async def run_server(
                 "error_message": None,
             },
         )
-        unhealthy_shutdown_task = asyncio.create_task(_watch_unhealthy_shutdown())
         plan_mode_nlp_preload_task = asyncio.create_task(_plan_mode_nlp_preload_worker())
         if db_metrics_enabled:
             db_metrics_task = asyncio.create_task(_db_metrics_reporter())
@@ -5592,7 +6216,7 @@ async def run_server(
         # Start hot reload file watcher
         await reload_manager.start()
         
-        print_info(f"IPC Server started on {server.socket_path}")
+        print_info(f"IPC Server started on {server.endpoint_url}")
         print_info(f"Protocol version: {PROTOCOL_VERSION}")
         print_info(f"Code version: {reload_manager.version}")
         print_info("Hot reload enabled - code changes will be auto-detected")
@@ -5603,13 +6227,9 @@ async def run_server(
             await server.serve_forever()
         except asyncio.CancelledError:
             pass
-        
+    
     finally:
         # Cancel any in-flight prompt tasks before shutdown.
-        unhealthy_shutdown_requested.set()
-        if unhealthy_shutdown_task is not None:
-            unhealthy_shutdown_task.cancel()
-            await asyncio.gather(unhealthy_shutdown_task, return_exceptions=True)
         if plan_mode_nlp_preload_task is not None:
             plan_mode_nlp_preload_task.cancel()
             await asyncio.gather(plan_mode_nlp_preload_task, return_exceptions=True)
@@ -5677,7 +6297,8 @@ def main(args: list[str] | None = None) -> int:
         return asyncio.run(
             run_server(
                 config,
-                socket_path=parsed_args.socket_path,
+                host=parsed_args.host,
+                port=parsed_args.port,
                 verbose=parsed_args.verbose,
             )
         )
@@ -5738,7 +6359,7 @@ def main(args: list[str] | None = None) -> int:
         audit_logger = AuditLogger(config.audit_log_path)
         audit_include_prompt = bool(getattr(config, "audit_include_prompt", False))
         startup_payload: dict[str, object] = {
-            "model": config.model_name,
+            "model": config.model_name or "<auto-resolve-from-live-catalog>",
             "tools_count": len(tools),
             "mode": "cli",
             "prompt_present": bool(parsed_args.prompt),
@@ -5764,6 +6385,7 @@ def main(args: list[str] | None = None) -> int:
             vertex_project=config.vertex_project,
             vertex_location=config.vertex_location,
         )
+        config.model_name = client.resolve_text_model(config.model_name or None)
         logger.debug("Gemini client initialized")
 
         # Wire semantic embedding service (second init site — CLI mode)
@@ -5925,6 +6547,33 @@ def main(args: list[str] | None = None) -> int:
             model_name=config.model_name,
         )
         return EXIT_VALIDATION_ERROR
+
+    if audit_logger:
+        tool_result_summary: dict[str, Any] = {
+            "tool": tool_call.name,
+            "ok": bool(execution.get("ok")) if isinstance(execution, dict) else True,
+        }
+        if isinstance(execution, dict):
+            for key in (
+                "url",
+                "final_url",
+                "error_class",
+                "status_code",
+                "redirect_count",
+                "compliance_policy_version",
+                "anti_bot_provider",
+                "anti_bot_confidence",
+            ):
+                if key in execution:
+                    tool_result_summary[key] = execution.get(key)
+            if "security_checks" in execution:
+                tool_result_summary["security_checks"] = execution.get("security_checks")
+            if "prompt_injection_risk" in execution:
+                risk = execution.get("prompt_injection_risk") or {}
+                if isinstance(risk, dict):
+                    tool_result_summary["prompt_injection_risk_level"] = risk.get("risk_level")
+                    tool_result_summary["prompt_injection_risk_score"] = risk.get("risk_score")
+        audit_logger.log_event(EventType.TOOL_RESULT, tool_result_summary)
 
     execution_text, _ = _format_tool_execution_output(tool_call.name, execution)
     execution_json = json.dumps(execution, ensure_ascii=False)

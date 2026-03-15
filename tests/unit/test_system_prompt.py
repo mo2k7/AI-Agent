@@ -37,13 +37,67 @@ def test_format_tool_belt_lists_required_and_optional_args() -> None:
     assert "Optional args: path" in text
 
 
+def test_format_tool_belt_includes_tool_routing_playbook_for_loaded_tools() -> None:
+    tools = [
+        {
+            "name": "search_files",
+            "description": "Find files based on metadata or content",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        },
+        {
+            "name": "read_document",
+            "description": "Extract text from documents",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "mode": {"type": "string"}}},
+        },
+        {
+            "name": "browse_web",
+            "description": "Browse and extract content from web pages",
+            "parameters": {"type": "object", "properties": {"url": {"type": "string"}}},
+        },
+        {
+            "name": "apply_ops",
+            "description": "Execute a previously planned operation",
+            "parameters": {"type": "object", "properties": {"plan_id": {"type": "string"}}, "required": ["plan_id"]},
+        },
+    ]
+
+    text = format_tool_belt(tools)
+
+    assert "TOOL ROUTING PLAYBOOK" in text
+    assert "CONVERSATION-FIRST RULES" in text
+    assert "If the conversation context already answers the request, do not call a tool." in text
+    assert "Use `search_files` to discover candidate local paths" in text
+    assert "Use `read_document` to inspect files" in text
+    assert "Use `browse_web` only for web content" in text
+    assert "If the user explicitly asks you to look up, verify, browse, search online, or get the latest/current web information" in text
+    assert "Do not use `browse_web` just to restate, reformat, or continue an existing conversation." in text
+    assert "Do not answer time-sensitive web questions from memory first" in text
+    assert "Use `apply_ops` only when a concrete plan already exists" in text
+    assert "TOOL CHOICE ANTI-PATTERNS" in text
+    assert "Do not treat every follow-up as a new research task." in text
+    assert "Do not answer latest/current web questions from stale memory" in text
+
+
+def test_build_system_prompt_preserves_base_tool_routing_contract(tmp_path: Path) -> None:
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text(
+        "## SYSTEM IDENTITY\n\nBase body\n\n## TOOL ROUTING CONTRACT\n\nUse tools by execution stage.\n",
+        encoding="utf-8",
+    )
+
+    built = build_system_prompt(tools=[], prompt_path=prompt_path)
+
+    assert "## TOOL ROUTING CONTRACT" in built
+    assert "Use tools by execution stage." in built
+
+
 def test_build_system_prompt_appends_runtime_tool_catalog(tmp_path: Path) -> None:
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("## SYSTEM IDENTITY\nBase prompt body", encoding="utf-8")
 
     tools = [
         {
-            "name": "read_text",
+            "name": "read_document",
             "description": "Read text content from a file",
             "parameters": {
                 "type": "object",
@@ -57,7 +111,7 @@ def test_build_system_prompt_appends_runtime_tool_catalog(tmp_path: Path) -> Non
 
     assert "Base prompt body" in built
     assert "ACTIVE TOOL BELT" in built
-    assert "`read_text`" in built
+    assert "`read_document`" in built
 
 
 def test_build_system_prompt_without_tools_uses_base_prompt(tmp_path: Path) -> None:
@@ -81,6 +135,13 @@ def test_load_system_prompt_raises_when_file_empty(tmp_path: Path) -> None:
     empty_prompt.write_text("   \n\n", encoding="utf-8")
     with pytest.raises(SystemPromptLoadError):
         load_system_prompt(prompt_path=empty_prompt)
+
+
+def test_default_system_prompt_routes_notes_to_session_pad() -> None:
+    prompt = load_system_prompt()
+    assert "`Session Notes` pad" in prompt
+    assert "Do NOT create a separate tab unless the user explicitly asks for one." in prompt
+    assert "Do not turn ordinary follow-up questions into fresh searches." in prompt
 
 
 def test_inject_model_identity_includes_requested_verbosity_level() -> None:

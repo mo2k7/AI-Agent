@@ -29,28 +29,11 @@ TEACHER_DEFAULT_NOTE_TAGS: tuple[str, ...] = (
     "key-highlights",
 )
 TEACHER_NOTE_COMPLETION_TOOLS: frozenset[str] = frozenset(
-    {
-        "take_note",
-        "update_note",
-        "format_note",
-        "merge_notes",
-        "generate_quiz",
-        "summarize_note",
-    }
+    {"manage_notes"}
 )
 
 NOTE_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "take_note",
-        "update_note",
-        "delete_note",
-        "format_note",
-        "merge_notes",
-        "reorder_notes",
-        "generate_image",
-        "generate_quiz",
-        "summarize_note",
-    }
+    {"manage_notes", "generate_image"}
 )
 
 
@@ -108,6 +91,8 @@ class ScreenToolContext:
     client_address: str
     pending_screen_captures: dict[str, tuple[str, asyncio.Future[dict | None]]]
     send_status: Callable[..., Awaitable[None]]
+    send_capture_request: Callable[..., Awaitable[None]]
+    client_capabilities: Callable[[str], set[str]]
     resolved_user_prompt: str
     read_screen_ocr_max_chars: int
     read_screen_ocr_max_lines: int

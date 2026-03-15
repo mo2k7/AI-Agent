@@ -8,6 +8,21 @@
 
 import Foundation
 import Combine
+struct IPCSystemDiagnostics: Decodable {
+    let status: String
+    let apiKeyValid: Bool
+    let dbConnected: Bool
+    let toolsReady: Bool
+    let errors: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case apiKeyValid = "api_key_valid"
+        case dbConnected = "db_connected"
+        case toolsReady = "tools_ready"
+        case errors
+    }
+}
 
 struct IPCSessionSummary: Decodable, Identifiable {
     let sessionId: String
@@ -17,6 +32,7 @@ struct IPCSessionSummary: Decodable, Identifiable {
     let updatedAt: Double
     let lastActivity: Double
     let status: String
+    let storeVersion: Int?
 
     var id: String { sessionId }
 
@@ -28,6 +44,7 @@ struct IPCSessionSummary: Decodable, Identifiable {
         case updatedAt = "updated_at"
         case lastActivity = "last_activity"
         case status
+        case storeVersion = "store_version"
     }
 }
 
@@ -46,6 +63,48 @@ struct IPCSessionMessage: Decodable, Identifiable {
         case content
         case createdAt = "created_at"
         case turnIndex = "turn_index"
+    }
+}
+
+struct IPCSessionHistoryPage: Decodable {
+    let messages: [IPCSessionMessage]
+    let direction: String
+    let oldestTurnIndex: Int?
+    let newestTurnIndex: Int?
+    let hasOlder: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case messages
+        case direction
+        case oldestTurnIndex = "oldest_turn_index"
+        case newestTurnIndex = "newest_turn_index"
+        case hasOlder = "has_older"
+    }
+}
+
+struct IPCModelCatalog: Decodable {
+    let defaultModel: String
+    let models: [GeminiModelOption]
+
+    enum CodingKeys: String, CodingKey {
+        case defaultModel = "default_model"
+        case models
+    }
+}
+
+struct IPCRegisteredDevice: Decodable {
+    let deviceId: String
+    let platform: String
+    let deviceName: String
+    let appVersion: String
+    let capabilities: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case deviceId = "device_id"
+        case platform
+        case deviceName = "device_name"
+        case appVersion = "app_version"
+        case capabilities
     }
 }
 
@@ -121,15 +180,27 @@ private struct IPCDeleteSessionsResult: Decodable {
     }
 }
 
+private struct IPCSessionListSinceResponse: Decodable {
+    let sessions: [IPCSessionSummary]
+    let maxVersion: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessions
+        case maxVersion = "max_version"
+    }
+}
+
 private struct IPCAuthHelloResponse: Decodable {
     let authenticated: Bool
     let protocolVersion: String
     let features: [String]
+    let rotationToken: String?
 
     enum CodingKeys: String, CodingKey {
         case authenticated
         case protocolVersion = "protocol_version"
         case features
+        case rotationToken = "rotation_token"
     }
 }
 
@@ -137,6 +208,17 @@ struct IPCSystemEvent {
     let domain: String
     let action: String
     let payload: [String: Any]
+    let seq: Int?
+}
+
+struct IPCRequestTimeoutPayload {
+    let requestId: String
+    let code: String
+    let phase: String
+    let operation: String
+    let timeoutSeconds: Double?
+    let elapsedSeconds: Double?
+    let userMessage: String
 }
 
 enum IPCRequestError: LocalizedError {
@@ -175,7 +257,7 @@ enum IPCRequestError: LocalizedError {
 }
 
 /// High-level IPC client that provides a clean async interface for communicating
-/// with the Python backend via Unix Domain Socket
+/// with the backend via WebSocket transport.
 @MainActor
 final class IPCClient: ObservableObject {
     
@@ -192,6 +274,9 @@ final class IPCClient: ObservableObject {
     
     /// Whether currently streaming a response
     @Published private(set) var isStreaming: Bool = false
+
+    /// Whether a live cancellation request is waiting for backend acknowledgement.
+    @Published private(set) var isCancellationPending: Bool = false
     
     // MARK: - Private Properties
     
@@ -200,6 +285,10 @@ final class IPCClient: ObservableObject {
 
     /// Shared token required for backend auth.hello handshake.
     private var authToken: String?
+
+    /// One-time rotation token issued by the backend on auth success.
+    /// Survives disconnect so reconnects can use it instead of the static bootstrap token.
+    private var rotationToken: String?
 
     /// Whether transport-level auth/version negotiation has completed.
     private var isAuthenticatedTransport: Bool = false
@@ -211,12 +300,15 @@ final class IPCClient: ObservableObject {
     private let requiredBackendFeatures: Set<String> = [
         "prompt",
         "cancel",
+        "device.register",
         "tool.confirm",
         "screen.capture_response",
         "ping",
         "session.create",
         "session.list",
         "session.history",
+        "session.history_page",
+        "models.list",
         "session.set_mode",
         "session.rename",
         "session.delete",
@@ -236,6 +328,9 @@ final class IPCClient: ObservableObject {
     
     /// Current request ID being tracked
     private(set) var currentRequestId: String?
+
+    /// Request ID currently waiting for cancellation acknowledgement from the backend.
+    private var cancellationPendingRequestId: String?
     
     /// Cancellables for Combine subscriptions
     private var cancellables = Set<AnyCancellable>()
@@ -252,12 +347,14 @@ final class IPCClient: ObservableObject {
     private let defaultRPCTimeoutNanoseconds: UInt64 = 3_000_000_000
     private let sessionDeleteRPCTimeoutNanoseconds: UInt64 = 45_000_000_000
     private var requestStartTimes: [String: Date] = [:]
+    private var lastDeliveredStatusSignature: String?
     private let pingTimeoutNanoseconds: UInt64 = {
         let env = ProcessInfo.processInfo.environment["AI_AGENT_PING_TIMEOUT_MS"]
         let value = UInt64(env ?? "") ?? 3_000
         let clamped = max(UInt64(500), min(value, UInt64(30_000)))
         return clamped * 1_000_000
     }()
+    private let requestTimeoutErrorCode = -32014
     
     // MARK: - Callbacks
     
@@ -265,7 +362,7 @@ final class IPCClient: ObservableObject {
     var onStatusChange: ((AgentStatus, String?) -> Void)?
     
     /// Called when streaming text is updated
-    var onStreamUpdate: ((String, Bool) -> Void)? // text, isDone
+    var onStreamUpdate: ((String, String, Bool) -> Void)? // delta, text, isDone
     
     /// Called when a tool call is received
     var onToolCall: ((ToolCall) -> Void)?
@@ -275,6 +372,12 @@ final class IPCClient: ObservableObject {
     
     /// Called when an error occurs
     var onError: ((String) -> Void)?
+
+    /// Called when the backend confirms the active request was cancelled.
+    var onCancelled: (() -> Void)?
+
+    /// Called when backend reports structured request-timeout metadata.
+    var onRequestTimeout: ((IPCRequestTimeoutPayload) -> Void)?
 
     /// Called for backend lifecycle system events (session/notes/memory).
     var onSystemEvent: ((IPCSystemEvent) -> Void)?
@@ -308,9 +411,14 @@ final class IPCClient: ObservableObject {
             }
         }
         
-        socketManager.dispatcher.onStreamingUpdate = { [weak self] requestId, text, isDone in
+        socketManager.dispatcher.onStreamingUpdate = { [weak self] requestId, delta, text, isDone in
             Task { @MainActor in
-                self?.handleStreamingUpdate(requestId: requestId, text: text, isDone: isDone)
+                self?.handleStreamingUpdate(
+                    requestId: requestId,
+                    delta: delta,
+                    text: text,
+                    isDone: isDone
+                )
             }
         }
         
@@ -326,9 +434,9 @@ final class IPCClient: ObservableObject {
             }
         }
         
-        socketManager.dispatcher.onError = { [weak self] requestId, message, code in
+        socketManager.dispatcher.onError = { [weak self] requestId, message, code, data in
             Task { @MainActor in
-                self?.handleError(message, requestId: requestId, code: code)
+                self?.handleError(message, requestId: requestId, code: code, data: data)
             }
         }
 
@@ -346,7 +454,7 @@ final class IPCClient: ObservableObject {
         authToken = (trimmed?.isEmpty == false) ? trimmed : nil
     }
     
-    /// Connects to the Python backend (auto-discovers socket)
+    /// Connects to the backend using the configured WebSocket endpoint.
     func connect() async {
         do {
             try await socketManager.connect()
@@ -357,10 +465,10 @@ final class IPCClient: ObservableObject {
         }
     }
     
-    /// Connects to a specific socket path
-    /// - Parameter path: Full path to the Unix domain socket
-    func connect(toSocketPath path: String) async throws {
-        try await socketManager.connect(toPath: path)
+    /// Connects to a specific WebSocket endpoint URL.
+    /// - Parameter url: Fully qualified `ws://` or `wss://` endpoint.
+    func connect(toWebSocketURL url: String) async throws {
+        try await socketManager.connect(toURLString: url)
         do {
             try await authenticateAndNegotiate()
         } catch {
@@ -374,12 +482,15 @@ final class IPCClient: ObservableObject {
         isAuthenticatedTransport = false
         negotiatedProtocolVersion = nil
         isConnected = false
+        isCancellationPending = false
+        cancellationPendingRequestId = nil
         if let pendingPingId = pendingPingId {
             ignoredPingIds.insert(pendingPingId)
             completePingIfNeeded(requestId: pendingPingId, success: false)
         }
         failAllPendingRPCs(IPCRequestError.disconnected)
         requestStartTimes.removeAll()
+        lastDeliveredStatusSignature = nil
         socketManager.disconnect()
     }
     
@@ -394,6 +505,7 @@ final class IPCClient: ObservableObject {
     ///   - verbosity: Response verbosity (`low`, `medium`, `high`, `extra_high`).
     ///   - presentationStyle: Response rendering style (`readable_pro`, `glass_editorial`, `dense_technical`).
     ///   - streamingAnimation: Streaming animation style (`wave_reveal`, `typewriter_luxe`, `minimal_motion`).
+    ///   - browseProfile: Browse restriction profile (`strict`, `standard`, `flexible`).
     ///   - deepThink: Enables stronger reasoning mode for this prompt.
     /// - Returns: The request ID for tracking.
     @discardableResult
@@ -407,6 +519,7 @@ final class IPCClient: ObservableObject {
         verbosity: String,
         presentationStyle: String,
         streamingAnimation: String,
+        browseProfile: String,
         deepThink: Bool,
         correlationId: String
     ) async -> String? {
@@ -418,6 +531,9 @@ final class IPCClient: ObservableObject {
         // Reset streaming state
         streamingText = ""
         isStreaming = true
+        isCancellationPending = false
+        cancellationPendingRequestId = nil
+        lastDeliveredStatusSignature = nil
         let requestId = UUID().uuidString
         currentRequestId = requestId
         requestStartTimes[requestId] = Date()
@@ -434,6 +550,7 @@ final class IPCClient: ObservableObject {
                 "verbosity": verbosity,
                 "presentation_style": presentationStyle,
                 "stream_animation": streamingAnimation,
+                "browse_profile": browseProfile,
                 "deep_think": deepThink ? "true" : "false",
             ]
         )
@@ -449,6 +566,7 @@ final class IPCClient: ObservableObject {
                 verbosity: verbosity,
                 presentationStyle: presentationStyle,
                 streamingAnimation: streamingAnimation,
+                browseProfile: browseProfile,
                 deepThink: deepThink,
                 correlationId: correlationId,
                 requestId: requestId
@@ -457,6 +575,10 @@ final class IPCClient: ObservableObject {
         } catch {
             if currentRequestId == requestId {
                 currentRequestId = nil
+            }
+            if cancellationPendingRequestId == requestId {
+                cancellationPendingRequestId = nil
+                isCancellationPending = false
             }
             requestStartTimes.removeValue(forKey: requestId)
             handleError(error.localizedDescription)
@@ -474,13 +596,30 @@ final class IPCClient: ObservableObject {
         return try decodeJSONPayload(content, as: IPCCreatedSession.self)
     }
 
-    func listSessions(limit: Int = 50) async throws -> [IPCSessionSummary] {
-        let clamped = max(1, min(limit, 200))
+    func listSessions(limit: Int = 0) async throws -> [IPCSessionSummary] {
+        let resolvedLimit = limit <= 0 ? 0 : min(limit, 5_000)
         let content = try await sendRPC(
             method: "session.list",
-            params: ["limit": AnyCodable(clamped)]
+            params: ["limit": AnyCodable(resolvedLimit)]
         )
         return try decodeJSONPayload(content, as: [IPCSessionSummary].self)
+    }
+
+    func listSessionsSince(sinceVersion: Int, limit: Int = 200) async throws -> (sessions: [IPCSessionSummary], maxVersion: Int) {
+        let content = try await sendRPC(
+            method: "session.list_since",
+            params: [
+                "since_version": AnyCodable(sinceVersion),
+                "limit": AnyCodable(max(1, min(limit, 500))),
+            ]
+        )
+        let result = try decodeJSONPayload(content, as: IPCSessionListSinceResponse.self)
+        return (result.sessions, result.maxVersion)
+    }
+
+    func getSystemDiagnostics() async throws -> IPCSystemDiagnostics {
+        let content = try await sendRPC(method: "system.diagnostics", params: [:])
+        return try decodeJSONPayload(content, as: IPCSystemDiagnostics.self)
     }
 
     func deleteSession(sessionId: String) async throws {
@@ -521,6 +660,35 @@ final class IPCClient: ObservableObject {
             ]
         )
         return try decodeJSONPayload(content, as: [IPCSessionMessage].self)
+    }
+
+    func sessionHistoryPage(
+        sessionId: String,
+        direction: String,
+        anchorTurnIndex: Int? = nil,
+        limit: Int = 120
+    ) async throws -> IPCSessionHistoryPage {
+        var params: [String: AnyCodable] = [
+            "session_id": AnyCodable(sessionId),
+            "direction": AnyCodable(direction),
+            "limit": AnyCodable(max(1, min(limit, 120))),
+        ]
+        if let anchorTurnIndex {
+            params["anchor_turn_index"] = AnyCodable(anchorTurnIndex)
+        }
+        let content = try await sendRPC(
+            method: "session.history_page",
+            params: params
+        )
+        return try decodeJSONPayload(content, as: IPCSessionHistoryPage.self)
+    }
+
+    func listModels(forceRefresh: Bool = false) async throws -> IPCModelCatalog {
+        let content = try await sendRPC(
+            method: "models.list",
+            params: ["force_refresh": AnyCodable(forceRefresh)]
+        )
+        return try decodeJSONPayload(content, as: IPCModelCatalog.self)
     }
 
     func renameSession(sessionId: String, title: String) async throws -> IPCSessionSummary {
@@ -584,25 +752,45 @@ final class IPCClient: ObservableObject {
         return try decodeJSONPayload(content, as: [IPCNote].self)
     }
 
-    func createNote(sessionId: String, content: String, source: String = "user") async throws -> IPCNote {
+    func createNote(
+        sessionId: String,
+        content: String,
+        source: String = "user",
+        title: String? = nil,
+        workspaceKind: String? = nil
+    ) async throws -> IPCNote {
+        var params: [String: AnyCodable] = [
+            "session_id": AnyCodable(sessionId),
+            "content": AnyCodable(content),
+            "source": AnyCodable(source),
+        ]
+        if let title {
+            params["title"] = AnyCodable(title)
+        }
+        if let workspaceKind {
+            params["workspace_kind"] = AnyCodable(workspaceKind)
+        }
         let result = try await sendRPC(
             method: "notes.create",
-            params: [
-                "session_id": AnyCodable(sessionId),
-                "content": AnyCodable(content),
-                "source": AnyCodable(source),
-            ]
+            params: params
         )
         return try decodeJSONPayload(result, as: IPCNote.self)
     }
 
-    func updateNote(sessionId: String, noteId: String, content: String? = nil, isPinned: Bool? = nil) async throws -> IPCNote {
+    func updateNote(
+        sessionId: String,
+        noteId: String,
+        content: String? = nil,
+        isPinned: Bool? = nil,
+        title: String? = nil
+    ) async throws -> IPCNote {
         var params: [String: AnyCodable] = [
             "session_id": AnyCodable(sessionId),
             "note_id": AnyCodable(noteId),
         ]
         if let content { params["content"] = AnyCodable(content) }
         if let isPinned { params["is_pinned"] = AnyCodable(isPinned) }
+        if let title { params["title"] = AnyCodable(title) }
         let result = try await sendRPC(method: "notes.update", params: params)
         return try decodeJSONPayload(result, as: IPCNote.self)
     }
@@ -639,6 +827,21 @@ final class IPCClient: ObservableObject {
             ]
         )
         return try decodeJSONPayload(content, as: [IPCNoteVersion].self)
+    }
+
+    func registerDevice(_ manifest: DeviceBridgeManifest) async throws -> IPCRegisteredDevice {
+        let content = try await sendRPC(
+            method: "device.register",
+            params: [
+                "device_id": AnyCodable(manifest.deviceId),
+                "platform": AnyCodable(manifest.platform),
+                "device_name": AnyCodable(manifest.deviceName),
+                "app_version": AnyCodable(manifest.appVersion),
+                "capabilities": AnyCodable(manifest.capabilityNames),
+                "supported_tools": AnyCodable(manifest.supportedTools),
+            ]
+        )
+        return try decodeJSONPayload(content, as: IPCRegisteredDevice.self)
     }
 
     func confirmCurrentToolExecution(approved: Bool) async throws {
@@ -689,16 +892,31 @@ final class IPCClient: ObservableObject {
         )
     }
 
+    /// Sends a proxied tool execution result back to the backend.
+    func sendToolExecuteResponse(proxyKey: String, result: [String: Any]) async throws {
+        _ = try await sendRPC(
+            method: "tool.execute_response",
+            params: [
+                "proxy_key": AnyCodable(proxyKey),
+                "result": AnyCodable(result),
+            ]
+        )
+    }
+
     /// Cancels the current request
     func cancel() async {
         guard isConnected else { return }
-        guard currentRequestId != nil else { return }
+        guard let requestId = currentRequestId else { return }
+        guard cancellationPendingRequestId == nil else { return }
         
         do {
-            try await socketManager.sendCancel(targetRequestId: currentRequestId)
+            cancellationPendingRequestId = requestId
+            isCancellationPending = true
             isStreaming = false
-            currentRequestId = nil
+            try await socketManager.sendCancel(targetRequestId: requestId)
         } catch {
+            cancellationPendingRequestId = nil
+            isCancellationPending = false
             handleError(error.localizedDescription)
         }
     }
@@ -738,14 +956,18 @@ final class IPCClient: ObservableObject {
         }
 
         let requestPid = Int(ProcessInfo.processInfo.processIdentifier)
+        var authParams: [String: AnyCodable] = [
+            "protocol_version": AnyCodable(expectedProtocolVersion),
+            "client_name": AnyCodable("AIAgentUI"),
+            "client_pid": AnyCodable(requestPid),
+            "auth_token": AnyCodable(authToken),
+        ]
+        if let rotationToken {
+            authParams["rotation_token"] = AnyCodable(rotationToken)
+        }
         let content = try await sendRPC(
             method: "auth.hello",
-            params: [
-                "protocol_version": AnyCodable(expectedProtocolVersion),
-                "client_name": AnyCodable("AIAgentUI"),
-                "client_pid": AnyCodable(requestPid),
-                "auth_token": AnyCodable(authToken),
-            ]
+            params: authParams
         )
         let auth = try decodeJSONPayload(content, as: IPCAuthHelloResponse.self)
         guard auth.authenticated else {
@@ -763,11 +985,14 @@ final class IPCClient: ObservableObject {
             throw IPCRequestError.missingFeatures(missing)
         }
 
+        // Store new rotation token for next reconnect.
+        rotationToken = auth.rotationToken
+
         isAuthenticatedTransport = true
         negotiatedProtocolVersion = auth.protocolVersion
         isConnected = true
         lastError = nil
-        onStatusChange?(.idle, nil)
+        emitStatusChange(.idle, nil)
     }
     
     // MARK: - Private Handlers
@@ -779,10 +1004,10 @@ final class IPCClient: ObservableObject {
             if isAuthenticatedTransport {
                 isConnected = true
                 lastError = nil
-                onStatusChange?(.idle, nil)
+                emitStatusChange(.idle, nil)
             } else {
                 isConnected = false
-                onStatusChange?(.connecting, "Authenticating IPC session...")
+                emitStatusChange(.connecting, "Authenticating IPC session...")
             }
             
         case .disconnected:
@@ -790,6 +1015,8 @@ final class IPCClient: ObservableObject {
             negotiatedProtocolVersion = nil
             isConnected = false
             isStreaming = false
+            isCancellationPending = false
+            cancellationPendingRequestId = nil
             currentRequestId = nil
             if let pendingPingId = pendingPingId {
                 ignoredPingIds.insert(pendingPingId)
@@ -798,13 +1025,15 @@ final class IPCClient: ObservableObject {
             failAllPendingRPCs(IPCRequestError.disconnected)
             
         case .connecting:
-            onStatusChange?(.connecting, nil)
+            emitStatusChange(.connecting, nil)
             
         case .failed(let error):
             isAuthenticatedTransport = false
             negotiatedProtocolVersion = nil
             isConnected = false
             isStreaming = false
+            isCancellationPending = false
+            cancellationPendingRequestId = nil
             if let pendingPingId = pendingPingId {
                 ignoredPingIds.insert(pendingPingId)
                 completePingIfNeeded(requestId: pendingPingId, success: false)
@@ -817,8 +1046,9 @@ final class IPCClient: ObservableObject {
     private func handleStatusUpdate(_ status: AgentStatus, requestId: String, detail: String?) {
         // Only handle updates for our current request
         guard let activeRequestId = currentRequestId, requestId == activeRequestId else { return }
+        guard cancellationPendingRequestId != requestId else { return }
         
-        onStatusChange?(status, detail)
+        emitStatusChange(status, detail)
         
         // Update streaming state based on status
         switch status {
@@ -831,15 +1061,16 @@ final class IPCClient: ObservableObject {
         }
     }
     
-    private func handleStreamingUpdate(requestId: String, text: String, isDone: Bool) {
+    private func handleStreamingUpdate(requestId: String, delta: String, text: String, isDone: Bool) {
         guard let activeRequestId = currentRequestId, requestId == activeRequestId else { return }
+        guard cancellationPendingRequestId != requestId else { return }
 
         let isTextChanged = streamingText != text
         if isTextChanged {
             streamingText = text
         }
         if isTextChanged || isDone {
-            onStreamUpdate?(text, isDone)
+            onStreamUpdate?(delta, text, isDone)
         }
         
         if isDone {
@@ -849,11 +1080,12 @@ final class IPCClient: ObservableObject {
     
     private func handleToolCall(_ toolCall: ToolCall, requestId: String) {
         guard let activeRequestId = currentRequestId, requestId == activeRequestId else { return }
+        guard cancellationPendingRequestId != requestId else { return }
         
         onToolCall?(toolCall)
         switch toolCall.status {
         case .pending, .executing:
-            onStatusChange?(.callingTool(toolName: toolCall.name), "Using \(toolCall.name)")
+            emitStatusChange(.callingTool(toolName: toolCall.name), "Using \(toolCall.name)")
         case .success, .failed:
             break
         }
@@ -880,14 +1112,94 @@ final class IPCClient: ObservableObject {
         logRequestCompletion(requestId: requestId, kind: "prompt", error: nil)
         
         guard let activeRequestId = currentRequestId, requestId == activeRequestId else { return }
+
+        if cancellationPendingRequestId == requestId {
+            isStreaming = false
+            isCancellationPending = false
+            cancellationPendingRequestId = nil
+            currentRequestId = nil
+            onCancelled?()
+            emitStatusChange(.idle, nil)
+            return
+        }
         
         isStreaming = false
+        isCancellationPending = false
+        cancellationPendingRequestId = nil
         currentRequestId = nil
         onComplete?(content)
-        onStatusChange?(.complete, nil)
+        emitStatusChange(.complete, nil)
+    }
+
+    private func emitStatusChange(_ status: AgentStatus, _ detail: String?) {
+        let normalizedDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let signature = "\(status.signatureKey)|\(normalizedDetail)"
+        guard lastDeliveredStatusSignature != signature else { return }
+        lastDeliveredStatusSignature = signature
+        onStatusChange?(status, normalizedDetail.isEmpty ? nil : normalizedDetail)
     }
     
-    private func handleError(_ message: String, requestId: String? = nil, code: Int? = nil) {
+    private func _asString(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
+    private func _asDouble(_ value: Any?) -> Double? {
+        if let value = value as? Double {
+            return value.isFinite ? value : nil
+        }
+        if let value = value as? Int {
+            return Double(value)
+        }
+        if let value = value as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let parsed = Double(trimmed), parsed.isFinite else { return nil }
+            return parsed
+        }
+        return nil
+    }
+
+    private func parseRequestTimeoutPayload(
+        requestId: String?,
+        code: Int?,
+        data: [String: Any]?,
+        normalizedMessage: String
+    ) -> IPCRequestTimeoutPayload? {
+        let isTimeoutCode = (code == requestTimeoutErrorCode)
+        let dataCode = _asString(data?["code"])
+        let dataLooksLikeTimeout = (dataCode?.hasSuffix("_timeout") == true)
+        guard isTimeoutCode || dataLooksLikeTimeout else { return nil }
+
+        let resolvedRequestId = _asString(data?["request_id"])
+            ?? requestId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? "global"
+        let resolvedCode = dataCode ?? "request_timeout"
+        let phase = _asString(data?["phase"]) ?? "request"
+        let operation = _asString(data?["operation"]) ?? "unknown"
+        let timeoutSeconds = _asDouble(data?["timeout_seconds"])
+        let elapsedSeconds = _asDouble(data?["elapsed_seconds"])
+        let userMessage = _asString(data?["user_message"]) ?? normalizedMessage
+        return IPCRequestTimeoutPayload(
+            requestId: resolvedRequestId,
+            code: resolvedCode,
+            phase: phase,
+            operation: operation,
+            timeoutSeconds: timeoutSeconds,
+            elapsedSeconds: elapsedSeconds,
+            userMessage: userMessage
+        )
+    }
+
+    private func handleError(
+        _ message: String,
+        requestId: String? = nil,
+        code: Int? = nil,
+        data: [String: Any]? = nil
+    ) {
         let normalizedMessage: String = {
             let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? "Unknown backend error." : trimmed
@@ -901,6 +1213,12 @@ final class IPCClient: ObservableObject {
             }
             return "Backend error (\(code)): \(normalizedMessage)"
         }()
+        let timeoutPayload = parseRequestTimeoutPayload(
+            requestId: requestId,
+            code: code,
+            data: data,
+            normalizedMessage: normalizedMessage
+        )
 
         if let requestId = requestId,
            let pendingPingId = pendingPingId,
@@ -934,13 +1252,34 @@ final class IPCClient: ObservableObject {
             }
         }
 
+        if let timeoutPayload {
+            onRequestTimeout?(timeoutPayload)
+        }
+
+        let normalizedLower = normalizedMessage.lowercased()
+        let isCancellation = code == -32800
+            || normalizedLower.contains("request cancelled by user")
+            || normalizedLower.contains("request canceled by user")
+
         if isGlobalError || requestId == currentRequestId {
             currentRequestId = nil
         }
+        if requestId == cancellationPendingRequestId || isCancellation {
+            cancellationPendingRequestId = nil
+            isCancellationPending = false
+        }
+        if isCancellation {
+            lastError = nil
+            isStreaming = false
+            onCancelled?()
+            emitStatusChange(.idle, nil)
+            return
+        }
+
         lastError = userVisibleMessage
         isStreaming = false
         onError?(userVisibleMessage)
-        onStatusChange?(.error(message: userVisibleMessage), userVisibleMessage)
+        emitStatusChange(.error(message: userVisibleMessage), userVisibleMessage)
     }
 
     private func handleSystemMessage(_ response: SystemResponse, requestId: String) {
@@ -957,7 +1296,8 @@ final class IPCClient: ObservableObject {
             IPCSystemEvent(
                 domain: domain,
                 action: action,
-                payload: payload
+                payload: payload,
+                seq: response.system.seq
             )
         )
     }

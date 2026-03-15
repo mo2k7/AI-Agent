@@ -63,31 +63,31 @@ async def handle(
         img_alt = img_prompt[:120]
         _set_image_failure("alt_text must be a string when provided.")
 
-    quality_raw = arguments.get("quality_tier", "standard")
+    quality_raw = arguments.get("quality_tier") or "standard"
     quality_tier = "standard"
     if isinstance(quality_raw, str) and quality_raw.strip():
         quality_tier = quality_raw.strip().lower()
     else:
         _set_image_failure("quality_tier must be a non-empty string.")
 
-    aspect_ratio_raw = arguments.get("aspect_ratio", "1:1")
+    aspect_ratio_raw = arguments.get("aspect_ratio") or "1:1"
     aspect_ratio = "1:1"
     if isinstance(aspect_ratio_raw, str) and aspect_ratio_raw.strip():
         aspect_ratio = aspect_ratio_raw.strip()
     else:
         _set_image_failure("aspect_ratio must be a non-empty string.")
 
-    image_size_raw = arguments.get("image_size", "1K")
+    image_size_raw = arguments.get("image_size") or "1K"
     image_size = "1K"
     if isinstance(image_size_raw, str) and image_size_raw.strip():
         image_size = image_size_raw.strip()
     else:
         _set_image_failure("image_size must be a non-empty string.")
 
-    person_generation_raw = arguments.get("person_generation", "allow_adult")
-    person_generation = "allow_adult"
+    person_generation_raw = arguments.get("person_generation") or "ALLOW_ADULT"
+    person_generation = "ALLOW_ADULT"
     if isinstance(person_generation_raw, str) and person_generation_raw.strip():
-        person_generation = person_generation_raw.strip().lower()
+        person_generation = person_generation_raw.strip().upper()
     else:
         _set_image_failure("person_generation must be a non-empty string.")
 
@@ -101,15 +101,6 @@ async def handle(
     else:
         _set_image_failure("negative_prompt must be a string when provided.")
 
-    seed_raw = arguments.get("seed")
-    seed_value: int | None = None
-    if seed_raw is None:
-        seed_value = None
-    elif isinstance(seed_raw, bool) or not isinstance(seed_raw, int):
-        _set_image_failure("seed must be an integer when provided.")
-    else:
-        seed_value = seed_raw
-
     number_raw = arguments.get("number_of_images", 1)
     number_of_images = 1
     if isinstance(number_raw, bool) or not isinstance(number_raw, int):
@@ -121,25 +112,8 @@ async def handle(
         if number_of_images < 1 or number_of_images > 4:
             _set_image_failure("number_of_images must be between 1 and 4.")
 
-    enhance_prompt_raw = arguments.get("enhance_prompt", True)
-    enhance_prompt = True
-    if isinstance(enhance_prompt_raw, bool):
-        enhance_prompt = enhance_prompt_raw
-    else:
-        _set_image_failure("enhance_prompt must be a boolean.")
-
-    output_mime_type_raw = arguments.get("output_mime_type", "image/png")
+    # Nano Banana returns image/png by default; used for file extension logic
     output_mime_type = "image/png"
-    if isinstance(output_mime_type_raw, str) and output_mime_type_raw.strip():
-        normalized_mime = output_mime_type_raw.strip().lower()
-        if normalized_mime in {"image/png", "image/jpeg"}:
-            output_mime_type = normalized_mime
-        else:
-            _set_image_failure(
-                "output_mime_type must be image/png or image/jpeg."
-            )
-    else:
-        _set_image_failure("output_mime_type must be a non-empty string.")
 
     # ── Resolve optional note_id ──
 
@@ -218,18 +192,15 @@ async def handle(
         try:
             image_result = await asyncio.wait_for(
                 asyncio.to_thread(
-                    ctx.gemini_client.generate_images,
+                    ctx.gemini_client.generate_image,
                     prompt=img_prompt,
                     quality_tier=quality_tier,
                     number_of_images=number_of_images,
                     aspect_ratio=aspect_ratio,
                     image_size=image_size,
-                    enhance_prompt=enhance_prompt,
                     person_generation=person_generation,
                     negative_prompt=negative_prompt,
-                    seed=seed_value,
                     model_override=ctx.image_model_override,
-                    output_mime_type=output_mime_type,
                 ),
                 timeout=ctx.image_timeout_seconds,
             )
@@ -261,40 +232,31 @@ async def handle(
 
     # ── Validate image bytes ──
 
-    prepared_images: list[tuple[bytes, int, int]] = []
+    prepared_images: list[tuple[bytes, str, int, int]] = []
     if image_failure is None:
         for generated in generated_images:
             image_bytes = generated.get("bytes", b"")
             if not isinstance(image_bytes, bytes) or not image_bytes:
-                rai_reason = str(
-                    generated.get("rai_filtered_reason", "") or ""
-                ).strip()
-                filtered_message = (
-                    "Image generation was filtered by safety policy"
-                    if rai_reason
-                    else "Image generation returned empty content"
-                )
-                if rai_reason:
-                    filtered_message = f"{filtered_message}: {rai_reason}"
-                _set_image_failure(filtered_message)
+                _set_image_failure("Image generation returned empty content")
                 break
+            img_mime = str(generated.get("mime_type", "image/png") or "image/png")
             width = int(generated.get("width", 0) or 0)
             height = int(generated.get("height", 0) or 0)
-            prepared_images.append((image_bytes, width, height))
+            prepared_images.append((image_bytes, img_mime, width, height))
 
     # ── Persist to disk + optionally embed in note ──
 
     markers_to_append: list[str] = []
     if image_failure is None:
         for idx, prepared_image in enumerate(prepared_images):
-            image_bytes, width, height = prepared_image
+            image_bytes, img_mime, width, height = prepared_image
             target_path = output_paths[idx]
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_bytes(image_bytes)
             digest = hashlib.sha256(image_bytes).hexdigest()
             persisted_record: dict[str, object] = {
                 "path": str(target_path),
-                "mime_type": output_mime_type,
+                "mime_type": img_mime,
                 "width": width,
                 "height": height,
                 "sha256": digest,
@@ -309,7 +271,7 @@ async def handle(
                     args=(ctx.session_id, embedded_note_id),
                     kwargs={
                         "image_bytes": image_bytes,
-                        "mime_type": output_mime_type,
+                        "mime_type": img_mime,
                         "width": width,
                         "height": height,
                         "alt_text": img_alt,
@@ -372,14 +334,11 @@ async def handle(
                 "aspect_ratio": aspect_ratio,
                 "image_size": image_size,
                 "number_of_images": number_of_images,
-                "enhance_prompt": enhance_prompt,
                 "person_generation": person_generation,
-                "output_mime_type": output_mime_type,
             },
             "warnings": [],
             "prompt_metadata": {
                 "prompt_length_chars": len(img_prompt),
-                "enhance_prompt_used": enhance_prompt,
             },
         },
     }

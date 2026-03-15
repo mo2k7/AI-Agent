@@ -48,7 +48,8 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
 
         op_kind = str(raw_op.get("op", "")).strip().lower()
         src_raw = str(raw_op.get("src", "")).strip()
-        dest_raw = str(raw_op.get("dest", "")).strip()
+        dest_value = raw_op.get("dest")
+        dest_raw = str(dest_value).strip() if dest_value is not None else ""
         overwrite_policy_raw = str(raw_op.get("overwrite_policy", "fail")).strip().lower()
         entry_issues: list[str] = []
 

@@ -111,8 +111,16 @@ class MemoryManager:
             raise ValueError(f"Unknown session: {session_id}")
         return updated
 
-    def list_sessions(self, *, limit: int = 50) -> list[SessionRecord]:
+    def list_sessions(self, *, limit: int | None = 50) -> list[SessionRecord]:
         return self.store.list_sessions(limit=limit)
+
+    def list_sessions_since(
+        self, since_version: int, *, limit: int = 200
+    ) -> tuple[list[SessionRecord], int]:
+        return self.store.list_sessions_since(since_version, limit=limit)
+
+    def max_store_version(self) -> int:
+        return self.store.max_store_version()
 
     def delete_session(self, session_id: str) -> None:
         with self._ephemeral_lock:
@@ -250,27 +258,28 @@ class MemoryManager:
             return
 
         if self._embedding_service is None:
-            raise RuntimeError(
-                "Embedding service is not initialized for persistent memory mode."
-            )
-
-        candidates = extract_semantic_memories(user_prompt=user_prompt, assistant_response=assistant_response)
-        for candidate in candidates:
-            if should_quarantine(candidate.policy_flags):
-                continue
-            self.store.upsert_semantic_memory(
+            logger.warning(
+                "Embedding service not initialized — skipping semantic extraction for session %s",
                 session_id,
-                kind=candidate.kind,
-                fact_key=candidate.fact_key,
-                content=candidate.content,
-                confidence=candidate.confidence,
-                source_message_id=(
-                    user_msg.message_id if candidate.source_role == "user" else assistant_msg.message_id
-                ),
-                trust_flags=candidate.trust_flags,
-                policy_flags=candidate.policy_flags,
-                embedding_service=self._embedding_service,
             )
+        else:
+            candidates = extract_semantic_memories(user_prompt=user_prompt, assistant_response=assistant_response)
+            for candidate in candidates:
+                if should_quarantine(candidate.policy_flags):
+                    continue
+                self.store.upsert_semantic_memory(
+                    session_id,
+                    kind=candidate.kind,
+                    fact_key=candidate.fact_key,
+                    content=candidate.content,
+                    confidence=candidate.confidence,
+                    source_message_id=(
+                        user_msg.message_id if candidate.source_role == "user" else assistant_msg.message_id
+                    ),
+                    trust_flags=candidate.trust_flags,
+                    policy_flags=candidate.policy_flags,
+                    embedding_service=self._embedding_service,
+                )
 
         self._refresh_summary_if_needed(session_id)
 
@@ -296,6 +305,49 @@ class MemoryManager:
                 }
             )
         return payload
+
+    def list_session_messages_page(
+        self,
+        session_id: str,
+        *,
+        direction: str,
+        limit: int = 120,
+        anchor_turn_index: int | None = None,
+    ) -> dict[str, object]:
+        if self.store.get_session(session_id) is None:
+            raise ValueError(f"Unknown session: {session_id}")
+
+        records, has_older = self.store.list_messages_page(
+            session_id,
+            direction=direction,
+            limit=max(1, min(limit, 120)),
+            anchor_turn_index=anchor_turn_index,
+        )
+
+        payload: list[dict[str, object]] = []
+        for record in records:
+            content = record.content
+            if record.role == "assistant" and looks_like_json_payload(content):
+                content = sanitize_user_visible_response(content)
+            payload.append(
+                {
+                    "message_id": record.message_id,
+                    "role": record.role,
+                    "content": content,
+                    "created_at": record.created_at,
+                    "turn_index": record.turn_index,
+                }
+            )
+
+        oldest_turn_index = payload[0]["turn_index"] if payload else None
+        newest_turn_index = payload[-1]["turn_index"] if payload else None
+        return {
+            "messages": payload,
+            "direction": direction,
+            "oldest_turn_index": oldest_turn_index,
+            "newest_turn_index": newest_turn_index,
+            "has_older": has_older,
+        }
 
     def list_memories(self, session_id: str, *, limit: int = 100) -> list[dict[str, object]]:
         if self.store.get_session(session_id) is None:
@@ -327,13 +379,35 @@ class MemoryManager:
         if self.store.get_session(session_id) is None:
             raise ValueError(f"Unknown session: {session_id}")
 
-    def create_note(self, session_id: str, *, content: str, source: str = "user") -> dict[str, object]:
+    def create_note(
+        self,
+        session_id: str,
+        *,
+        content: str,
+        source: str = "user",
+        title: str | None = None,
+        workspace_kind: str | None = None,
+        is_default_tab: bool = False,
+        tab_order: int | None = None,
+    ) -> dict[str, object]:
         self._require_session_exists(session_id)
-        return self.store.create_note(session_id, content=content, source=source)
+        return self.store.create_note(
+            session_id,
+            content=content,
+            source=source,
+            title=title,
+            workspace_kind=workspace_kind,
+            is_default_tab=is_default_tab,
+            tab_order=tab_order,
+        )
 
     def list_notes(self, session_id: str, *, limit: int = 200) -> list[dict[str, object]]:
         self._require_session_exists(session_id)
         return self.store.list_notes(session_id, limit=limit)
+
+    def get_or_create_session_pad(self, session_id: str) -> dict[str, object]:
+        self._require_session_exists(session_id)
+        return self.store.get_or_create_session_pad(session_id)
 
     def get_note(self, session_id: str, note_id: str) -> dict[str, object] | None:
         self._require_session_exists(session_id)
@@ -341,10 +415,18 @@ class MemoryManager:
 
     def update_note(
         self, session_id: str, note_id: str, *, content: str | None = None, is_pinned: bool | None = None,
+        title: str | None = None,
         touch_timestamp: float | None = None,
     ) -> dict[str, object] | None:
         self._require_session_exists(session_id)
-        return self.store.update_note(session_id, note_id, content=content, is_pinned=is_pinned, touch_timestamp=touch_timestamp)
+        return self.store.update_note(
+            session_id,
+            note_id,
+            content=content,
+            is_pinned=is_pinned,
+            title=title,
+            touch_timestamp=touch_timestamp,
+        )
 
     def delete_note(self, session_id: str, note_id: str) -> bool:
         self._require_session_exists(session_id)

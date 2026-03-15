@@ -44,6 +44,11 @@ _CONSTRAINT_SIGNAL_PATTERN = re.compile(
     r"\b(limit|budget|constraint|available|priority|avoid|weekend|weekends|weekday|weekdays|hours?)\b",
     re.IGNORECASE,
 )
+_NEW_TASK_PREFIX_PATTERN = re.compile(
+    r"^\s*(write|draft|compose|explain|tell|summarize|search|browse|find|open|create|make)\b",
+    re.IGNORECASE,
+)
+_QUESTION_WORD_PATTERN = re.compile(r"^\s*(what|who|when|where|why|how)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -61,18 +66,10 @@ class ClarificationIntentResult:
 class PlanClarificationIntentClassifier:
     """Classifies whether text is likely a clarification reply vs a new task."""
 
-    _DEFAULT_MODELS: tuple[str, ...] = (
-        "en_core_web_trf",
-        "en_core_web_lg",
-        "en_core_web_md",
-        "en_core_web_sm",
-    )
+    _CLASSIFIER_NAME = "builtin"
 
     def __init__(self, model_candidates: tuple[str, ...] | None = None) -> None:
-        self._model_candidates = model_candidates or self._DEFAULT_MODELS
-        self._load_attempted = False
-        self._nlp: Any = None
-        self._loaded_model_name = ""
+        del model_candidates
         self._load_error: str | None = None
 
     @property
@@ -105,80 +102,46 @@ class PlanClarificationIntentClassifier:
         pending_dimension: str | None,
         question_count: int,
     ) -> ClarificationIntentResult:
-        """Return clarification-intent probability using spaCy when available."""
+        """Return clarification-intent probability using the built-in classifier."""
         sanitized_reply = self.sanitize_text(reply_prompt)
         sanitized_root = self.sanitize_text(root_prompt)
         if not sanitized_reply:
             return ClarificationIntentResult(
                 is_clarification_reply=False,
                 confidence=0.0,
-                source="unavailable",
-                model_name="none",
+                source=self._CLASSIFIER_NAME,
+                model_name=self._CLASSIFIER_NAME,
                 sanitized_reply="",
                 sanitized_root_prompt=sanitized_root,
             )
 
-        nlp = self._ensure_model_loaded()
-        if nlp is None:
-            return ClarificationIntentResult(
-                is_clarification_reply=False,
-                confidence=0.0,
-                source="unavailable",
-                model_name="none",
-                sanitized_reply=sanitized_reply,
-                sanitized_root_prompt=sanitized_root,
-            )
-
-        reply_doc = nlp(sanitized_reply)
-        root_doc = nlp(sanitized_root or "plan request")
-        dim_doc = nlp(self._dimension_hint(pending_dimension))
-        diversion_doc = nlp("new unrelated request different task change topic")
-
-        root_similarity = self._safe_similarity(reply_doc, root_doc)
-        dimension_similarity = self._safe_similarity(reply_doc, dim_doc)
-        diversion_similarity = self._safe_similarity(reply_doc, diversion_doc)
-
         reply_tokens = self._token_set(sanitized_reply)
         root_tokens = self._token_set(sanitized_root)
+        dimension_tokens = self._token_set(self._dimension_hint(pending_dimension))
         overlap_ratio = 0.0
         if reply_tokens:
             overlap_ratio = len(reply_tokens.intersection(root_tokens)) / len(reply_tokens)
-
-        reply_lemmas = self._lemma_set(reply_doc)
-        root_lemmas = self._lemma_set(root_doc)
-        dim_lemmas = self._lemma_set(dim_doc)
-        lemma_overlap_root = 0.0
-        lemma_overlap_dim = 0.0
-        if reply_lemmas:
-            lemma_overlap_root = len(reply_lemmas.intersection(root_lemmas)) / len(reply_lemmas)
-            lemma_overlap_dim = len(reply_lemmas.intersection(dim_lemmas)) / len(reply_lemmas)
+        dimension_overlap = 0.0
+        if reply_tokens:
+            dimension_overlap = len(reply_tokens.intersection(dimension_tokens)) / len(reply_tokens)
 
         specificity_score, dimension_match = self._specificity_signal(
             reply=sanitized_reply,
             pending_dimension=pending_dimension,
         )
-        semantic_relevance = max(
-            root_similarity,
-            dimension_similarity,
-            lemma_overlap_root,
-            lemma_overlap_dim,
-        )
-        diversion_penalty = max(0.0, diversion_similarity - semantic_relevance)
         shape_signal = self._shape_signal(sanitized_reply, question_count=question_count)
-        imperative_shift_penalty = self._imperative_topic_shift_penalty(
-            reply_doc=reply_doc,
-            lemma_overlap_root=lemma_overlap_root,
-            lemma_overlap_dim=lemma_overlap_dim,
+        semantic_relevance = max(overlap_ratio, dimension_overlap)
+        new_task_penalty = self._new_task_penalty(
+            reply=sanitized_reply,
+            semantic_relevance=semantic_relevance,
         )
 
         confidence = (
-            (semantic_relevance * 0.28)
-            + (overlap_ratio * 0.20)
-            + (shape_signal * 0.16)
+            (semantic_relevance * 0.30)
+            + (shape_signal * 0.20)
             + (specificity_score * 0.36)
-            + (0.08 if dimension_match else 0.0)
-            - (diversion_penalty * 0.35)
-            - imperative_shift_penalty
+            + (0.12 if dimension_match else 0.0)
+            - new_task_penalty
         )
         confidence = max(0.0, min(1.0, confidence))
 
@@ -186,100 +149,15 @@ class PlanClarificationIntentClassifier:
         return ClarificationIntentResult(
             is_clarification_reply=confidence >= threshold,
             confidence=confidence,
-            source="spacy",
-            model_name=self._loaded_model_name,
+            source=self._CLASSIFIER_NAME,
+            model_name=self._CLASSIFIER_NAME,
             sanitized_reply=sanitized_reply,
             sanitized_root_prompt=sanitized_root,
         )
 
-    def _ensure_model_loaded(self) -> Any:
-        if self._load_attempted:
-            return self._nlp
-        self._load_attempted = True
-        try:
-            # Patch pydantic.v1 to handle Python 3.14 compatibility issue in confection
-            try:
-                import pydantic.v1.main
-                
-                # Only patch if not already patched
-                if not getattr(pydantic.v1.main.ModelMetaclass, "_patched_for_regex", False):
-                    original_new = pydantic.v1.main.ModelMetaclass.__new__
-                    
-                    def patched_new(mcs, name, bases, namespace, **kwargs):
-                        try:
-                            return original_new(mcs, name, bases, namespace, **kwargs)
-                        except TypeError as e:
-                            if 'unable to infer type for attribute "REGEX"' in str(e):
-                                # Define explicit type for REGEX to satisfy pydantic
-                                if "REGEX" in namespace:
-                                    # Fallback: remove the problematic attribute from validation
-                                    # or allow it to be ignored by not calling super new if possible,
-                                    # but we need a class.
-                                    # Better approach: modify namespace before calling original
-                                    namespace["__annotations__"] = namespace.get("__annotations__", {})
-                                    namespace["__annotations__"]["REGEX"] = Any
-                                    return original_new(mcs, name, bases, namespace, **kwargs)
-                            raise
-
-                    # Since __new__ is a static method on the metaclass, we wrap it properly
-                    # Actually, pydantic.v1.main.ModelMetaclass is a type.
-                    # We need to patch the method on the class.
-                    pydantic.v1.main.ModelMetaclass.__new__ = patched_new  # type: ignore
-                    pydantic.v1.main.ModelMetaclass._patched_for_regex = True  # type: ignore
-            except ImportError:
-                pass
-
-            import spacy
-        except Exception as exc:  # pragma: no cover - import path is environment-specific
-            self._load_error = f"spacy import failed: {exc}"
-            return None
-
-        for model_name in self._model_candidates:
-            try:
-                self._nlp = spacy.load(model_name)
-                self._loaded_model_name = model_name
-                self._load_error = None
-                return self._nlp
-            except Exception:
-                continue
-        self._load_error = "no configured spaCy model is installed"
-        return None
-
-    @staticmethod
-    def _safe_similarity(doc_a: Any, doc_b: Any) -> float:
-        has_vector_a = bool(getattr(doc_a, "has_vector", False))
-        has_vector_b = bool(getattr(doc_b, "has_vector", False))
-        if not has_vector_a or not has_vector_b:
-            return 0.0
-        vector_norm_a = float(getattr(doc_a, "vector_norm", 0.0) or 0.0)
-        vector_norm_b = float(getattr(doc_b, "vector_norm", 0.0) or 0.0)
-        if vector_norm_a <= 0.0 or vector_norm_b <= 0.0:
-            return 0.0
-        try:
-            value = float(doc_a.similarity(doc_b))
-        except Exception:
-            return 0.0
-        if value != value:  # NaN check
-            return 0.0
-        return max(0.0, min(1.0, value))
-
     @staticmethod
     def _token_set(text: str) -> set[str]:
         return set(_TOKEN_PATTERN.findall(text.lower()))
-
-    @staticmethod
-    def _lemma_set(doc: Any) -> set[str]:
-        values: set[str] = set()
-        for token in doc:
-            lemma = str(getattr(token, "lemma_", "")).strip().lower()
-            if len(lemma) < 3:
-                continue
-            if not lemma.isalpha():
-                continue
-            if bool(getattr(token, "is_stop", False)):
-                continue
-            values.add(lemma)
-        return values
 
     @staticmethod
     def _specificity_signal(*, reply: str, pending_dimension: str | None) -> tuple[float, bool]:
@@ -304,21 +182,17 @@ class PlanClarificationIntentClassifier:
         return specificity, False
 
     @staticmethod
-    def _imperative_topic_shift_penalty(
-        *,
-        reply_doc: Any,
-        lemma_overlap_root: float,
-        lemma_overlap_dim: float,
-    ) -> float:
-        if not reply_doc:
+    def _new_task_penalty(*, reply: str, semantic_relevance: float) -> float:
+        normalized = reply.strip().lower()
+        if not normalized:
             return 0.0
-        first = reply_doc[0]
-        first_pos = str(getattr(first, "pos_", "")).upper()
-        if first_pos not in {"VERB", "AUX"}:
+        if semantic_relevance >= 0.20:
             return 0.0
-        if lemma_overlap_root >= 0.15 or lemma_overlap_dim >= 0.15:
-            return 0.0
-        return 0.20
+        if _QUESTION_WORD_PATTERN.match(normalized):
+            return 0.32
+        if _NEW_TASK_PREFIX_PATTERN.match(normalized):
+            return 0.28
+        return 0.0
 
     @staticmethod
     def _dimension_hint(pending_dimension: str | None) -> str:
@@ -349,5 +223,3 @@ class PlanClarificationIntentClassifier:
         if "\n" in reply:
             base = min(1.0, base + 0.06)
         return base
-
-

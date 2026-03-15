@@ -63,13 +63,28 @@ def test_search_files_excludes_noisy_spotlight_paths(tmp_path: Path) -> None:
     assert str(noisy_file.resolve()) not in matches
 
 
-def test_search_files_semantic_extension_boosts_document_types(tmp_path: Path) -> None:
+def test_search_files_semantic_extension_boosts_document_types(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     executor = _make_executor(tmp_path)
     report_pdf = tmp_path / "Reports" / "project_overview.pdf"
     report_bin = tmp_path / "Reports" / "project_overview.bin"
     report_pdf.parent.mkdir(parents=True, exist_ok=True)
     report_pdf.write_text("pdf")
     report_bin.write_text("bin")
+
+    # Mock Spotlight to return both files so the scoring pipeline runs
+    monkeypatch.setattr(
+        executor,
+        "_search_spotlight",
+        lambda **_kwargs: (
+            [
+                executor._make_search_metadata(report_pdf, score=100, source="spotlight"),
+                executor._make_search_metadata(report_bin, score=100, source="spotlight"),
+            ],
+            2,
+        ),
+    )
 
     result = executor.execute(
         "search_files",
@@ -82,45 +97,7 @@ def test_search_files_semantic_extension_boosts_document_types(tmp_path: Path) -
     assert by_path[str(report_pdf.resolve())] > by_path[str(report_bin.resolve())]
 
 
-def test_read_text_respects_byte_range(tmp_path: Path) -> None:
-    executor = _make_executor(tmp_path)
-    file_path = tmp_path / "story.txt"
-    file_path.write_text("abcdefg")
 
-    result = executor.execute(
-        "read_text",
-        {"path": str(file_path), "byte_range": [1, 4]},
-    )
-
-    assert result["ok"] is True
-    output = result["output"]
-    assert output["byte_range"] == [1, 4]
-    assert output["content"] == "bcd"
-
-
-def test_read_text_byte_range_avoids_full_file_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    executor = _make_executor(tmp_path)
-    file_path = tmp_path / "large_story.txt"
-    file_path.write_text("0123456789" * 100)
-    original_read_bytes = Path.read_bytes
-    target = file_path.resolve()
-
-    def _guarded_read_bytes(self: Path) -> bytes:
-        if self.resolve() == target:
-            raise AssertionError("read_bytes should not be called for ranged reads")
-        return original_read_bytes(self)
-
-    monkeypatch.setattr(Path, "read_bytes", _guarded_read_bytes)
-
-    result = executor.execute(
-        "read_text",
-        {"path": str(file_path), "byte_range": [10, 15]},
-    )
-
-    assert result["ok"] is True
-    output = result["output"]
-    assert output["byte_range"] == [10, 15]
-    assert output["content"] == "01234"
 
 
 def test_plan_and_apply_ops_move_file(tmp_path: Path) -> None:

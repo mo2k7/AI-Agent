@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  NotesPanelController.swift
 //  AIAgentUI
@@ -197,3 +198,4 @@ extension NotesPanelController: NSWindowDelegate {
         }
     }
 }
+#endif

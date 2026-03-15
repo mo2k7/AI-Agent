@@ -11,7 +11,11 @@ import Foundation
 /// Represents a note in the session's notes panel.
 struct Note: Identifiable, Equatable, Sendable {
     let id: String          // note_id from backend
+    var title: String
     var content: String
+    var workspaceKind: String
+    var isDefaultTab: Bool
+    var tabOrder: Int
     var isPinned: Bool
     let source: String      // "user" or "agent"
     let createdAt: Date
@@ -19,6 +23,13 @@ struct Note: Identifiable, Equatable, Sendable {
 
     /// Whether the note was created by the AI agent.
     var isAgentCreated: Bool { source == "agent" }
+    var isSessionPad: Bool { workspaceKind == "session_pad" || isDefaultTab }
+    var displayTitle: String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        if isSessionPad { return "Session Notes" }
+        return "Untitled Tab"
+    }
 
     /// Extracts the note type from an embedded `<!-- note-type:xxx -->` HTML comment.
     var noteType: String? {
@@ -74,7 +85,11 @@ struct Note: Identifiable, Equatable, Sendable {
 /// Decodable representation of a note from the backend JSON-RPC response.
 struct IPCNote: Decodable {
     let noteId: String
+    let title: String
     let content: String
+    let workspaceKind: String
+    let isDefaultTab: Bool
+    let tabOrder: Int
     let isPinned: Bool
     let source: String
     let createdAt: Double
@@ -82,7 +97,11 @@ struct IPCNote: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case noteId = "note_id"
+        case title
         case content
+        case workspaceKind = "workspace_kind"
+        case isDefaultTab = "is_default_tab"
+        case tabOrder = "tab_order"
         case isPinned = "is_pinned"
         case source
         case createdAt = "created_at"
@@ -93,7 +112,11 @@ struct IPCNote: Decodable {
     func toNote() -> Note {
         Note(
             id: noteId,
+            title: title,
             content: content,
+            workspaceKind: workspaceKind,
+            isDefaultTab: isDefaultTab,
+            tabOrder: tabOrder,
             isPinned: isPinned,
             source: source,
             createdAt: Date(timeIntervalSince1970: createdAt),

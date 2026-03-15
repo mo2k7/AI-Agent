@@ -57,6 +57,50 @@ struct LiquidGlassModifier: ViewModifier {
     }
 }
 
+// MARK: - Section Fade Modifier
+
+/// Adds a gradient fade at a specified edge to blend sections seamlessly
+struct SectionFadeModifier: ViewModifier {
+    var edge: Edge
+    var height: CGFloat
+    var color: Color
+
+    func body(content: Content) -> some View {
+        content.overlay(alignment: edgeAlignment) {
+            LinearGradient(
+                colors: gradientColors,
+                startPoint: startPoint,
+                endPoint: endPoint
+            )
+            .frame(height: height)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var edgeAlignment: Alignment {
+        edge == .top ? .top : .bottom
+    }
+
+    private var gradientColors: [Color] {
+        switch edge {
+        case .top:
+            return [color, .clear]
+        case .bottom:
+            return [.clear, color]
+        default:
+            return [.clear, color]
+        }
+    }
+
+    private var startPoint: UnitPoint {
+        edge == .top ? .top : .top
+    }
+
+    private var endPoint: UnitPoint {
+        edge == .top ? .bottom : .bottom
+    }
+}
+
 // MARK: - Glass Card Modifier
 
 /// Applies a subtle glass card effect for inner components
@@ -142,6 +186,40 @@ struct GlassInputStyle: TextFieldStyle {
 // MARK: - View Extensions
 
 extension View {
+    /// Deepest glass layer for panel shells and overlay frames.
+    /// On macOS this applies rounded corners, border stroke, and drop shadow for the floating panel.
+    /// On iOS this applies the material background without clipping or shadow since the root view is full-screen.
+    func glassBase(cornerRadius: CGFloat = ThemeConstants.cornerRadiusLarge) -> some View {
+        #if os(macOS)
+        self
+            .background(.ultraThinMaterial)
+            .background(LinearGradient.glassGradient.opacity(0.9))
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .stroke(Color.glassStroke.opacity(DepthLevel.base.strokeOpacity), lineWidth: 1)
+            )
+            .shadow(
+                color: DepthLevel.base.shadowColor,
+                radius: DepthLevel.base.shadowRadius,
+                x: 0,
+                y: DepthLevel.base.shadowY
+            )
+        #else
+        self
+            .background(.ultraThinMaterial)
+            .background(LinearGradient.glassGradient.opacity(0.9))
+        #endif
+    }
+
+    /// Full-screen glass background for the iOS root container.
+    /// Applies the material + gradient without rounded corners, clipping, or shadow.
+    func iosFullScreenBase() -> some View {
+        self
+            .background(.ultraThinMaterial)
+            .background(LinearGradient.glassGradient.opacity(0.9))
+    }
+
     
     /// Applies the liquid glass effect
     /// - Parameters:
@@ -177,9 +255,102 @@ extension View {
         ))
     }
     
+    /// Glass surface depth (middle layer — message bubbles, content cards)
+    func glassSurface(cornerRadius: CGFloat = ThemeConstants.cornerRadiusMedium) -> some View {
+        self
+            .background(.thinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .stroke(Color.glassStroke.opacity(DepthLevel.surface.strokeOpacity), lineWidth: 0.8)
+            )
+            .shadow(
+                color: DepthLevel.surface.shadowColor,
+                radius: DepthLevel.surface.shadowRadius,
+                x: 0,
+                y: DepthLevel.surface.shadowY
+            )
+    }
+
+    /// Glass floating depth (top layer — interactive elements, chips, popovers)
+    func glassFloating(cornerRadius: CGFloat = ThemeConstants.cornerRadiusSmall) -> some View {
+        self
+            .background(.regularMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .stroke(Color.glassStroke.opacity(DepthLevel.floating.strokeOpacity), lineWidth: 1)
+            )
+            .shadow(
+                color: DepthLevel.floating.shadowColor,
+                radius: DepthLevel.floating.shadowRadius,
+                x: 0,
+                y: DepthLevel.floating.shadowY
+            )
+    }
+
+    /// Adds a gradient fade at the specified edge to blend sections
+    func sectionFade(
+        edge: Edge = .bottom,
+        height: CGFloat = 6,
+        color: Color = Color.glassShadow.opacity(0.06)
+    ) -> some View {
+        modifier(SectionFadeModifier(edge: edge, height: height, color: color))
+    }
+
     /// Applies a hover effect for interactive elements
     func hoverEffect() -> some View {
         self.contentShape(Rectangle())
+    }
+}
+
+// MARK: - Overlay Container
+
+/// Reusable overlay container for modal-like content on NSPanel.
+/// Uses ZStack pattern instead of .sheet() which is invisible on NSPanel with hidden titlebar.
+struct OverlayContainer<Content: View>: View {
+    @Binding var isPresented: Bool
+    var tapOutsideToDismiss: Bool = true
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard tapOutsideToDismiss else { return }
+                    isPresented = false
+                }
+
+            VStack(spacing: 0) {
+                HStack {
+                    Spacer()
+                    Button(action: { isPresented = false }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Close")
+                }
+                .padding(.trailing, ThemeConstants.spacingM)
+                .padding(.top, ThemeConstants.spacingS)
+
+                content()
+            }
+            #if os(macOS)
+            .glassBase(cornerRadius: ThemeConstants.cornerRadiusLarge)
+            #else
+            .background(.ultraThinMaterial)
+            .background(LinearGradient.glassGradient.opacity(0.9))
+            .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusLarge))
+            .contentShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusLarge))
+            .padding(.horizontal, ThemeConstants.spacingM)
+            .padding(.vertical, ThemeConstants.spacingXL)
+            #endif
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.95)))
     }
 }
 

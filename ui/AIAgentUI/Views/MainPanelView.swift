@@ -30,6 +30,9 @@ struct MainPanelView: View {
     // MARK: - State
     
     @ObservedObject var appState: AppState
+    @ObservedObject var chatState: ChatState = .shared
+    @ObservedObject var themeState: UIThemeState = .shared
+    @ObservedObject var connectionState: ConnectionState = .shared
     @ObservedObject var permissionsManager = PermissionsManager.shared
     @State private var showSettingsSheet = false
     @State private var showRenameSessionSheet = false
@@ -40,6 +43,8 @@ struct MainPanelView: View {
     @State private var pendingSessionDeleteTarget: SessionDeleteTarget?
     @State private var isSessionDeleteDialogPresented = false
     @State private var isDeletingSelectedSessions = false
+    @State private var isHeaderHovered = false
+    @State private var pendingHeaderHideTask: Task<Void, Never>?
     
     // MARK: - Body
     
@@ -52,19 +57,16 @@ struct MainPanelView: View {
             VStack(spacing: 0) {
                 // Header
                 headerView
-                
-                Divider()
-                    .background(Color.glassStroke)
-                
-                // Content area
-                contentArea
+                    .sectionFade(edge: .bottom, height: 6)
 
-                Divider()
-                    .background(Color.glassStroke)
-                
+                // Content area
+                MainContentAreaView(appState: appState)
+
                 // Input area
-                inputArea
+                MainInputAreaView(appState: appState, isFileDropTargeted: $isFileDropTargeted)
+                    .sectionFade(edge: .top, height: 8)
             }
+            #if os(macOS)
             .frame(
                 minWidth: ThemeConstants.panelMinWidth,
                 idealWidth: ThemeConstants.panelWidth,
@@ -73,7 +75,7 @@ struct MainPanelView: View {
                 idealHeight: ThemeConstants.panelHeight,
                 maxHeight: .infinity
             )
-            .liquidGlass()
+            .glassBase()
             .overlay(
                 RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
                     .stroke(
@@ -81,6 +83,10 @@ struct MainPanelView: View {
                         lineWidth: 2
                     )
             )
+            #else
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.panelBackground)
+            #endif
             .onDrop(
                 of: [UTType.fileURL.identifier],
                 isTargeted: $isFileDropTargeted,
@@ -97,18 +103,31 @@ struct MainPanelView: View {
 
             // Startup overlay (shown during initialization — on top of permissions)
             StartupOverlay(appState: appState)
-        }
-        // NOTE: These sheets may also be invisible on NSPanel with hidden titlebar.
-        // Convert to ZStack overlays if users report frozen UI when opening settings/sessions.
-        // For now, users can press Escape to dismiss these sheets.
-        .sheet(isPresented: $showSettingsSheet) {
-            InlineSettingsView(appState: appState, isPresented: $showSettingsSheet)
-        }
-        .sheet(isPresented: $showRenameSessionSheet) {
-            renameSessionSheet
-        }
-        .sheet(isPresented: $showSessionManagerSheet) {
-            sessionManagerSheet
+
+            if let timeoutNotice = appState.requestTimeoutNotice {
+                timeoutOverlay(timeoutNotice)
+            }
+
+            // Settings overlay (ZStack instead of .sheet() — NSPanel .sheet() can be invisible)
+            if showSettingsSheet {
+                OverlayContainer(isPresented: $showSettingsSheet) {
+                    InlineSettingsView(appState: appState, isPresented: $showSettingsSheet)
+                }
+            }
+
+            // Rename session overlay
+            if showRenameSessionSheet {
+                OverlayContainer(isPresented: $showRenameSessionSheet) {
+                    renameSessionSheet
+                }
+            }
+
+            // Session manager overlay
+            if showSessionManagerSheet {
+                OverlayContainer(isPresented: $showSessionManagerSheet) {
+                    sessionManagerSheet
+                }
+            }
         }
         .alert(
             "Approve Destructive Operation",
@@ -147,129 +166,82 @@ struct MainPanelView: View {
     // MARK: - Header View
     
     private var headerView: some View {
-        HStack(spacing: ThemeConstants.spacingS) {
-            // App icon
-            Image(systemName: "brain")
-                .font(.system(size: 18))
-                .foregroundColor(.primaryBlue)
-            
-            Text("AI Agent")
-                .font(.headline)
-                .foregroundColor(.textPrimary)
-
-            Text(appState.activeSessionTitle)
-                .font(.caption2)
-                .foregroundColor(.textSecondary)
-                .lineLimit(1)
-                .frame(maxWidth: 160, alignment: .leading)
-
-            executionModeBadge
-            deepThinkBadge
-            
+        VStack(spacing: 0) {
+            #if os(iOS)
+            // Extra top padding on iOS to clear the status bar / notch / Dynamic Island
             Spacer()
-            
-            // Permission indicator (if missing permissions)
-            if !permissionsManager.allPermissionsGranted {
-                PermissionIndicator()
+                .frame(height: 0)
+                .safeAreaInset(edge: .top) { Color.clear.frame(height: 0) }
+            #endif
+
+            // Primary bar — always visible
+            HStack(alignment: .center, spacing: ThemeConstants.spacingS) {
+                // Status-reactive app icon (replaces static brain + connection dot)
+                AmbientAppIcon(status: chatState.status, isConnected: connectionState.isConnected)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("AI Agent")
+                        .font(.headline)
+                        .foregroundColor(.textPrimary)
+                    Text(appState.activeSessionTitle)
+                        .font(.caption2)
+                        .foregroundColor(.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Spacer()
+
+                // Permission indicator (if missing permissions)
+                if !permissionsManager.allPermissionsGranted {
+                    PermissionIndicator()
+                }
+
+                // Notes toggle
+                Button(action: { appState.toggleNotesPanel() }) {
+                    Image(systemName: appState.isNotesPanelVisible ? "note.text" : "note.text.badge.plus")
+                        .font(.system(size: 13))
+                        .foregroundColor(appState.isNotesPanelVisible ? .primaryBlue : .textSecondary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(
+                                    (appState.isNotesPanelVisible ? Color.primaryBlue : Color.cardBackground)
+                                        .opacity(appState.isNotesPanelVisible ? 0.14 : 0.42)
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Notes (Cmd+Shift+N)")
+
+                // Menu button
+                menuButton
             }
-            
-            // Notes toggle
-            Button(action: { appState.toggleNotesPanel() }) {
-                Image(systemName: appState.isNotesPanelVisible ? "note.text" : "note.text.badge.plus")
-                    .font(.system(size: 13))
-                    .foregroundColor(appState.isNotesPanelVisible ? .primaryBlue : .textSecondary)
-            }
-            .buttonStyle(.plain)
-            .help("Toggle Notes (Cmd+Shift+N)")
-
-            // Connection status
-            connectionIndicator
-
-            // Menu button
-            menuButton
-        }
-        .padding(.horizontal, ThemeConstants.spacingM)
-        .padding(.vertical, ThemeConstants.spacingS)
-        .background(Color.clear)
-    }
-    
-    private var connectionIndicator: some View {
-        HStack(spacing: ThemeConstants.spacingXS) {
-            Circle()
-                .fill(appState.isConnected ? Color.statusComplete : Color.statusError)
-                .frame(width: 8, height: 8)
-            
-            Text(appState.isConnected ? "Connected" : "Disconnected")
-                .font(.caption)
-                .foregroundColor(.textSecondary)
-        }
-    }
-
-    private var executionModeBadge: some View {
-        Text(appState.executionMode.badgeText)
-            .font(.caption2.monospaced())
-            .fontWeight(.semibold)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
+            .padding(.horizontal, ThemeConstants.spacingM)
+            .padding(.vertical, ThemeConstants.spacingS)
             .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(executionModeBadgeBackground)
+                LinearGradient(
+                    colors: [Color.white.opacity(0.05), Color.clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
             )
-            .foregroundColor(executionModeBadgeForeground)
-    }
 
-    private var executionModeBadgeForeground: Color {
-        switch appState.executionMode {
-        case .plan:
-            return .orange
-        case .teacher:
-            return .statusComplete
-        case .direct:
-            return .primaryBlue
+            // Hover-reveal badge tray
+            HeaderContextTray(appState: appState, isVisible: isHeaderHovered)
         }
-    }
-
-    private var executionModeBadgeBackground: Color {
-        switch appState.executionMode {
-        case .plan:
-            return Color.orange.opacity(0.22)
-        case .teacher:
-            return Color.statusComplete.opacity(0.2)
-        case .direct:
-            return Color.primaryBlue.opacity(0.18)
+        .background(Color.clear)
+        #if os(macOS)
+        .onHover { hovering in
+            setHeaderHover(hovering)
         }
-    }
-
-    private var deepThinkBadge: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "brain")
-                .font(.system(size: 10, weight: .semibold))
-            Text(appState.deepThinkEnabled ? "DEEP THINK ON" : "DEEP THINK OFF")
-                .font(.caption2.monospaced())
-                .fontWeight(.semibold)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(
-            RoundedRectangle(cornerRadius: 5)
-                .fill(deepThinkBadgeBackground)
-        )
-        .foregroundColor(deepThinkBadgeForeground)
-        .help(
-            appState.deepThinkEnabled
-                ? "Deep Think is enabled for new prompts."
-                : "Deep Think is disabled for new prompts."
-        )
-    }
-
-    private var deepThinkBadgeForeground: Color {
-        appState.deepThinkEnabled ? .statusThinking : .textTertiary
-    }
-
-    private var deepThinkBadgeBackground: Color {
-        appState.deepThinkEnabled ? Color.statusThinking.opacity(0.15) : Color.cardBackground.opacity(0.55)
+        #endif
     }
     
+    // Badge properties moved to HeaderContextTray.swift
+    // Connection indicator embedded in AmbientAppIcon.swift
+
     private var menuButton: some View {
         Menu {
             Button(action: { Task { await appState.createNewSession() } }) {
@@ -335,13 +307,13 @@ struct MainPanelView: View {
 
             // Model submenu for quick selection
             Menu {
-                ForEach(GeminiModel.allCases) { model in
+                ForEach(appState.modelSelectionOptions) { model in
                     Button(action: {
-                        appState.setSelectedModel(model)
+                        appState.setSelectedModel(model.id)
                     }) {
                         HStack {
-                            Text(model.displayName)
-                            if appState.selectedModel == model {
+                            Text(model.resolvedDisplayName)
+                            if appState.selectedModelId == model.id {
                                 Image(systemName: "checkmark")
                             }
                         }
@@ -382,11 +354,11 @@ struct MainPanelView: View {
             Menu {
                 ForEach(ResponsePresentationStyle.allCases) { style in
                     Button(action: {
-                        appState.setResponsePresentationStyle(style)
+                        themeState.responsePresentationStyle = style
                     }) {
                         HStack {
                             Text(style.displayName)
-                            if appState.responsePresentationStyle == style {
+                            if themeState.responsePresentationStyle == style {
                                 Image(systemName: "checkmark")
                             }
                         }
@@ -396,35 +368,58 @@ struct MainPanelView: View {
                 Divider()
 
                 Button(action: {
-                    appState.setReadableProHighContrastEnabled(!appState.readableProHighContrastEnabled)
+                    themeState.readableProHighContrastEnabled.toggle()
                 }) {
                     HStack {
                         Text("Readable Pro High Contrast")
-                        if appState.readableProHighContrastEnabled {
+                        if themeState.readableProHighContrastEnabled {
                             Image(systemName: "checkmark")
                         }
                     }
                 }
-                .disabled(appState.responsePresentationStyle != .readablePro)
+                .disabled(themeState.responsePresentationStyle != .readablePro)
             } label: {
-                Label("Format: \(appState.responsePresentationStyle.displayName)", systemImage: "textformat")
+                Label("Format: \(themeState.responsePresentationStyle.displayName)", systemImage: "textformat")
             }
 
             Menu {
                 ForEach(StreamingAnimationStyle.allCases) { style in
                     Button(action: {
-                        appState.setStreamingAnimationStyle(style)
+                        themeState.streamingAnimationStyle = style
                     }) {
                         HStack {
                             Text(style.displayName)
-                            if appState.streamingAnimationStyle == style {
+                            if themeState.streamingAnimationStyle == style {
                                 Image(systemName: "checkmark")
                             }
                         }
                     }
                 }
             } label: {
-                Label("Animation: \(appState.streamingAnimationStyle.displayName)", systemImage: "sparkles")
+                Label("Animation: \(themeState.streamingAnimationStyle.displayName)", systemImage: "sparkles")
+            }
+
+            Menu {
+                ForEach(BrowseRestrictionProfile.allCases) { profile in
+                    Button(action: {
+                        appState.setBrowseRestrictionProfile(profile)
+                    }) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(profile.displayName)
+                                Text(profile.quickMenuDescription)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            if appState.browseRestrictionProfile == profile {
+                                Spacer(minLength: ThemeConstants.spacingS)
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label("Web Browsing: \(appState.browseRestrictionProfile.displayName)", systemImage: "globe")
             }
 
             Menu {
@@ -467,13 +462,40 @@ struct MainPanelView: View {
             Image(systemName: "ellipsis.circle")
                 .font(.system(size: 18))
                 .foregroundColor(.textSecondary)
+                .frame(width: 28, height: 28)
+                .background(
+                    Circle()
+                        .fill(Color.cardBackground.opacity(0.42))
+                )
         }
+        #if os(macOS)
         .menuStyle(.borderlessButton)
+        #endif
         .menuIndicator(.hidden)
+        // Force Menu recreation when relevant state changes — fixes iOS UIContextMenuInteraction
+        // caching stale content (the _UIReparentingView issue)
+        .id(menuIdentityKey)
+    }
+
+    /// Combined identity key for the 3-dots Menu so iOS recreates it on state changes.
+    private var menuIdentityKey: String {
+        [
+            appState.selectedModelId,
+            appState.memoryMode.rawValue,
+            appState.responseVerbosity.rawValue,
+            appState.executionMode.rawValue,
+            appState.deepThinkEnabled.description,
+            appState.browseRestrictionProfile.rawValue,
+            themeState.responsePresentationStyle.rawValue,
+            themeState.streamingAnimationStyle.rawValue,
+            themeState.readableProHighContrastEnabled.description,
+            appState.activeSessionId,
+            String(appState.sessions.count),
+        ].joined(separator: "|")
     }
     
     private var currentModelDisplayName: String {
-        appState.selectedModel.displayName
+        appState.selectedModel.resolvedDisplayName
     }
 
     private var renameSessionSheet: some View {
@@ -625,184 +647,71 @@ struct MainPanelView: View {
         .frame(minWidth: 520, minHeight: 380)
     }
     
-    // MARK: - Content Area
-    
-    @ViewBuilder
-    private var contentArea: some View {
-        if appState.isSessionHistoryLoading {
-            SessionHistoryLoadingView()
-        } else if appState.messages.isEmpty {
-            EmptyMessageView()
-        } else {
-            MessageListView(
-                messages: appState.messages,
-                sessionId: appState.activeSessionId
-            )
-        }
-    }
-    
-    // MARK: - Input Area
-    
-    private var inputArea: some View {
-        VStack(spacing: ThemeConstants.spacingXS) {
-            // Error message if present
-            if let error = appState.lastError, appState.status.isError {
-                errorBanner(error)
-            }
+    // MARK: - Content Area & Input Area Extracted
+    // The implementations of contentArea and inputArea have been moved to isolated structs
+    // to prevent ChatState high-frequency updates from invalidating the root MainPanelView.
 
-            if isFileDropTargeted {
-                HStack(spacing: ThemeConstants.spacingS) {
-                    Image(systemName: "square.and.arrow.down")
-                        .foregroundColor(.primaryBlue)
-                    Text("Drop files to attach them to this request")
+
+
+    private func timeoutOverlay(_ notice: RequestTimeoutNotice) -> some View {
+        VStack {
+            Spacer()
+            HStack(spacing: ThemeConstants.spacingS) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Request Timed Out")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.textPrimary)
+                    Text(notice.userMessage)
                         .font(.caption)
                         .foregroundColor(.textSecondary)
-                    Spacer()
-                }
-                .padding(ThemeConstants.spacingS)
-                .background(Color.primaryBlue.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall))
-            }
-
-            if !appState.droppedFilePaths.isEmpty {
-                droppedFilesSection
-            }
-
-            executionModeInfoBanner
-            
-            // Input field
-            InputField(
-                text: $appState.currentInput,
-                placeholder: inputPlaceholderText,
-                isDisabled: appState.status.isBusy || appState.isSendingPrompt || appState.isSessionHistoryLoading,
-                onSubmit: {
-                    Task {
-                        await appState.sendPrompt()
-                    }
-                }
-            )
-        }
-        .padding(ThemeConstants.spacingM)
-        .transaction { $0.animation = nil }
-    }
-
-    private var inputPlaceholderText: String {
-        switch appState.executionMode {
-        case .plan:
-            return "Describe what to plan..."
-        case .teacher:
-            return "Ask a study question..."
-        case .direct:
-            return "Ask me anything..."
-        }
-    }
-
-
-
-    private var executionModeInfoBanner: some View {
-        let banner = executionModeBannerConfiguration
-        return HStack(spacing: ThemeConstants.spacingS) {
-            Image(systemName: banner.icon)
-                .foregroundColor(banner.foreground)
-            Text(banner.message)
-            .font(.caption)
-            .foregroundColor(.textSecondary)
-            Spacer(minLength: ThemeConstants.spacingS)
-        }
-        .padding(ThemeConstants.spacingS)
-        .background(banner.background)
-        .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall))
-    }
-
-    private var executionModeBannerConfiguration: (icon: String, foreground: Color, background: Color, message: String) {
-        switch appState.executionMode {
-        case .plan:
-            return (
-                "list.bullet.clipboard",
-                .orange,
-                Color.orange.opacity(0.12),
-                "Plan Mode: builds a plan only. No file-changing tools will execute."
-            )
-        case .teacher:
-            return (
-                "graduationcap.fill",
-                .statusComplete,
-                Color.statusComplete.opacity(0.12),
-                "Teacher Mode: teaches conversationally and auto-saves highlighted study notes."
-            )
-        case .direct:
-            return (
-                "bolt.fill",
-                .primaryBlue,
-                Color.primaryBlue.opacity(0.1),
-                "Direct Mode: can execute tools immediately (with destructive-operation confirmation)."
-            )
-        }
-    }
-
-    private var droppedFilesSection: some View {
-        VStack(alignment: .leading, spacing: ThemeConstants.spacingXS) {
-            HStack {
-                Text("Attached Paths (\(appState.droppedFilePaths.count))")
-                    .font(.caption)
-                    .foregroundColor(.textSecondary)
-                Spacer()
-                Button("Clear") {
-                    appState.clearDroppedFiles()
-                }
-                .font(.caption2)
-                .buttonStyle(.plain)
-                .foregroundColor(.statusError)
-            }
-
-            ForEach(appState.droppedFilePaths, id: \.self) { path in
-                HStack(spacing: ThemeConstants.spacingXS) {
-                    Image(systemName: "doc")
-                        .foregroundColor(.primaryBlue)
-                    Text(URL(fileURLWithPath: path).lastPathComponent)
+                        .lineLimit(3)
+                    Text("Phase: \(notice.phase)  •  Operation: \(notice.operation)")
                         .font(.caption2)
-                        .lineLimit(1)
-                        .foregroundColor(.textPrimary)
-                    Spacer(minLength: ThemeConstants.spacingXS)
-                    Text(path)
-                        .font(.caption2)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                         .foregroundColor(.textTertiary)
-                    Button(action: { appState.removeDroppedFile(path: path) }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.textTertiary)
-                    }
-                    .buttonStyle(.plain)
                 }
-            }
-        }
-        .padding(ThemeConstants.spacingS)
-        .background(Color.cardBackground.opacity(0.65))
-        .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall))
-    }
-    
-    private func errorBanner(_ message: String) -> some View {
-        HStack(spacing: ThemeConstants.spacingS) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.statusError)
-            
-            Text(message)
+                Spacer()
+                Button("Dismiss") {
+                    appState.dismissRequestTimeoutNotice()
+                }
                 .font(.caption)
-                .foregroundColor(.statusError)
-            
-            Spacer()
-            
-            Button(action: { appState.lastError = nil }) {
-                Image(systemName: "xmark")
-                    .font(.caption)
-                    .foregroundColor(.statusError)
+                .buttonStyle(.plain)
+                .foregroundColor(.primaryBlue)
             }
-            .buttonStyle(.plain)
+            .padding(ThemeConstants.spacingM)
+            .background(Color.cardBackground.opacity(0.95))
+            .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall))
+            .overlay(
+                RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
+                    .stroke(Color.statusError.opacity(0.35), lineWidth: 1)
+            )
+            .padding(.horizontal, ThemeConstants.spacingM)
+            .padding(.bottom, ThemeConstants.spacingM)
         }
-        .padding(ThemeConstants.spacingS)
-        .background(Color.statusError.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall))
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+        .animation(AnimationConstants.standard, value: notice.id)
+    }
+
+
+
+    private func setHeaderHover(_ hovering: Bool) {
+        pendingHeaderHideTask?.cancel()
+        pendingHeaderHideTask = nil
+
+        if hovering {
+            withAnimation(AnimationConstants.snappy) {
+                isHeaderHovered = true
+            }
+            return
+        }
+
+        pendingHeaderHideTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            withAnimation(AnimationConstants.fast) {
+                isHeaderHovered = false
+            }
+            pendingHeaderHideTask = nil
+        }
     }
 
     private var sessionDeleteDialogTitle: String {
@@ -911,8 +820,7 @@ struct MainPanelView: View {
 
     /// Opens the Settings window
     private func openSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        showSettingsSheet = true
     }
 }
 
@@ -1000,6 +908,8 @@ private struct SessionManagerRow: View {
 struct CompactPanelView: View {
     
     @ObservedObject var appState: AppState
+    @ObservedObject var connectionState: ConnectionState = .shared
+    @ObservedObject var chatState: ChatState = .shared
     
     var body: some View {
         VStack(spacing: 0) {
@@ -1010,17 +920,17 @@ struct CompactPanelView: View {
                 
                 Spacer()
                 
-                InlineStatusView(status: appState.status, isConnected: appState.isConnected)
+                InlineStatusView(status: chatState.status, isConnected: connectionState.isConnected)
             }
             .padding(.horizontal, ThemeConstants.spacingS)
             .padding(.vertical, ThemeConstants.spacingXS)
             
             // Messages (limited height)
-            if !appState.messages.isEmpty {
+            if !chatState.messageRows.isEmpty {
                 ScrollView {
                     LazyVStack(spacing: ThemeConstants.spacingS) {
-                        ForEach(appState.messages.suffix(3)) { message in
-                            ResponseBubble(message: message, animate: message.isStreaming)
+                        ForEach(chatState.messageRows.suffix(3)) { row in
+                            ResponseBubble(row: row, animate: row.isStreaming)
                         }
                     }
                     .padding(.horizontal, ThemeConstants.spacingS)
@@ -1030,9 +940,9 @@ struct CompactPanelView: View {
             
             // Input
             SimpleInputField(
-                text: $appState.currentInput,
+                text: $chatState.currentInput,
                 placeholder: "Ask...",
-                isDisabled: appState.status.isBusy || appState.isSendingPrompt || appState.isSessionHistoryLoading,
+                isDisabled: chatState.status.isBusy || appState.isSendingPrompt || appState.isSessionHistoryLoading,
                 onSubmit: {
                     Task {
                         await appState.sendPrompt()

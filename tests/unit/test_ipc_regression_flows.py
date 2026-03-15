@@ -17,6 +17,7 @@ import pytest
 from agent_host import main as main_module
 from agent_host.config import Config
 from agent_host.ipc.protocol import ErrorMessage
+from tests.unit.websocket_test_harness import connect_line_transport, reserve_tcp_port
 
 TEST_IPC_AUTH_TOKEN = "test-ipc-auth-token"
 
@@ -55,13 +56,14 @@ def _patch_reload_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-async def _wait_for_socket(path: Path, timeout_seconds: float = 5.0) -> None:
+async def _connect_transport(endpoint_url: str, timeout_seconds: float = 5.0):
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
-        if path.exists():
-            return
-        await asyncio.sleep(0.02)
-    raise TimeoutError(f"Socket did not appear in time: {path}")
+        try:
+            return await connect_line_transport(endpoint_url)
+        except OSError:
+            await asyncio.sleep(0.02)
+    raise TimeoutError(f"WebSocket endpoint did not become ready in time: {endpoint_url}")
 
 
 async def _authenticate_socket(
@@ -117,6 +119,26 @@ async def _running_server(
                         )
                     )
                 )
+            configured_model = kwargs.get("model_name")
+            if not hasattr(self, "model_name"):
+                self.model_name = configured_model or "gemini-test"
+
+        def resolve_text_model(self, requested_model: str | None = None) -> str:
+            if requested_model:
+                return requested_model
+            configured = getattr(self, "model_name", None)
+            if isinstance(configured, str) and configured.strip():
+                return configured
+            return "gemini-test"
+
+        def resolve_image_model(
+            self,
+            requested_model: str | None = None,
+            *,
+            require_generation: bool = False,
+        ) -> str:
+            del require_generation
+            return self.resolve_text_model(requested_model)
 
         def send_continuation(self, **kwargs: object) -> dict[str, object]:
             base_impl = getattr(gemini_client_cls, "send_continuation", None)
@@ -133,7 +155,8 @@ async def _running_server(
     workspace = search_root or (tmp_path / "workspace")
     workspace.mkdir(parents=True, exist_ok=True)
 
-    socket_path = Path(f"/tmp/ai-agent-regression-{uuid.uuid4().hex[:10]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -145,12 +168,11 @@ async def _running_server(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         try:
             await _authenticate_socket(reader, writer)
             yield reader, writer, workspace
@@ -161,8 +183,6 @@ async def _running_server(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 async def _send_request(
@@ -218,8 +238,8 @@ async def _read_result_for_request(
 
 
 async def _create_session_via_socket(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
+    reader,
+    writer,
 ) -> str:
     """Create a session via socket RPC and return the session_id."""
     request_id = f"req-create-session-{uuid.uuid4().hex[:8]}"

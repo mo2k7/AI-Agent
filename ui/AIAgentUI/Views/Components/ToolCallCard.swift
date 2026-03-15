@@ -53,8 +53,6 @@ struct ToolCallCard: View {
             RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
                 .stroke(statusColor.opacity(0.5), lineWidth: 1)
         )
-        .animation(AnimationConstants.snappy, value: isExpanded)
-        .animation(AnimationConstants.fast, value: toolCall.status)
     }
     
     // MARK: - Subviews
@@ -298,8 +296,6 @@ struct ActiveToolCallView: View {
             RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusSmall)
                 .stroke(statusColor.opacity(0.55), lineWidth: 2)
         )
-        .animation(AnimationConstants.snappy, value: isExpanded)
-        .animation(AnimationConstants.fast, value: toolCall.status)
     }
 
     private var statusPrefix: String {

@@ -1,8 +1,8 @@
 """
-IPC Server for Unix Domain Socket communication with SwiftUI frontend.
+IPC Server for WebSocket communication with SwiftUI frontend.
 
 Provides an async server that:
-- Listens on a Unix Domain Socket
+- Listens on a WebSocket endpoint
 - Handles multiple client connections
 - Routes incoming requests to appropriate handlers
 - Sends streaming responses back to clients
@@ -13,12 +13,15 @@ import inspect
 import json
 import logging
 import os
-import stat
+import secrets
+import ssl
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Awaitable
 from dataclasses import dataclass
+from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 from agent_host.ipc.protocol import (
     IncomingRequest,
@@ -56,16 +59,50 @@ def _format_exception_message(exc: BaseException, *, fallback: str = "Internal s
     return f"{fallback} ({exc.__class__.__name__})"
 
 
+class _SlidingWindowRateLimiter:
+    """Per-client sliding-window rate limiter."""
+
+    _EXEMPT_METHODS = frozenset({"auth.hello", "ping"})
+
+    def __init__(self, max_requests: int, window_seconds: float):
+        if max_requests <= 0 or window_seconds <= 0:
+            raise ValueError("max_requests and window_seconds must be positive")
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+        self._windows: dict[str, list[float]] = {}
+
+    def check(self, client_id: str, method: str) -> bool:
+        """Return True if the request is allowed, False if rate-limited."""
+        if method in self._EXEMPT_METHODS:
+            return True
+        now = time.monotonic()
+        window = self._windows.get(client_id)
+        if window is None:
+            window = []
+            self._windows[client_id] = window
+        cutoff = now - self._window_seconds
+        # Prune expired entries
+        while window and window[0] < cutoff:
+            window.pop(0)
+        if len(window) >= self._max_requests:
+            return False
+        window.append(now)
+        return True
+
+    def remove_client(self, client_id: str) -> None:
+        """Remove tracking state for a disconnected client."""
+        self._windows.pop(client_id, None)
+
+
 @dataclass
 class ClientConnection:
     """Represents a connected client."""
-    
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+
+    websocket: ServerConnection
     address: str
     connected_at: float
     trace_outbound: Optional[Callable[[bytes], None]] = None
-    
+
     async def send(self, data: bytes) -> None:
         """Sends data to the client."""
         if self.trace_outbound is not None:
@@ -73,22 +110,17 @@ class ClientConnection:
                 self.trace_outbound(data)
             except Exception:
                 logger.exception("Outbound trace hook failed for client %s", self.address)
-        if self.writer.is_closing():
-            return
-        self.writer.write(data)
         try:
-            await self.writer.drain()
-        except (ConnectionError, BrokenPipeError):
+            await self.websocket.send(data)
+        except ConnectionClosed:
             # Client disconnected during write; ignore
             pass
-    
+
     async def close(self) -> None:
         """Closes the client connection."""
         try:
-            if not self.writer.is_closing():
-                self.writer.close()
-            await self.writer.wait_closed()
-        except (ConnectionError, BrokenPipeError, OSError):
+            await self.websocket.close()
+        except (ConnectionClosed, OSError):
             pass
 
 
@@ -99,7 +131,7 @@ DisconnectHandler = Callable[[ClientConnection], Awaitable[None] | None]
 
 class IPCServer:
     """
-    Unix Domain Socket server for SwiftUI frontend communication.
+    WebSocket server for SwiftUI frontend communication.
     
     Usage:
         server = IPCServer()
@@ -109,20 +141,16 @@ class IPCServer:
         await server.stop()
     """
     
-    # Default socket path template
-    DEFAULT_SOCKET_PATH = "/tmp/ai-agent-{pid}.sock"
-    
-    # Buffer size for reading
-    BUFFER_SIZE = 4096
-    # Hard cap for buffered request bytes awaiting newline delimiter.
-    # Increased to 16MB to support large context pastes/file content in prompts.
+    DEFAULT_HOST = os.environ.get("AI_AGENT_IPC_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    DEFAULT_PORT = 8765
     MAX_INCOMING_BUFFER = 16 * 1_048_576
     # Timeout for client handshake/first request to prevent resource exhaustion
     HANDSHAKE_TIMEOUT = 10.0
     
     def __init__(
         self,
-        socket_path: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         max_clients: int = 5,
         *,
         require_auth: bool = False,
@@ -133,19 +161,23 @@ class IPCServer:
         Initializes the IPC server.
         
         Args:
-            socket_path: Path to the Unix Domain Socket.
-                         Defaults to /tmp/ai-agent-<pid>.sock
+            host: Interface to bind the WebSocket server to.
+            port: TCP port to bind the WebSocket server to.
             max_clients: Maximum number of concurrent clients.
             require_auth: Whether to enforce auth.hello before any RPC method.
             auth_token: Shared auth token expected from the frontend.
             required_protocol_version: Required frontend protocol version.
         """
-        self._socket_path = socket_path or self.DEFAULT_SOCKET_PATH.format(pid=os.getpid())
+        self._host = (host or self.DEFAULT_HOST).strip() or self.DEFAULT_HOST
+        resolved_port = self.DEFAULT_PORT if port is None else int(port)
+        if resolved_port < 0 or resolved_port > 65535:
+            raise ValueError("WebSocket port must be between 0 and 65535")
+        self._port = resolved_port
         self._max_clients = max_clients
         self._require_auth = require_auth
         self._auth_token = (auth_token or "").strip()
         self._required_protocol_version = required_protocol_version
-        self._server: Optional[asyncio.Server] = None
+        self._server: Optional[Server] = None
         self._clients: dict[str, ClientConnection] = {}
         self._handlers: dict[str, RequestHandler] = {}
         self._disconnect_handler: Optional[DisconnectHandler] = None
@@ -163,11 +195,20 @@ class IPCServer:
             raise ValueError(
                 "IPC auth is required but no auth_token was configured."
             )
+        self._rate_limiter = _SlidingWindowRateLimiter(
+            max_requests=max(1, _safe_env_int("AI_AGENT_IPC_RATE_LIMIT", 30)),
+            window_seconds=max(1, _safe_env_int("AI_AGENT_IPC_RATE_WINDOW", 10)),
+        )
+        # Auth rotation: one-time tokens issued per auth.hello success.
+        self._active_rotation_tokens: dict[str, dict[str, object]] = {}
+        self._rotation_token_ttl_seconds = 3600.0
+        self._tls_enabled = False
     
     @property
-    def socket_path(self) -> str:
-        """Returns the socket path."""
-        return self._socket_path
+    def endpoint_url(self) -> str:
+        """Returns the bound WebSocket endpoint URL."""
+        scheme = "wss" if self._tls_enabled else "ws"
+        return f"{scheme}://{self._host}:{self._port}"
     
     @property
     def is_running(self) -> bool:
@@ -198,6 +239,42 @@ class IPCServer:
         """Register an optional callback invoked when a client disconnects."""
         self._disconnect_handler = handler
 
+    def _generate_rotation_token(self, client_id: str) -> str:
+        """Generate a one-time rotation token for a client."""
+        token = secrets.token_urlsafe(32)
+        self._active_rotation_tokens[token] = {
+            "client_id": client_id,
+            "created_at": time.monotonic(),
+        }
+        return token
+
+    def _consume_rotation_token(self, token: str) -> str | None:
+        """Consume a rotation token if valid and not expired.
+
+        Returns the associated client_id on success, None otherwise.
+        """
+        entry = self._active_rotation_tokens.pop(token, None)
+        if entry is None:
+            return None
+        created_at = entry["created_at"]
+        if not isinstance(created_at, (int, float)):
+            return None
+        elapsed = time.monotonic() - created_at
+        if elapsed > self._rotation_token_ttl_seconds:
+            logger.debug("Rotation token expired (%.1fs old)", elapsed)
+            return None
+        client_id = entry["client_id"]
+        return client_id if isinstance(client_id, str) else None
+
+    def _purge_rotation_tokens_for_client(self, client_id: str) -> None:
+        """Remove all rotation tokens associated with a client."""
+        to_remove = [
+            tok for tok, entry in self._active_rotation_tokens.items()
+            if entry.get("client_id") == client_id
+        ]
+        for tok in to_remove:
+            self._active_rotation_tokens.pop(tok, None)
+
     def _auth_feature_list(self) -> list[str]:
         """Return feature names exposed for version/auth negotiation."""
         base_features = {
@@ -211,81 +288,107 @@ class IPCServer:
         base_features.update(self._handlers.keys())
         return sorted(base_features)
 
-    def _build_auth_success_payload(self) -> str:
-        payload = {
+    def _build_auth_success_payload(
+        self, *, rotation_token: str | None = None
+    ) -> str:
+        payload: dict[str, object] = {
             "authenticated": True,
             "protocol_version": self._required_protocol_version,
             "features": self._auth_feature_list(),
         }
+        if rotation_token is not None:
+            payload["rotation_token"] = rotation_token
         return json.dumps(payload, ensure_ascii=False)
 
-    def _remove_socket_path_if_safe(self, *, strict: bool) -> None:
-        """
-        Remove the configured socket path only when it is an actual socket node.
-
-        When *strict* is True (startup path), encountering a non-socket existing
-        path is treated as a hard error to avoid destructive unlink behavior.
-        """
-        socket_path = Path(self._socket_path)
+    @staticmethod
+    def _is_allowed_ip(ip: str) -> bool:
+        """Check if an IP is from a trusted subnet (Tailscale, localhost, or private)."""
+        import ipaddress
         try:
-            entry_stat = socket_path.lstat()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            message = f"Unable to inspect socket path {socket_path}: {exc}"
-            if strict:
-                raise RuntimeError(message) from exc
-            logger.warning(message)
-            return
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
 
-        if not stat.S_ISSOCK(entry_stat.st_mode):
-            message = f"Refusing to remove non-socket path: {socket_path}"
-            if strict:
-                raise RuntimeError(message)
-            logger.warning(message)
-            return
+        # Localhost
+        if addr.is_loopback:
+            return True
 
-        try:
-            socket_path.unlink()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            message = f"Failed to remove stale socket path {socket_path}: {exc}"
-            if strict:
-                raise RuntimeError(message) from exc
-            logger.warning(message)
-    
+        # Tailscale CGNAT range: 100.64.0.0/10
+        tailscale_net = ipaddress.ip_network("100.64.0.0/10")
+        if addr in tailscale_net:
+            return True
+
+        # RFC 1918 private ranges (LAN)
+        if addr.is_private:
+            return True
+
+        return False
+
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """Build an SSL context from env-configured cert/key files.
+
+        Returns None (plain ws://) when certs are not configured.
+        Sets ``self._tls_enabled`` when TLS is active.
+        """
+        require_tls = os.environ.get("AI_AGENT_REQUIRE_TLS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        cert_path = os.environ.get("AI_AGENT_TLS_CERT", "").strip()
+        key_path = os.environ.get("AI_AGENT_TLS_KEY", "").strip()
+        if not cert_path or not key_path:
+            if require_tls:
+                raise RuntimeError("AI_AGENT_REQUIRE_TLS is set but TLS cert/key env vars are missing.")
+            return None
+        cert_file = Path(cert_path).expanduser().resolve(strict=False)
+        key_file = Path(key_path).expanduser().resolve(strict=False)
+        if not cert_file.is_file():
+            if require_tls:
+                raise RuntimeError(f"Required TLS cert file not found: {cert_file}")
+            logger.warning("TLS cert file not found: %s — falling back to plain ws://", cert_file)
+            return None
+        if not key_file.is_file():
+            if require_tls:
+                raise RuntimeError(f"Required TLS key file not found: {key_file}")
+            logger.warning("TLS key file not found: %s — falling back to plain ws://", key_file)
+            return None
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # ATS-compatible Forward Secrecy cipher suites
+        ctx.set_ciphers(
+            "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20"
+        )
+        ctx.load_cert_chain(str(cert_file), str(key_file))
+        self._tls_enabled = True
+        logger.info("TLS enabled with cert=%s", cert_file)
+        return ctx
+
     async def start(self) -> None:
         """Starts the IPC server."""
         if self._running:
             logger.warning("Server is already running")
             return
 
-        # Remove stale socket safely without unlinking arbitrary file types.
-        self._remove_socket_path_if_safe(strict=True)
-        
-        # Create the server with a restrictive umask so socket permissions are
-        # safe from the moment the path is created.
-        original_umask = os.umask(0o177)
-        try:
-            self._server = await asyncio.start_unix_server(
-                self._handle_client,
-                path=self._socket_path,
-            )
-        finally:
-            os.umask(original_umask)
-        
-        # Set socket permissions (owner read/write only)
-        try:
-            os.chmod(self._socket_path, 0o600)
-        except OSError as e:
-            logger.error(f"Failed to set socket permissions: {e}")
-            raise
-        
+        # Optional TLS for iOS ATS compliance; plain ws:// for local connections.
+        ssl_context = self._build_ssl_context()
+
+        self._server = await serve(
+            self._handle_client,
+            self._host,
+            self._port,
+            max_size=self.MAX_INCOMING_BUFFER,
+            open_timeout=self.HANDSHAKE_TIMEOUT,
+            ssl=ssl_context,
+        )
+        bound = self._server.sockets[0].getsockname()
+        self._host = str(bound[0])
+        self._port = int(bound[1])
         self._running = True
         self._shutdown_event.clear()
-        
-        logger.info(f"IPC Server started on {self._socket_path}")
+
+        logger.info("IPC Server started on %s", self.endpoint_url)
     
     async def stop(self) -> None:
         """Stops the IPC server and disconnects all clients."""
@@ -303,15 +406,13 @@ class IPCServer:
                 logger.error(f"Error closing client {client_id}: {e}")
         
         self._clients.clear()
-        
+        self._active_rotation_tokens.clear()
+
         # Close the server
         if self._server:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        
-        # Remove socket file if and only if the path is still a socket node.
-        self._remove_socket_path_if_safe(strict=False)
         
         self._shutdown_event.set()
         logger.info("IPC Server stopped")
@@ -389,24 +490,33 @@ class IPCServer:
     
     async def _handle_client(
         self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        websocket: ServerConnection,
     ) -> None:
         """Handles a new client connection."""
         # Generate client ID
-        client_id = f"client-{len(self._clients) + 1}-{id(writer)}"
+        client_id = f"client-{len(self._clients) + 1}-{id(websocket)}"
+
+        # Security: when bound to 0.0.0.0, restrict to Tailscale/local/private subnets
+        if self._host == "0.0.0.0":
+            remote_addr = websocket.remote_address
+            client_ip = remote_addr[0] if remote_addr else ""
+            if not self._is_allowed_ip(client_ip):
+                logger.warning(
+                    "Rejected connection from non-Tailscale IP: %s (client %s)",
+                    client_ip, client_id,
+                )
+                await websocket.close(code=1008, reason="Connection not allowed from this IP")
+                return
         
         # Check max clients
         if len(self._clients) >= self._max_clients:
             logger.warning(f"Max clients reached, rejecting {client_id}")
-            writer.close()
-            await writer.wait_closed()
+            await websocket.close(code=1013, reason="Max clients reached")
             return
         
         # Create client connection
         client = ClientConnection(
-            reader=reader,
-            writer=writer,
+            websocket=websocket,
             address=client_id,
             connected_at=asyncio.get_event_loop().time(),
             trace_outbound=lambda data: self._trace_message("out", client_id, data),
@@ -427,6 +537,8 @@ class IPCServer:
             logger.error(f"Error handling client {client_id}: {e}")
         finally:
             # Clean up
+            self._rate_limiter.remove_client(client_id)
+            self._purge_rotation_tokens_for_client(client_id)
             self._clients.pop(client_id, None)
             if self._disconnect_handler is not None:
                 try:
@@ -447,109 +559,65 @@ class IPCServer:
         client: ClientConnection,
     ) -> None:
         """Processes messages from a client."""
-        buffer = b""
         auth_complete = not self._require_auth
-        
+
         while self._running:
             try:
-                # Read data from client
-                # Use stricter timeout for initial handshake
                 timeout = self.HANDSHAKE_TIMEOUT if not auth_complete else 300.0
-                
-                data = await asyncio.wait_for(
-                    client.reader.read(self.BUFFER_SIZE),
-                    timeout=timeout,
-                )
-                
-                if not data:
-                    # Client disconnected
+                incoming = await asyncio.wait_for(client.websocket.recv(), timeout=timeout)
+                if incoming is None:
                     break
-                
-                # Add to buffer (bytes) and process newline-delimited messages
-                buffer += data
-                if len(buffer) > self.MAX_INCOMING_BUFFER:
-                    logger.warning(
-                        "Client %s exceeded max buffered request bytes (%s), closing connection",
-                        client_id,
-                        self.MAX_INCOMING_BUFFER,
+
+                if isinstance(incoming, bytes):
+                    payload = incoming
+                    try:
+                        message = incoming.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        logger.error("Invalid UTF-8 from %s: %s", client_id, exc)
+                        await client.send(ErrorMessage.parse_error("global", "Invalid UTF-8 in request").to_bytes())
+                        continue
+                else:
+                    message = incoming
+                    payload = incoming.encode("utf-8")
+
+                self._trace_message("in", client_id, payload)
+                request_id = self._extract_request_id(message)
+                try:
+                    request = IncomingRequest.from_json(message)
+                except json.JSONDecodeError as exc:
+                    logger.error("Invalid JSON from %s during framing/auth: %s", client_id, exc)
+                    await client.send(ErrorMessage.parse_error(request_id, str(exc)).to_bytes())
+                    continue
+                except ValueError as exc:
+                    logger.error("Invalid request payload from %s during framing/auth: %s", client_id, exc)
+                    await client.send(ErrorMessage.invalid_request(request_id, str(exc)).to_bytes())
+                    continue
+
+                if self._require_auth and not auth_complete:
+                    if request.method != "auth.hello":
+                        logger.warning("Rejecting unauthenticated method from %s: %s", client_id, request.method)
+                        await client.send(
+                            ErrorMessage.auth_required(request.id, "First request must be auth.hello").to_bytes()
+                        )
+                        break
+                    auth_complete = await self._handle_auth_hello(client_id, client, request)
+                    if not auth_complete:
+                        break
+                    continue
+
+                if not self._rate_limiter.check(client_id, request.method):
+                    logger.warning("Rate limiting client %s for method %s", client_id, request.method)
+                    await client.send(
+                        ErrorMessage.rate_limited(
+                            request.id,
+                            f"Exceeded {self._rate_limiter._max_requests} requests "
+                            f"per {self._rate_limiter._window_seconds}s window",
+                        ).to_bytes()
                     )
-                    error = ErrorMessage.parse_error(
-                        "global",
-                        "Request too large or missing newline delimiter",
-                    )
-                    try:
-                        await client.send(error.to_bytes())
-                    except Exception:
-                        pass
-                    break
-                
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    line = line.strip()
-                    
-                    if not line:
-                        continue
+                    continue
 
-                    self._trace_message("in", client_id, line)
-                    
-                    try:
-                        message = line.decode("utf-8")
-                    except UnicodeDecodeError as e:
-                        logger.error(f"Invalid UTF-8 from {client_id}: {e}")
-                        error = ErrorMessage.parse_error("global", "Invalid UTF-8 in request")
-                        try:
-                            await client.send(error.to_bytes())
-                        except (BrokenPipeError, ConnectionError, OSError):
-                            logger.debug(f"Failed to send UTF-8 parse error to {client_id}")
-                        continue
-
-                    request_id = self._extract_request_id(message)
-                    try:
-                        request = IncomingRequest.from_json(message)
-                    except json.JSONDecodeError as exc:
-                        logger.error("Invalid JSON from %s during framing/auth: %s", client_id, exc)
-                        error = ErrorMessage.parse_error(request_id, str(exc))
-                        try:
-                            await client.send(error.to_bytes())
-                        except (BrokenPipeError, ConnectionError, OSError):
-                            logger.debug(f"Failed to send parse error to {client_id}")
-                        continue
-                    except ValueError as exc:
-                        logger.error("Invalid request payload from %s during framing/auth: %s", client_id, exc)
-                        error = ErrorMessage.invalid_request(request_id, str(exc))
-                        try:
-                            await client.send(error.to_bytes())
-                        except (BrokenPipeError, ConnectionError, OSError):
-                            logger.debug(f"Failed to send invalid request error to {client_id}")
-                        continue
-
-                    if self._require_auth and not auth_complete:
-                        if request.method != "auth.hello":
-                            logger.warning(
-                                "Rejecting unauthenticated method from %s: %s",
-                                client_id,
-                                request.method,
-                            )
-                            error = ErrorMessage.auth_required(
-                                request.id,
-                                "First request must be auth.hello",
-                            )
-                            try:
-                                await client.send(error.to_bytes())
-                            except (BrokenPipeError, ConnectionError, OSError):
-                                logger.debug(f"Failed to send auth-required error to {client_id}")
-                            break
-                        auth_complete = await self._handle_auth_hello(client_id, client, request)
-                        if not auth_complete:
-                            break
-                        continue
-
-                    await self._handle_message(client_id, client, message)
-                    
+                await self._handle_message(client_id, client, message)
             except asyncio.TimeoutError:
-                # Check connection liveness
-                if client.writer.is_closing():
-                    break
                 if self._require_auth and not auth_complete:
                     logger.warning("Authentication timeout for %s; closing connection", client_id)
                     try:
@@ -564,7 +632,7 @@ class IPCServer:
                     break
                 # Keepalive timeout after auth: continue and wait for next frame.
                 continue
-            except (ConnectionResetError, BrokenPipeError):
+            except ConnectionClosed:
                 break
             except Exception as e:
                 logger.error(f"Error reading from client {client_id}: {e}")
@@ -618,15 +686,30 @@ class IPCServer:
                 ).to_bytes()
             )
             return False
-        if not isinstance(auth_token, str) or not auth_token:
-            await client.send(
-                ErrorMessage.auth_failed(
-                    request.id,
-                    "Missing auth token",
-                ).to_bytes()
-            )
-            return False
-        if auth_token != self._auth_token:
+        # Dual-token validation: check rotation token first, then bootstrap.
+        rotation_token_param = params.get("rotation_token")
+        token_valid = False
+        auth_method = "bootstrap"
+
+        if isinstance(rotation_token_param, str) and rotation_token_param:
+            consumed_client = self._consume_rotation_token(rotation_token_param)
+            if consumed_client is not None:
+                token_valid = True
+                auth_method = "rotation"
+
+        if not token_valid:
+            if not isinstance(auth_token, str) or not auth_token:
+                await client.send(
+                    ErrorMessage.auth_failed(
+                        request.id,
+                        "Missing auth token",
+                    ).to_bytes()
+                )
+                return False
+            if auth_token == self._auth_token:
+                token_valid = True
+
+        if not token_valid:
             await client.send(
                 ErrorMessage.auth_failed(
                     request.id,
@@ -635,17 +718,23 @@ class IPCServer:
             )
             return False
 
+        # Auth succeeded — issue a fresh rotation token for reconnect.
+        new_rotation_token = self._generate_rotation_token(client_id)
+
         await client.send(
             ResultMessage.create(
                 request.id,
-                self._build_auth_success_payload(),
+                self._build_auth_success_payload(
+                    rotation_token=new_rotation_token
+                ),
             ).to_bytes()
         )
         logger.info(
-            "Client authenticated: %s (client_name=%s, client_pid=%s)",
+            "Client authenticated: %s (client_name=%s, client_pid=%s, method=%s)",
             client_id,
             client_name,
             client_pid,
+            auth_method,
         )
         return True
     

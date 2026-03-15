@@ -1,0 +1,7 @@
+{
+  "last_security_tested_at": "2026-03-01T01:53:56.773363+00:00",
+  "suite": "tests/unit/test_browse_web_security.py + tests/unit/test_tool_executor_hardening_precision.py",
+  "status": "pass",
+  "recorded_by": "ci-security-gate",
+  "schedule": "weekly"
+}

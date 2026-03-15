@@ -12,6 +12,34 @@ if TYPE_CHECKING:
 
 from agent_host.tools.executor import ToolExecutionError
 
+# Mode-aware configuration — controls pipeline behavior per search strategy.
+_MODE_CONFIG: dict[str, dict[str, object]] = {
+    "fast": {
+        "seed": False,
+        "mdfind_timeout": 4,
+        "collect_cap_mult": 2,
+        "fts_fallback": False,
+        "seed_budget_cap_ms": 0,
+        "seed_entries_cap": 0,
+    },
+    "auto": {
+        "seed": True,
+        "mdfind_timeout": 8,
+        "collect_cap_mult": 3,
+        "fts_fallback": False,
+        "seed_budget_cap_ms": 220,
+        "seed_entries_cap": 1200,
+    },
+    "deep": {
+        "seed": True,
+        "mdfind_timeout": 8,
+        "collect_cap_mult": 5,
+        "fts_fallback": True,
+        "seed_budget_cap_ms": 600,
+        "seed_entries_cap": 5000,
+    },
+}
+
 
 def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Execute the search_files tool."""
@@ -105,17 +133,15 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
         model_folder_hint = folder_hint_raw.strip().lower()
 
     raw_query_lower = query.lower()
-    query_tokens = executor._tokenize_search_query(raw_query_lower)
-    query_tokens = executor._expand_search_tokens(query_tokens)
-    query_lower = " ".join(query_tokens) if query_tokens else raw_query_lower
+    core_tokens = executor._tokenize_search_query(raw_query_lower)
+    # Expanded tokens include plural/singular forms for broader path scoring.
+    # FTS queries use core_tokens only (expanded forms can break AND semantics
+    # when e.g. "pythons"* doesn't match the indexed token "python").
+    query_tokens = executor._expand_search_tokens(core_tokens)
+    query_lower = " ".join(core_tokens) if core_tokens else raw_query_lower
     query_phrases = [item.strip() for item in re.findall(r'"([^"]+)"', query_lower) if item.strip()]
     if {"gemini", "generated", "image"}.issubset(set(query_tokens)):
         query_phrases = list(dict.fromkeys([*query_phrases, "gemini generated image"]))
-    spotlight_queries = executor._derive_spotlight_query_variants(
-        original_query=query,
-        query_tokens=query_tokens,
-        query_phrases=query_phrases,
-    )
 
     # Prefer model-provided extensions; fall back to heuristic derivation.
     if model_extensions:
@@ -128,14 +154,26 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
         folder_hints = {model_folder_hint}
     else:
         folder_hints = executor._derive_folder_hints(query_tokens)
+
+    spotlight_queries = executor._derive_spotlight_query_variants(
+        original_query=query,
+        query_tokens=query_tokens,
+        query_phrases=query_phrases,
+        extension_hints=extension_hints,
+    )
     all_candidates: list[dict[str, Any]] = []
-    scanned_walk_entries = 0
     scanned_index_candidates = 0
     scanned_index_seed_entries = 0
-    truncated = False
-    truncated_reason = ""
-    next_token = ""
     search_started = time.perf_counter()
+
+    # --- Mode-dependent pipeline configuration ---
+    mcfg = _MODE_CONFIG.get(mode, _MODE_CONFIG["auto"])
+    do_seed = bool(mcfg["seed"])
+    mdfind_timeout = int(mcfg["mdfind_timeout"])  # type: ignore[arg-type]
+    collect_cap_mult = int(mcfg["collect_cap_mult"])  # type: ignore[arg-type]
+    fts_fallback = bool(mcfg["fts_fallback"])
+    seed_budget_cap_ms = int(mcfg["seed_budget_cap_ms"])  # type: ignore[arg-type]
+    seed_entries_cap = int(mcfg["seed_entries_cap"])  # type: ignore[arg-type]
 
     tier_stats: dict[str, dict[str, object]] = {
         "spotlight": {"elapsed_ms": 0.0, "scanned": 0, "matched": 0},
@@ -156,12 +194,13 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
     # depend on BOTH completing, so they remain sequential afterward.
 
     # Pre-compute seed budget before launching parallel work (uses wall-clock).
-    seed_budget_ms = min(220, max(60, int(_remaining_budget_ms() * 0.25)))
+    budget_fraction = 0.5 if mode == "deep" else 0.25
+    seed_budget_ms = min(seed_budget_cap_ms, max(60, int(_remaining_budget_ms() * budget_fraction)))
 
     parallel_started = time.perf_counter()
     seed_stats: dict[str, Any] = {}
 
-    if executor._search_index_enabled:
+    if executor._search_index_enabled and do_seed:
         with ThreadPoolExecutor(max_workers=2) as pool:
             spotlight_future = pool.submit(
                 executor._search_spotlight,
@@ -173,21 +212,25 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
                 folder_hints=folder_hints,
                 path_filter=path_filter,
                 limit=limit,
+                mdfind_timeout=mdfind_timeout,
+                collect_cap_mult=collect_cap_mult,
             )
+            seed_max_entries = max(120, min(seed_entries_cap, limit * (250 if mode == "deep" else 120)))
             seed_future = pool.submit(
                 executor._seed_search_index_incremental,
                 query_tokens=query_tokens,
                 folder_hints=folder_hints,
                 include_hidden=include_hidden,
                 max_depth=max_depth,
-                max_entries=max(120, min(1200, limit * 120)),
+                max_entries=seed_max_entries,
                 max_seconds=max(0.05, seed_budget_ms / 1000.0),
             )
 
             spotlight_results, scanned_spotlight_candidates = spotlight_future.result()
             seed_stats = seed_future.result()
     else:
-        # No FTS — run Spotlight alone (still benefits from internal mdfind parallelism).
+        # fast mode or no FTS — run Spotlight alone (still benefits from internal
+        # mdfind parallelism).
         spotlight_results, scanned_spotlight_candidates = executor._search_spotlight(
             queries=spotlight_queries,
             query_lower=query_lower,
@@ -197,6 +240,8 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
             folder_hints=folder_hints,
             path_filter=path_filter,
             limit=limit,
+            mdfind_timeout=mdfind_timeout,
+            collect_cap_mult=collect_cap_mult,
         )
 
     spotlight_elapsed_ms = round((time.perf_counter() - parallel_started) * 1000.0, 3)
@@ -223,6 +268,8 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
             folder_hints=folder_hints,
             path_filter=path_filter,
             limit=limit,
+            fts_fallback=fts_fallback,
+            fts_tokens=core_tokens,
         )
         all_candidates.extend(index_results)
 
@@ -254,6 +301,35 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
         folder_hints=folder_hints,
     )
 
+    # --- S2: Directory co-location discovery (skip in fast mode) ---
+    colocation_added = 0
+    if mode != "fast" and ranked_results:
+        siblings = executor._discover_colocated_files(ranked_results)
+        if siblings:
+            colocation_added = len(siblings)
+            ranked_results.extend(siblings)
+            ranked_results.sort(
+                key=lambda item: (
+                    int(item.get("score", 0)),
+                    float(item.get("modified_at", 0.0)),
+                ),
+                reverse=True,
+            )
+
+    # --- S3: Apply cache boost from recent related searches ---
+    cache_boosted = executor._apply_cache_boost(
+        current_query_tokens=query_tokens,
+        candidates=ranked_results,
+    )
+    if cache_boosted:
+        ranked_results.sort(
+            key=lambda item: (
+                int(item.get("score", 0)),
+                float(item.get("modified_at", 0.0)),
+            ),
+            reverse=True,
+        )
+
     total_scanned_entries = (
         scanned_spotlight_candidates
         + scanned_index_candidates
@@ -265,6 +341,21 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
             "Search index query failed; results may be incomplete. Try a different query."
         )
 
+    final_matches = ranked_results[:limit]
+
+    # --- S3: Cache results for follow-up searches ---
+    executor._cache_search_results(
+        query_lower=query_lower,
+        query_tokens=query_tokens,
+        result_paths=tuple(r["path"] for r in final_matches),
+        result_scores=tuple(int(r.get("score", 0)) for r in final_matches),
+    )
+
+    # --- S4: Diagnostics ---
+    spotlight_content_floor_count = sum(
+        1 for r in final_matches if r.get("spotlight_content_match")
+    )
+
     return {
         "ok": True,
         "query": query,
@@ -274,18 +365,18 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
         "time_budget_ms": time_budget_ms,
         "include_hidden": include_hidden,
         "max_depth": max_depth,
-        "continuation_token": "",
-        "next_token": next_token,
         "scanned_entries": total_scanned_entries,
         "scanned_spotlight_candidates": scanned_spotlight_candidates,
         "scanned_index_candidates": scanned_index_candidates,
         "scanned_index_seed_entries": scanned_index_seed_entries,
-        "scanned_walk_entries": scanned_walk_entries,
         "search_scan_limit": executor.search_scan_limit,
-        "truncated": truncated,
-        "truncated_reason": truncated_reason,
         "tier_stats": tier_stats,
         "warnings": warnings,
         "ranking_version": executor._SEARCH_RANKING_VERSION,
-        "matches": ranked_results[:limit],
+        "diagnostics": {
+            "spotlight_content_floor_applied": spotlight_content_floor_count,
+            "colocation_siblings_added": colocation_added,
+            "cache_overlap_boost_applied": cache_boosted,
+        },
+        "matches": final_matches,
     }

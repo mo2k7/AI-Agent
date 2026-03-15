@@ -174,3 +174,31 @@ def test_format_generate_image_output_handles_empty_payload() -> None:
 
     assert "No saved images were returned." in content
     assert content == summary
+
+
+def test_format_browse_web_output_compacts_policy_warnings() -> None:
+    execution = {
+        "tool": "browse_web",
+        "ok": True,
+        "output": {
+            "final_url": "https://example.com/article",
+            "title": "Example Article",
+            "effective_browse_profile": "flexible",
+            "policy_warnings": [
+                "Access restriction warning: URL appears to require login.",
+                "Security attestation warning: stale",
+            ],
+            "content": "Article body text.",
+        },
+    }
+
+    content, summary = _format_tool_execution_output("browse_web", execution)
+
+    assert "**Web Browse**" in content
+    assert "Source: [Example Article](https://example.com/article)" in content
+    assert "Browse profile: `flexible`" in content
+    assert "Policy notice: `flexible` browsing allowed this result with policy warnings." in content
+    assert "Policy notice: `flexible` browsing allowed this result with policy warnings.\n\nCaution:" in content
+    assert "Caution: Access restriction warning: URL appears to require login. (+1 more)" in content
+    assert "Article body text." in content
+    assert "Caution:" in summary

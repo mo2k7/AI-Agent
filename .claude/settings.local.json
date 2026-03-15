@@ -62,7 +62,19 @@
       "Bash(gh auth status:*)",
       "Bash(git rm:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(security find-generic-password:*)",
+      "Bash(security list-keychains:*)",
+      "Bash(security dump-keychain:*)",
+      "Bash({)",
+      "Bash(__NEW_LINE_9334e1e7bfdf654d__ git ls-files --cached --others --exclude-standard)",
+      "Read(//Users/muhammadabdullah/AI Automation Agent macOS/**)",
+      "Bash(xcodegen:*)",
+      "Bash(swift:*)",
+      "Bash(brew install:*)",
+      "WebFetch(domain:ai.google.dev)",
+      "WebFetch(domain:googleapis.github.io)",
+      "WebFetch(domain:docs.cloud.google.com)"
     ]
   },
   "outputStyle": "Explanatory"

@@ -3,87 +3,196 @@
 //  AIAgentUI
 //
 //  Created for Personal macOS AI Agent
-//  Status: Active - Session notes panel UI with full CRUD
+//  Status: Active - Session-pad-first notes workspace
 //
 
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Root view for the floating notes panel.
+#if os(macOS)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
+
 struct NotesPanelView: View {
     @ObservedObject var appState: AppState
-    @State private var newNoteText: String = ""
-    @FocusState private var isInputFocused: Bool
-    @State private var selectedTag: String?
+    @State private var selectedNoteId: String?
+    @State private var isEditing: Bool = false
+    @State private var draftTitle: String = ""
+    @State private var draftContent: String = ""
     @State private var isSearchVisible: Bool = false
     @State private var searchText: String = ""
-    @State private var highlightedNoteId: String?
+    @State private var showNewTabSheet: Bool = false
+    @State private var showHistory: Bool = false
+    @State private var versions: [IPCNoteVersion] = []
+    @State private var isLoadingVersions: Bool = false
+    @State private var showStudyView: Bool = false
+    @State private var exportShareItem: ExportShareItem?
 
-    /// All unique tags across all notes, sorted alphabetically.
-    private var allTags: [String] {
-        let tags = Set(appState.notes.flatMap(\.tags))
-        return tags.sorted()
+    private var sessionPad: Note? {
+        appState.notes.first(where: \.isSessionPad)
     }
 
-    /// Notes filtered by selected tag and/or search text.
-    private var filteredNotes: [Note] {
-        var result = appState.notes
-        if let tag = selectedTag {
-            result = result.filter { $0.tags.contains(tag) }
+    private var secondaryTabs: [Note] {
+        appState.notes.filter { !$0.isSessionPad }
+    }
+
+    private var visibleSecondaryTabs: [Note] {
+        Array(secondaryTabs.prefix(3))
+    }
+
+    private var overflowSecondaryTabs: [Note] {
+        Array(secondaryTabs.dropFirst(3))
+    }
+
+    private var activeNote: Note? {
+        if let selectedNoteId,
+           let selected = appState.notes.first(where: { $0.id == selectedNoteId }) {
+            return selected
         }
+        return sessionPad ?? appState.notes.first
+    }
+
+    private var searchResults: [Note] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !query.isEmpty {
-            result = result.filter {
-                $0.displayContent.localizedCaseInsensitiveContains(query)
-            }
+        guard !query.isEmpty else { return [] }
+        return appState.notes.filter {
+            $0.displayTitle.localizedCaseInsensitiveContains(query)
+                || $0.displayContent.localizedCaseInsensitiveContains(query)
         }
-        return result
+    }
+
+    private var activeBlocks: [MarkdownBlock] {
+        guard let activeNote else { return [] }
+        return NoteMarkdownParser.parse(activeNote.displayContent)
+    }
+
+    private var activeIsFlashcardNote: Bool {
+        guard let noteType = activeNote?.noteType else { return false }
+        return noteType == "flashcards" || noteType == "study_guide"
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            headerView
-            if !allTags.isEmpty {
-                tagFilterBar
+        ZStack {
+            VStack(spacing: 0) {
+                headerView
+                Divider().background(Color.glassStroke)
+                tabStrip
+                if isSearchVisible {
+                    searchBar
+                }
+                if !searchResults.isEmpty {
+                    searchResultsView
+                }
+                Divider().background(Color.glassStroke.opacity(0.5))
+                editorToolbar
+                Divider().background(Color.glassStroke.opacity(0.5))
+                contentView
+                Divider().background(Color.glassStroke)
+                footerView
             }
-            Divider().background(Color.glassStroke)
-            notesListView
-            Divider().background(Color.glassStroke)
-            createNoteBar
+            #if os(macOS)
+            .frame(
+                minWidth: 360, idealWidth: 460, maxWidth: .infinity,
+                minHeight: 360, idealHeight: 620, maxHeight: .infinity
+            )
+            .glassBase()
+            #else
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.panelBackground)
+            #endif
+
+            if showNewTabSheet {
+                OverlayContainer(isPresented: $showNewTabSheet) {
+                    NewNoteTabSheet(
+                        onCancel: { showNewTabSheet = false },
+                        onCreate: { title, content in
+                            appState.createNote(content: content, title: title, workspaceKind: "tab") { note in
+                                select(note: note)
+                            }
+                            showNewTabSheet = false
+                        }
+                    )
+                }
+            }
+
+            if showHistory {
+                OverlayContainer(isPresented: $showHistory) {
+                    NoteHistoryView(
+                        noteId: activeNote?.id ?? "",
+                        versions: versions,
+                        isLoading: isLoadingVersions,
+                        onClose: { showHistory = false },
+                        onRestore: { restoredContent in
+                            guard let activeNote else { return }
+                            appState.updateNote(noteId: activeNote.id, content: restoredContent)
+                            showHistory = false
+                        }
+                    )
+                }
+            }
+
+            if showStudyView, let activeNote {
+                OverlayContainer(isPresented: $showStudyView) {
+                    let cards = FlashcardParser.parse(activeNote.displayContent)
+                    FlashcardStudyView(
+                        noteTitle: activeNote.displayTitle,
+                        cards: cards,
+                        onClose: { showStudyView = false }
+                    )
+                }
+            }
+
+            #if !os(macOS)
+            if let exportShareItem {
+                OverlayContainer(
+                    isPresented: Binding(
+                        get: { self.exportShareItem != nil },
+                        set: { isPresented in
+                            if !isPresented {
+                                self.exportShareItem = nil
+                            }
+                        }
+                    ),
+                    tapOutsideToDismiss: false
+                ) {
+                    ExportShareOverlay(
+                        item: exportShareItem,
+                        onDismiss: { self.exportShareItem = nil }
+                    )
+                }
+            }
+            #endif
         }
-        .frame(
-            minWidth: 280, idealWidth: 340, maxWidth: .infinity,
-            minHeight: 300, idealHeight: 520, maxHeight: .infinity
-        )
-        .liquidGlass()
         .onAppear {
             appState.loadNotes()
+            synchronizeSelection()
+        }
+        .onChange(of: appState.activeSessionId) { _, _ in
+            resetEditorState()
+            synchronizeSelection(forceSessionPad: true)
+        }
+        .onChange(of: appState.notes) { _, _ in
+            synchronizeSelection()
+            refreshDraftFromActiveNoteIfNeeded()
         }
     }
 
-    // MARK: - Header
-
-    @ViewBuilder
     private var headerView: some View {
         HStack(spacing: ThemeConstants.spacingS) {
             Image(systemName: "note.text")
-                .font(.system(size: 16))
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.primaryBlue)
 
-            Text("Notes")
-                .font(.headline)
-                .foregroundColor(.textPrimary)
-
-            if !filteredNotes.isEmpty {
-                Text("\(filteredNotes.count)")
-                    .font(.caption2.monospacedDigit())
-                    .fontWeight(.semibold)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(activeNote?.displayTitle ?? "Session Notes")
+                    .font(.headline)
+                    .foregroundColor(.textPrimary)
+                    .lineLimit(1)
+                Text(activeNote?.isSessionPad == true ? "Unified session pad" : "Secondary notes tab")
+                    .font(.caption)
                     .foregroundColor(.textSecondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(
-                        Capsule().fill(Color.textSecondary.opacity(0.15))
-                    )
             }
 
             Spacer()
@@ -95,9 +204,11 @@ struct NotesPanelView: View {
             }
 
             Button(action: {
-                withAnimation(.easeInOut(duration: 0.2)) {
+                withAnimation(.easeInOut(duration: 0.15)) {
                     isSearchVisible.toggle()
-                    if !isSearchVisible { searchText = "" }
+                    if !isSearchVisible {
+                        searchText = ""
+                    }
                 }
             }) {
                 Image(systemName: isSearchVisible ? "magnifyingglass.circle.fill" : "magnifyingglass")
@@ -105,24 +216,25 @@ struct NotesPanelView: View {
                     .foregroundColor(isSearchVisible ? .primaryBlue : .textSecondary)
             }
             .buttonStyle(.plain)
-            .help("Search Notes")
+            .help("Search all notes tabs")
 
             Menu {
                 Button(action: { exportNotes(format: .markdown) }) {
-                    Label("Markdown (.md)", systemImage: "doc.richtext")
+                    Label("Export All as Markdown", systemImage: "doc.richtext")
                 }
                 Button(action: { exportNotes(format: .plainText) }) {
-                    Label("Plain Text (.txt)", systemImage: "doc.plaintext")
+                    Label("Export All as Plain Text", systemImage: "doc.plaintext")
                 }
             } label: {
                 Image(systemName: "square.and.arrow.up")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(.textSecondary)
             }
+            #if os(macOS)
             .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Export Notes")
-            .disabled(filteredNotes.isEmpty)
+            #endif
+            .help("Export notes")
+            .disabled(appState.notes.isEmpty)
 
             Button(action: { NotesPanelController.shared.hide() }) {
                 Image(systemName: "xmark")
@@ -134,224 +246,409 @@ struct NotesPanelView: View {
         }
         .padding(.horizontal, ThemeConstants.spacingM)
         .padding(.vertical, ThemeConstants.spacingS)
-
-        if isSearchVisible {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11))
-                    .foregroundColor(.textSecondary)
-                TextField("Search notes\u{2026}", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(.callout)
-                if !searchText.isEmpty {
-                    Button(action: { searchText = "" }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 11))
-                            .foregroundColor(.textSecondary.opacity(0.6))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, ThemeConstants.spacingM)
-            .padding(.vertical, 5)
-            .background(Color.textPrimary.opacity(0.04))
-        }
     }
 
-    // MARK: - Tag Filter Bar
-
-    private var tagFilterBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                // "All" chip
-                Button(action: { selectedTag = nil }) {
-                    Text("All")
-                        .font(.system(size: 9, weight: selectedTag == nil ? .bold : .medium, design: .rounded))
-                        .foregroundColor(selectedTag == nil ? .white : .textSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(selectedTag == nil ? Color.primaryBlue : Color.textPrimary.opacity(0.06))
-                        )
-                }
-                .buttonStyle(.plain)
-
-                ForEach(allTags, id: \.self) { tag in
-                    Button(action: { selectedTag = selectedTag == tag ? nil : tag }) {
-                        Text(tag)
-                            .font(.system(size: 9, weight: selectedTag == tag ? .bold : .medium, design: .rounded))
-                            .foregroundColor(selectedTag == tag ? .white : .textSecondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .fill(selectedTag == tag ? Color.primaryBlue : Color.textPrimary.opacity(0.06))
-                            )
-                    }
-                    .buttonStyle(.plain)
+    private var tabStrip: some View {
+        HStack(spacing: 8) {
+            if let sessionPad {
+                NoteTabPill(
+                    title: sessionPad.displayTitle,
+                    isActive: activeNote?.id == sessionPad.id,
+                    isPrimary: true
+                ) {
+                    select(note: sessionPad)
                 }
             }
-            .padding(.horizontal, ThemeConstants.spacingM)
-            .padding(.vertical, 4)
-        }
-    }
 
-    // MARK: - Notes List
-
-    private var notesListView: some View {
-        Group {
-            if appState.notes.isEmpty && !appState.isNotesLoading {
-                emptyState
-            } else if filteredNotes.isEmpty {
-                VStack(spacing: ThemeConstants.spacingS) {
-                    Spacer()
-                    Text("No notes matching tag")
-                        .font(.callout)
-                        .foregroundColor(.textSecondary)
-                    Button("Clear filter") { selectedTag = nil }
-                        .buttonStyle(.plain)
-                        .font(.caption.weight(.medium))
-                        .foregroundColor(.primaryBlue)
-                    Spacer()
+            ForEach(visibleSecondaryTabs) { note in
+                NoteTabPill(
+                    title: note.displayTitle,
+                    isActive: activeNote?.id == note.id,
+                    isPrimary: false
+                ) {
+                    select(note: note)
                 }
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: ThemeConstants.spacingS) {
-                            ForEach(filteredNotes) { note in
-                                NoteCard(
-                                    note: note,
-                                    appState: appState,
-                                    isHighlighted: highlightedNoteId == note.id,
-                                    onNoteLinkTapped: { prefix in
-                                        scrollToNote(prefix: prefix, proxy: proxy)
-                                    }
-                                )
-                                .id(note.id)
-                            }
+            }
+
+            if !overflowSecondaryTabs.isEmpty {
+                Menu {
+                    ForEach(overflowSecondaryTabs) { note in
+                        Button(note.displayTitle) {
+                            select(note: note)
                         }
-                        .padding(ThemeConstants.spacingM)
                     }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("+\(overflowSecondaryTabs.count)")
+                            .font(.caption.weight(.semibold))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .foregroundColor(.textSecondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(Color.textPrimary.opacity(0.05))
+                    )
+                #if os(macOS)
+                .menuStyle(.borderlessButton)
+                #endif
                 }
             }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
 
-    private var emptyState: some View {
-        VStack(spacing: ThemeConstants.spacingM) {
             Spacer()
-            Image(systemName: "note.text")
-                .font(.system(size: 36))
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [Color.secondaryBlue.opacity(0.5), Color.primaryBlue.opacity(0.3)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-            Text("No notes yet")
-                .font(.headline)
-                .foregroundColor(.textSecondary)
-            Text("Create a note below or ask\nthe agent to take notes for you.")
-                .font(.caption)
-                .foregroundColor(.textSecondary.opacity(0.7))
-                .multilineTextAlignment(.center)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity)
-    }
 
-    // MARK: - Create Note Bar
-
-    private var createNoteBar: some View {
-        HStack(spacing: ThemeConstants.spacingS) {
-            Menu {
-                ForEach(NoteTemplate.all) { tmpl in
-                    Button(action: { newNoteText = tmpl.content; isInputFocused = true }) {
-                        Label(tmpl.name, systemImage: tmpl.icon)
-                    }
-                }
-            } label: {
-                Image(systemName: "doc.text.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(.textSecondary.opacity(0.6))
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Insert Template")
-
-            TextField("Write a note...", text: $newNoteText)
-                .textFieldStyle(.plain)
-                .font(.body)
-                .focused($isInputFocused)
-                .onSubmit { submitNote() }
-
-            Button(action: submitNote) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 20))
-                    .foregroundColor(
-                        newNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? .textSecondary.opacity(0.3)
-                            : .primaryBlue
-                    )
+            Button(action: { showNewTabSheet = true }) {
+                Label("New Tab", systemImage: "plus")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.textSecondary)
             }
             .buttonStyle(.plain)
-            .disabled(newNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .help("Add Note")
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(Color.textPrimary.opacity(0.05))
+            )
+            .help("Create a separate notes tab")
         }
         .padding(.horizontal, ThemeConstants.spacingM)
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundColor(.textSecondary)
+            TextField("Search notes and tabs...", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.callout)
+            if !searchText.isEmpty {
+                Button(action: { searchText = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.textSecondary.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, ThemeConstants.spacingM)
+        .padding(.vertical, 8)
+        .background(Color.textPrimary.opacity(0.03))
+    }
+
+    private var searchResultsView: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(searchResults.prefix(6)) { note in
+                Button(action: { select(note: note) }) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(note.displayTitle)
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.textPrimary)
+                        Text(note.displayContent)
+                            .font(.caption2)
+                            .foregroundColor(.textSecondary)
+                            .lineLimit(2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, ThemeConstants.spacingM)
+                    .padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 4)
         .background(Color.textPrimary.opacity(0.02))
     }
 
-    private func submitNote() {
-        let trimmed = newNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        appState.createNote(content: trimmed)
-        newNoteText = ""
+    private var editorToolbar: some View {
+        HStack(spacing: 8) {
+            if let activeNote {
+                if activeNote.isSessionPad {
+                    Text("Agent writes here by default")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.secondaryBlue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule().fill(Color.secondaryBlue.opacity(0.12))
+                        )
+                } else {
+                    Text("Secondary Tab")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.textSecondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule().fill(Color.textPrimary.opacity(0.06))
+                        )
+                }
+
+                if let noteType = activeNote.noteType {
+                    NoteTypeChip(type: noteType)
+                }
+
+                ForEach(activeNote.tags.prefix(3), id: \.self) { tag in
+                    NoteTagChip(tag: tag)
+                }
+
+                Text(relativeTimestamp(for: activeNote.updatedAt))
+                    .font(.caption)
+                    .foregroundColor(.textSecondary)
+            }
+
+            Spacer()
+
+            if activeIsFlashcardNote {
+                Button(action: { showStudyView = true }) {
+                    Label("Study", systemImage: "rectangle.on.rectangle.angled")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.primaryBlue)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Button(action: loadAndShowHistory) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(activeNote == nil)
+            .help("Version History")
+
+            if let activeNote, !activeNote.isSessionPad {
+                Button(action: { appState.updateNote(noteId: activeNote.id, isPinned: !activeNote.isPinned) }) {
+                    Image(systemName: activeNote.isPinned ? "pin.slash" : "pin")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help(activeNote.isPinned ? "Unpin Tab" : "Pin Tab")
+            }
+
+            Button(action: toggleEditMode) {
+                Text(isEditing ? "Cancel" : "Edit")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(isEditing ? .textSecondary : .primaryBlue)
+            }
+            .buttonStyle(.plain)
+
+            if let activeNote, !activeNote.isSessionPad {
+                Menu {
+                    Button("Rename Tab") {
+                        beginRename(for: activeNote)
+                    }
+                    Button("Delete Tab", role: .destructive) {
+                        appState.deleteNote(noteId: activeNote.id)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.textSecondary)
+                #if os(macOS)
+                .menuStyle(.borderlessButton)
+                #endif
+                }
+            }
+        }
+        .padding(.horizontal, ThemeConstants.spacingM)
+        .padding(.vertical, 8)
     }
 
-    /// Scrolls to a note matching the given ID prefix and briefly highlights it.
-    private func scrollToNote(prefix: String, proxy: ScrollViewProxy) {
-        guard let note = appState.notes.first(where: { $0.id.hasPrefix(prefix) }) else { return }
-        selectedTag = nil
-        searchText = ""
-        withAnimation(.easeInOut(duration: 0.3)) {
-            proxy.scrollTo(note.id, anchor: .center)
-            highlightedNoteId = note.id
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            withAnimation { highlightedNoteId = nil }
+    @ViewBuilder
+    private var contentView: some View {
+        if let activeNote {
+            if isEditing {
+                editingView(for: activeNote)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: ThemeConstants.spacingM) {
+                        NoteMarkdownView(
+                            blocks: activeBlocks,
+                            imageFetcher: { imageId in
+                                await appState.fetchNoteImage(imageId: imageId)
+                            },
+                            noteType: activeNote.noteType,
+                            onNoteTapped: { prefix in
+                                guard let match = appState.notes.first(where: { $0.id.hasPrefix(prefix) }) else { return }
+                                select(note: match)
+                            }
+                        )
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(ThemeConstants.spacingM)
+                }
+            }
+        } else if appState.isNotesLoading {
+            VStack {
+                Spacer()
+                ProgressView("Loading notes…")
+                Spacer()
+            }
+        } else {
+            VStack(spacing: ThemeConstants.spacingM) {
+                Spacer()
+                Image(systemName: "note.text")
+                    .font(.system(size: 40))
+                    .foregroundColor(.textSecondary.opacity(0.4))
+                Text("No notes yet")
+                    .font(.headline)
+                    .foregroundColor(.textSecondary)
+                Text("The session pad will appear here and the agent will keep writing into it.")
+                    .font(.callout)
+                    .foregroundColor(.textSecondary.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    // MARK: - Export
+    private func editingView(for note: Note) -> some View {
+        VStack(alignment: .leading, spacing: ThemeConstants.spacingS) {
+            if !note.isSessionPad {
+                TextField("Tab title", text: $draftTitle)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            TextEditor(text: $draftContent)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.textPrimary.opacity(0.04))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.glassStroke.opacity(0.35), lineWidth: 0.5)
+                )
+
+            HStack {
+                if note.isSessionPad {
+                    Text("Session Notes is the default destination for agent note-taking.")
+                        .font(.caption)
+                        .foregroundColor(.textSecondary)
+                }
+                Spacer()
+                Button("Save") {
+                    saveEdits(for: note)
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.primaryBlue)
+            }
+        }
+        .padding(ThemeConstants.spacingM)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var footerView: some View {
+        HStack {
+            Text("Default behavior: the agent keeps writing in Session Notes unless you explicitly ask for a separate tab.")
+                .font(.caption)
+                .foregroundColor(.textSecondary)
+            Spacer()
+            if let activeNote, activeNote.isSessionPad {
+                Text("Primary Workspace")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondaryBlue)
+            }
+        }
+        .padding(.horizontal, ThemeConstants.spacingM)
+        .padding(.vertical, 8)
+    }
+
+    private func synchronizeSelection(forceSessionPad: Bool = false) {
+        if forceSessionPad, let sessionPad {
+            selectedNoteId = sessionPad.id
+            return
+        }
+        if let selectedNoteId,
+           appState.notes.contains(where: { $0.id == selectedNoteId }) {
+            return
+        }
+        selectedNoteId = sessionPad?.id ?? appState.notes.first?.id
+    }
+
+    private func select(note: Note) {
+        selectedNoteId = note.id
+        isEditing = false
+        draftTitle = note.displayTitle
+        draftContent = note.content
+    }
+
+    private func toggleEditMode() {
+        guard let activeNote else { return }
+        if isEditing {
+            resetEditorState()
+        } else {
+            draftTitle = activeNote.displayTitle
+            draftContent = activeNote.content
+            isEditing = true
+        }
+    }
+
+    private func beginRename(for note: Note) {
+        select(note: note)
+        isEditing = true
+    }
+
+    private func resetEditorState() {
+        isEditing = false
+        draftTitle = activeNote?.displayTitle ?? ""
+        draftContent = activeNote?.content ?? ""
+    }
+
+    private func refreshDraftFromActiveNoteIfNeeded() {
+        guard isEditing, let activeNote else { return }
+        if draftContent.isEmpty && draftTitle.isEmpty {
+            draftTitle = activeNote.displayTitle
+            draftContent = activeNote.content
+        }
+    }
+
+    private func saveEdits(for note: Note) {
+        let trimmedContent = draftContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedContent.isEmpty else { return }
+        let title: String? = note.isSessionPad ? nil : draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        appState.updateNote(
+            noteId: note.id,
+            content: trimmedContent,
+            title: title?.isEmpty == true ? nil : title
+        )
+        isEditing = false
+    }
+
+    private func loadAndShowHistory() {
+        guard let activeNote else { return }
+        isLoadingVersions = true
+        showHistory = true
+        Task { @MainActor in
+            versions = await appState.fetchNoteVersions(noteId: activeNote.id)
+            isLoadingVersions = false
+        }
+    }
 
     private enum ExportFormat { case markdown, plainText }
 
     private func exportNotes(format: ExportFormat) {
-        let notes = filteredNotes
+        let notes = appState.notes
         guard !notes.isEmpty else { return }
 
         let ext = format == .markdown ? "md" : "txt"
         let separator = format == .markdown ? "\n\n---\n\n" : "\n\n────────────────────\n\n"
-
         let document = notes.enumerated().map { index, note in
-            var header: String
-            if format == .markdown {
-                let typeLabel = note.noteType.map { " `[\($0)]`" } ?? ""
-                let tagLabels = note.tags.isEmpty ? "" : " " + note.tags.map { "#\($0)" }.joined(separator: " ")
-                let pin = note.isPinned ? " [pinned]" : ""
-                header = "## Note \(index + 1)\(typeLabel)\(tagLabels)\(pin)"
-            } else {
-                header = "NOTE \(index + 1)"
-                if note.isPinned { header += " [PINNED]" }
-            }
-            return "\(header)\n\(note.displayContent)"
+            let heading = format == .markdown
+                ? "## \(note.displayTitle)"
+                : "NOTE \(index + 1): \(note.displayTitle)"
+            return "\(heading)\n\(note.displayContent)"
         }.joined(separator: separator)
 
+        #if os(macOS)
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "notes-export.\(ext)"
         panel.allowedContentTypes = format == .markdown
@@ -365,461 +662,185 @@ struct NotesPanelView: View {
         } catch {
             DebugLogger.log("notes_export_error", fields: ["error": error.localizedDescription])
         }
-    }
-}
-
-// MARK: - Note Card
-
-/// A single note card with view/edit/delete capabilities.
-struct NoteCard: View {
-    let note: Note
-    @ObservedObject var appState: AppState
-    var isHighlighted: Bool = false
-    var onNoteLinkTapped: ((String) -> Void)?
-    @State private var isEditing: Bool = false
-    @State private var editText: String = ""
-    @State private var isHovering: Bool = false
-    @State private var isExpanded: Bool = false
-    @State private var contentHeight: CGFloat = 0
-    @State private var showFullView: Bool = false
-    @State private var showStudyView: Bool = false
-    @State private var showHistory: Bool = false
-    @State private var versions: [IPCNoteVersion] = []
-    @State private var isLoadingVersions: Bool = false
-
-    /// Whether this note can be studied as flashcards.
-    private var isFlashcardNote: Bool {
-        let t = note.noteType
-        return t == "flashcards" || t == "study_guide"
-    }
-
-    var body: some View {
-        HStack(spacing: 0) {
-            // Accent bar for agent-created notes
-            if note.isAgentCreated {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color.secondaryBlue, Color.primaryBlue],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .frame(width: 3)
-                    .padding(.vertical, 6)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                // Top row: badges + timestamp + actions
-                HStack(spacing: 4) {
-                    if note.isPinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 9))
-                            .foregroundColor(.orange)
-                    }
-                    if note.isAgentCreated {
-                        Text("AI")
-                            .font(.system(size: 9, weight: .bold, design: .rounded))
-                            .foregroundColor(.primaryBlue)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(
-                                RoundedRectangle(cornerRadius: 3)
-                                    .fill(Color.primaryBlue.opacity(0.12))
-                            )
-                    }
-                    if let noteType = note.noteType {
-                        NoteTypeChip(type: noteType)
-                    }
-                    ForEach(note.tags.prefix(3), id: \.self) { tag in
-                        NoteTagChip(tag: tag)
-                    }
-                    Text(relativeTimestamp)
-                        .font(.caption2)
-                        .foregroundColor(.textSecondary.opacity(0.6))
-                    Spacer()
-
-                    if isHovering && !isEditing {
-                        actionButtons
-                    }
-                }
-
-                // Content or editor
-                if isEditing {
-                    editView
-                } else {
-                    noteContentView
-                }
-            }
-            .padding(10)
+        #else
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("notes-export-\(UUID().uuidString).\(ext)")
+        do {
+            try document.write(to: tempURL, atomically: true, encoding: .utf8)
+            exportShareItem = ExportShareItem(url: tempURL)
+        } catch {
+            DebugLogger.log("notes_export_error", fields: ["error": error.localizedDescription])
         }
-        .background(
-            RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
-                .fill(cardBackground)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
-                .stroke(
-                    isHighlighted ? Color.primaryBlue.opacity(0.8)
-                        : Color.glassStroke.opacity(isHovering ? 0.7 : 0.4),
-                    lineWidth: isHighlighted ? 1.5 : 0.5
-                )
-        )
-        .shadow(
-            color: Color.glassShadow.opacity(isHovering ? 0.12 : 0.05),
-            radius: isHovering ? 6 : 2,
-            y: isHovering ? 3 : 1
-        )
-        .scaleEffect(isHovering ? 1.01 : 1.0)
-        .animation(.easeInOut(duration: 0.15), value: isHovering)
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                isHovering = hovering
-            }
-        }
-        .sheet(isPresented: $showFullView) {
-            NoteFullView(note: note, appState: appState)
-        }
-        .sheet(isPresented: $showStudyView) {
-            let cards = FlashcardParser.parse(note.displayContent)
-            let title = note.displayContent.components(separatedBy: "\n").first.flatMap {
-                $0.replacingOccurrences(of: "**", with: "").trimmingCharacters(in: .whitespaces)
-            } ?? "Flashcards"
-            FlashcardStudyView(noteTitle: title, cards: cards)
-        }
-        .sheet(isPresented: $showHistory) {
-            NoteHistoryView(
-                noteId: note.id,
-                versions: versions,
-                isLoading: isLoadingVersions,
-                onRestore: { content in
-                    appState.updateNote(noteId: note.id, content: content)
-                    showHistory = false
-                }
-            )
-        }
-    }
-
-    private func loadAndShowHistory() {
-        isLoadingVersions = true
-        showHistory = true
-        Task { @MainActor in
-            versions = await appState.fetchNoteVersions(noteId: note.id)
-            isLoadingVersions = false
-        }
-    }
-
-    // MARK: - Subviews
-
-    private var actionButtons: some View {
-        HStack(spacing: 6) {
-            Button(action: {
-                appState.updateNote(noteId: note.id, isPinned: !note.isPinned)
-            }) {
-                Image(systemName: note.isPinned ? "pin.slash" : "pin")
-                    .font(.system(size: 10))
-                    .foregroundColor(.textSecondary)
-            }
-            .buttonStyle(.plain)
-            .help(note.isPinned ? "Unpin" : "Pin")
-
-            if isFlashcardNote {
-                Button(action: { showStudyView = true }) {
-                    Image(systemName: "rectangle.on.rectangle.angled")
-                        .font(.system(size: 10))
-                        .foregroundColor(.primaryBlue)
-                }
-                .buttonStyle(.plain)
-                .help("Study Flashcards")
-            }
-
-            Button(action: { showFullView = true }) {
-                Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    .font(.system(size: 10))
-                    .foregroundColor(.textSecondary)
-            }
-            .buttonStyle(.plain)
-            .help("Full View")
-
-            Button(action: {
-                editText = note.content
-                isEditing = true
-            }) {
-                Image(systemName: "pencil")
-                    .font(.system(size: 10))
-                    .foregroundColor(.textSecondary)
-            }
-            .buttonStyle(.plain)
-            .help("Edit")
-
-            Button(action: loadAndShowHistory) {
-                Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 10))
-                    .foregroundColor(.textSecondary)
-            }
-            .buttonStyle(.plain)
-            .help("Version History")
-
-            Button(action: {
-                appState.deleteNote(noteId: note.id)
-            }) {
-                Image(systemName: "trash")
-                    .font(.system(size: 10))
-                    .foregroundColor(.red.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-            .help("Delete")
-        }
-        .transition(.opacity)
-    }
-
-    private var editView: some View {
-        VStack(alignment: .trailing, spacing: 6) {
-            TextEditor(text: $editText)
-                .font(.body)
-                .frame(minHeight: 60, maxHeight: 150)
-                .scrollContentBackground(.hidden)
-                .padding(4)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.textPrimary.opacity(0.05))
-                )
-
-            HStack(spacing: 8) {
-                Button("Cancel") {
-                    isEditing = false
-                    editText = ""
-                }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .foregroundColor(.textSecondary)
-
-                Button("Save") {
-                    let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        appState.updateNote(noteId: note.id, content: trimmed)
-                    }
-                    isEditing = false
-                    editText = ""
-                }
-                .buttonStyle(.plain)
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.primaryBlue)
-                .disabled(editText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }
-    }
-
-    // MARK: - Markdown Content
-
-    private static let collapseThreshold: CGFloat = 120
-
-    /// Renders note content using the shared `NoteMarkdownView` with expand/collapse.
-    private var noteContentView: some View {
-        let blocks = NoteMarkdownParser.parse(note.displayContent)
-        let needsCollapse = contentHeight > Self.collapseThreshold && !isExpanded
-
-        return VStack(alignment: .leading, spacing: 0) {
-            NoteMarkdownView(blocks: blocks, imageFetcher: { imageId in
-                    await appState.fetchNoteImage(imageId: imageId)
-                }, noteType: note.noteType, onNoteTapped: onNoteLinkTapped)
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: NoteContentHeightKey.self,
-                            value: geo.size.height
-                        )
-                    }
-                )
-                .onPreferenceChange(NoteContentHeightKey.self) { height in
-                    contentHeight = height
-                }
-                .frame(maxHeight: needsCollapse ? Self.collapseThreshold : .infinity, alignment: .top)
-                .clipped()
-
-            if needsCollapse {
-                // Gradient fade overlay + "Show more" button
-                LinearGradient(
-                    colors: [cardBackground.opacity(0), cardBackground],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 20)
-                .offset(y: -20)
-                .allowsHitTesting(false)
-
-                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isExpanded = true } }) {
-                    Text("Show more")
-                        .font(.caption2.weight(.medium))
-                        .foregroundColor(.secondaryBlue)
-                }
-                .buttonStyle(.plain)
-            } else if isExpanded && contentHeight > Self.collapseThreshold {
-                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isExpanded = false } }) {
-                    Text("Show less")
-                        .font(.caption2.weight(.medium))
-                        .foregroundColor(.secondaryBlue)
-                }
-                .buttonStyle(.plain)
-                .padding(.top, 4)
-            }
-        }
-    }
-
-    // MARK: - Helpers
-
-    private var cardBackground: Color {
-        if note.isPinned {
-            return Color.orange.opacity(isHovering ? 0.10 : 0.06)
-        }
-        if note.isAgentCreated {
-            return Color.primaryBlue.opacity(isHovering ? 0.08 : 0.04)
-        }
-        return Color.textPrimary.opacity(isHovering ? 0.06 : 0.03)
+        #endif
     }
 
     private static let relativeDateFormatter: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
     }()
 
-    private var relativeTimestamp: String {
-        Self.relativeDateFormatter.localizedString(for: note.updatedAt, relativeTo: Date())
+    private func relativeTimestamp(for date: Date) -> String {
+        Self.relativeDateFormatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
-// MARK: - Note Full View
+private struct ExportShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
 
-/// Full-size modal view for a single note with rich markdown rendering.
-struct NoteFullView: View {
-    let note: Note
-    @ObservedObject var appState: AppState
-    @Environment(\.dismiss) private var dismiss
-    @State private var isEditing: Bool = false
-    @State private var editText: String = ""
+#if canImport(UIKit) && !os(macOS)
+private struct ExportShareOverlay: View {
+    let item: ExportShareItem
+    let onDismiss: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack(spacing: ThemeConstants.spacingS) {
-                if note.isAgentCreated {
-                    Text("AI")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundColor(.primaryBlue)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(Color.primaryBlue.opacity(0.12))
-                        )
-                }
-                if note.isPinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(.orange)
-                }
-                if let noteType = note.noteType {
-                    NoteTypeChip(type: noteType)
-                }
-                Text(fullTimestamp)
-                    .font(.caption)
-                    .foregroundColor(.textSecondary)
+        VStack(alignment: .leading, spacing: ThemeConstants.spacingM) {
+            Text("Share Notes Export")
+                .font(.headline)
+                .foregroundColor(.textPrimary)
+
+            Text("The system share sheet is open for the exported notes file.")
+                .font(.subheadline)
+                .foregroundColor(.textSecondary)
+
+            ExportSharePresenter(item: item, onDismiss: onDismiss)
+                .frame(width: 1, height: 1)
+
+            HStack {
                 Spacer()
-
-                Button(action: {
-                    editText = note.content
-                    isEditing.toggle()
-                }) {
-                    Image(systemName: isEditing ? "xmark" : "pencil")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.textSecondary)
+                Button("Close") {
+                    onDismiss()
                 }
-                .buttonStyle(.plain)
-                .help(isEditing ? "Cancel Edit" : "Edit")
-
-                Button(action: {
-                    appState.updateNote(noteId: note.id, isPinned: !note.isPinned)
-                }) {
-                    Image(systemName: note.isPinned ? "pin.slash" : "pin")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .help(note.isPinned ? "Unpin" : "Pin")
-
-                Button(action: { dismiss() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
-                        .foregroundColor(.textSecondary.opacity(0.6))
-                }
-                .buttonStyle(.plain)
-                .help("Close")
-            }
-            .padding(.horizontal, ThemeConstants.spacingM)
-            .padding(.vertical, ThemeConstants.spacingS)
-
-            Divider().background(Color.glassStroke)
-
-            // Content
-            if isEditing {
-                VStack(alignment: .trailing, spacing: ThemeConstants.spacingS) {
-                    TextEditor(text: $editText)
-                        .font(.body)
-                        .scrollContentBackground(.hidden)
-                        .padding(8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(Color.textPrimary.opacity(0.04))
-                        )
-
-                    Button("Save") {
-                        let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !trimmed.isEmpty {
-                            appState.updateNote(noteId: note.id, content: trimmed)
-                        }
-                        isEditing = false
-                        editText = ""
-                    }
-                    .buttonStyle(.plain)
-                    .font(.callout.weight(.semibold))
-                    .foregroundColor(.primaryBlue)
-                    .disabled(editText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                .padding(ThemeConstants.spacingM)
-            } else {
-                ScrollView {
-                    NoteMarkdownView(
-                        blocks: NoteMarkdownParser.parse(note.displayContent),
-                        imageFetcher: { imageId in
-                            await appState.fetchNoteImage(imageId: imageId)
-                        },
-                        noteType: note.noteType
-                    )
-                    .padding(ThemeConstants.spacingM)
-                }
+                .buttonStyle(GlassButtonStyle())
             }
         }
-        .frame(minWidth: 400, idealWidth: 520, maxWidth: 700,
-               minHeight: 300, idealHeight: 480, maxHeight: .infinity)
-        .background(Color.glassBg)
-    }
-
-    private static let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .short
-        return f
-    }()
-
-    private var fullTimestamp: String {
-        Self.dateFormatter.string(from: note.updatedAt)
+        .padding(ThemeConstants.spacingL)
+        .frame(width: 360)
     }
 }
 
-// MARK: - Note Type Chip
+private struct ExportSharePresenter: UIViewControllerRepresentable {
+    let item: ExportShareItem
+    let onDismiss: () -> Void
 
-/// Colored badge displaying the note's semantic type.
+    func makeUIViewController(context: Context) -> ExportShareHostController {
+        let controller = ExportShareHostController()
+        controller.item = item
+        controller.onDismiss = onDismiss
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: ExportShareHostController, context: Context) {
+        uiViewController.item = item
+        uiViewController.onDismiss = onDismiss
+        uiViewController.presentIfNeeded()
+    }
+}
+
+private final class ExportShareHostController: UIViewController {
+    var item: ExportShareItem?
+    var onDismiss: (() -> Void)?
+    private var hasPresented = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        presentIfNeeded()
+    }
+
+    func presentIfNeeded() {
+        guard !hasPresented, presentedViewController == nil, let item else { return }
+        hasPresented = true
+        let controller = UIActivityViewController(activityItems: [item.url], applicationActivities: nil)
+        controller.completionWithItemsHandler = { [weak self] _, _, _, _ in
+            self?.onDismiss?()
+        }
+        present(controller, animated: true)
+    }
+}
+#endif
+
+private struct NoteTabPill: View {
+    let title: String
+    let isActive: Bool
+    let isPrimary: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(isPrimary ? .semibold : .medium))
+                .foregroundColor(isActive ? .white : (isPrimary ? .primaryBlue : .textSecondary))
+                .lineLimit(1)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule().fill(backgroundColor)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var backgroundColor: Color {
+        if isActive {
+            return isPrimary ? .primaryBlue : .secondaryBlue
+        }
+        return isPrimary ? Color.primaryBlue.opacity(0.14) : Color.textPrimary.opacity(0.05)
+    }
+}
+
+private struct NewNoteTabSheet: View {
+    @State private var title: String = ""
+    @State private var content: String = ""
+    let onCancel: () -> Void
+    let onCreate: (String, String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: ThemeConstants.spacingM) {
+            Text("New Notes Tab")
+                .font(.headline)
+                .foregroundColor(.textPrimary)
+
+            TextField("Tab title", text: $title)
+                .textFieldStyle(.roundedBorder)
+
+            TextEditor(text: $content)
+                .font(.body)
+                .frame(minHeight: 180)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.textPrimary.opacity(0.04))
+                )
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    onCancel()
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.textSecondary)
+
+                Button("Create Tab") {
+                    let resolvedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !resolvedContent.isEmpty else { return }
+                    onCreate(resolvedTitle.isEmpty ? "New Tab" : resolvedTitle, resolvedContent)
+                }
+                .buttonStyle(.plain)
+                .font(.callout.weight(.semibold))
+                .foregroundColor(.primaryBlue)
+                .disabled(content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(ThemeConstants.spacingM)
+        .frame(minWidth: 380, idealWidth: 440, maxWidth: 520, minHeight: 300)
+        .background(Color.glassBg)
+    }
+}
+
 private struct NoteTypeChip: View {
     let type: String
 
@@ -864,21 +885,30 @@ private struct NoteTypeChip: View {
     }
 }
 
-// MARK: - Tag Chip
+private struct NoteTagChip: View {
+    let tag: String
 
-// MARK: - Note History View
+    var body: some View {
+        Text(tag)
+            .font(.system(size: 8, weight: .semibold, design: .rounded))
+            .foregroundColor(.textSecondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(
+                Capsule().fill(Color.textPrimary.opacity(0.06))
+            )
+    }
+}
 
-/// Sheet showing version history for a note with content previews and restore option.
 private struct NoteHistoryView: View {
     let noteId: String
     let versions: [IPCNoteVersion]
     let isLoading: Bool
+    var onClose: (() -> Void)?
     var onRestore: ((String) -> Void)?
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack {
                 Image(systemName: "clock.arrow.circlepath")
                     .foregroundColor(.primaryBlue)
@@ -886,12 +916,7 @@ private struct NoteHistoryView: View {
                     .font(.headline)
                     .foregroundColor(.textPrimary)
                 Spacer()
-                if !versions.isEmpty {
-                    Text("\(versions.count) version\(versions.count == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundColor(.textSecondary)
-                }
-                Button(action: { dismiss() }) {
+                Button(action: { onClose?() }) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 16))
                         .foregroundColor(.textSecondary.opacity(0.7))
@@ -905,29 +930,49 @@ private struct NoteHistoryView: View {
             if isLoading {
                 VStack {
                     Spacer()
-                    ProgressView("Loading history\u{2026}")
-                        .font(.callout)
+                    ProgressView("Loading history…")
                     Spacer()
                 }
             } else if versions.isEmpty {
                 VStack(spacing: ThemeConstants.spacingS) {
                     Spacer()
-                    Image(systemName: "clock")
-                        .font(.system(size: 28))
-                        .foregroundColor(.textSecondary.opacity(0.4))
                     Text("No previous versions")
                         .font(.callout)
                         .foregroundColor(.textSecondary)
-                    Text("Versions are saved each time the note is edited.")
-                        .font(.caption)
-                        .foregroundColor(.textSecondary.opacity(0.7))
                     Spacer()
                 }
             } else {
                 ScrollView {
                     LazyVStack(spacing: ThemeConstants.spacingS) {
                         ForEach(versions) { version in
-                            versionCard(version)
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(formattedDate(version.date))
+                                        .font(.caption.weight(.medium))
+                                        .foregroundColor(.secondaryBlue)
+                                    Spacer()
+                                    Button("Restore") {
+                                        onRestore?(version.content)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundColor(.primaryBlue)
+                                }
+
+                                let stripped = Note.stripHTMLComment(
+                                    Note.stripHTMLComment(version.content, prefix: "<!-- note-type:"),
+                                    prefix: "<!-- tags:"
+                                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                                Text(stripped)
+                                    .font(.caption)
+                                    .foregroundColor(.textSecondary)
+                                    .lineLimit(5)
+                            }
+                            .padding(ThemeConstants.spacingS)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(Color.textPrimary.opacity(0.03))
+                            )
                         }
                     }
                     .padding(ThemeConstants.spacingM)
@@ -939,209 +984,10 @@ private struct NoteHistoryView: View {
         .background(Color.glassBg)
     }
 
-    @ViewBuilder
-    private func versionCard(_ version: IPCNoteVersion) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(formattedDate(version.date))
-                    .font(.caption.weight(.medium))
-                    .foregroundColor(.secondaryBlue)
-                Spacer()
-                Button(action: { onRestore?(version.content) }) {
-                    Label("Restore", systemImage: "arrow.uturn.backward")
-                        .font(.caption.weight(.medium))
-                        .foregroundColor(.primaryBlue)
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Content preview (first 4 lines, stripped of metadata)
-            let stripped = Note.stripHTMLComment(
-                Note.stripHTMLComment(version.content, prefix: "<!-- note-type:"),
-                prefix: "<!-- tags:"
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
-            let preview = stripped.components(separatedBy: "\n").prefix(4).joined(separator: "\n")
-            Text(preview)
-                .font(.caption)
-                .foregroundColor(.textSecondary)
-                .lineLimit(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(ThemeConstants.spacingS)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color.textPrimary.opacity(0.03))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.glassStroke.opacity(0.3), lineWidth: 0.5)
-        )
-    }
-
-    private static let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .short
-        return f
-    }()
-
     private func formattedDate(_ date: Date) -> String {
-        Self.dateFormatter.string(from: date)
-    }
-}
-
-private struct NoteTagChip: View {
-    let tag: String
-
-    /// Deterministic color from tag string hash.
-    private var chipColor: Color {
-        let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .cyan, .mint, .indigo, .teal, .yellow]
-        let hash = abs(tag.hashValue)
-        return colors[hash % colors.count]
-    }
-
-    var body: some View {
-        Text(tag)
-            .font(.system(size: 7, weight: .semibold, design: .rounded))
-            .foregroundColor(chipColor)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 1)
-            .background(
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(chipColor.opacity(0.10))
-            )
-    }
-}
-
-// MARK: - Preference Key for Content Height Measurement
-
-private struct NoteContentHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-// MARK: - Note Templates
-
-struct NoteTemplate: Identifiable {
-    let id: String
-    let name: String
-    let icon: String
-    let content: String
-
-    static var all: [NoteTemplate] { [
-        NoteTemplate(
-            id: "meeting",
-            name: "Meeting Notes",
-            icon: "person.3",
-            content: """
-            ## Meeting Notes
-            **Date:** \(Self.todayString)
-            **Attendees:**
-            -
-
-            ## Agenda
-            1.
-
-            ## Action Items
-            - [ ]
-
-            ## Key Decisions
-            -
-            """
-        ),
-        NoteTemplate(
-            id: "lecture",
-            name: "Lecture Notes",
-            icon: "book",
-            content: """
-            ## Lecture Notes
-            **Topic:**
-            **Date:** \(Self.todayString)
-
-            ## Key Concepts
-            -
-
-            ## Definitions
-            - **Term:** Definition
-
-            ## Questions
-            -
-
-            ## Summary
-
-            """
-        ),
-        NoteTemplate(
-            id: "research",
-            name: "Research Notes",
-            icon: "magnifyingglass",
-            content: """
-            ## Research Notes
-            **Topic:**
-
-            ## Sources
-            -
-
-            ## Key Findings
-            -
-
-            ## Open Questions
-            -
-
-            ## Next Steps
-            -
-            """
-        ),
-        NoteTemplate(
-            id: "proscons",
-            name: "Pros & Cons",
-            icon: "scale.3d",
-            content: """
-            ## Pros & Cons
-            **Decision:**
-
-            ## Pros
-            -
-
-            ## Cons
-            -
-
-            ## Verdict
-
-            """
-        ),
-        NoteTemplate(
-            id: "weekly",
-            name: "Weekly Review",
-            icon: "calendar",
-            content: """
-            ## Weekly Review
-            **Week of:** \(Self.todayString)
-
-            ## Accomplishments
-            -
-
-            ## Challenges
-            -
-
-            ## Learnings
-            -
-
-            ## Next Week Goals
-            -
-            """
-        ),
-    ] }
-
-    private static let mediumDateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        return f
-    }()
-
-    private static var todayString: String {
-        mediumDateFormatter.string(from: Date())
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 }

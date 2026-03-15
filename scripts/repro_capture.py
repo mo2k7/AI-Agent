@@ -65,7 +65,7 @@ def main() -> int:
     replay = {
         "captured_at": time.time(),
         "source_report": str(report_path),
-        "socket_path": report.get("socket_path"),
+        "backend_url": report.get("backend_url"),
         "seed": report.get("seed"),
         "scenario": failure.get("scenario"),
         "error": failure.get("error"),
@@ -78,7 +78,8 @@ def main() -> int:
     repro_path = run_dir / "REPRO.txt"
     repro_cmd = (
         f"poetry run python scripts/repro_replay.py "
-        f"--replay {replay_path} --socket-path {report.get('socket_path', '/tmp/ai-agent.sock')} --bisect"
+        f"--replay {replay_path} --backend-url {report.get('backend_url', 'ws://127.0.0.1:8765')} "
+        f"--auth-token \"$AI_AGENT_IPC_AUTH_TOKEN\" --bisect"
     )
     repro_path.write_text(repro_cmd + "\n", encoding="utf-8")
 

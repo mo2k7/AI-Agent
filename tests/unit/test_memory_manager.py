@@ -237,8 +237,6 @@ def test_note_operations_reject_unknown_session_without_creating_session_db(
     )
     manager = MemoryManager(tmp_path / "memory")
     unknown_session = "unknown-session"
-    session_db_path = manager.store._session_db_path(unknown_session)
-    assert not session_db_path.exists()
 
     with pytest.raises(ValueError, match="Unknown session"):
         manager.list_notes(unknown_session)
@@ -248,5 +246,3 @@ def test_note_operations_reject_unknown_session_without_creating_session_db(
         manager.get_note_image(unknown_session, "image-1")
     with pytest.raises(ValueError, match="Unknown session"):
         manager.list_note_versions(unknown_session, "note-1")
-
-    assert not session_db_path.exists()

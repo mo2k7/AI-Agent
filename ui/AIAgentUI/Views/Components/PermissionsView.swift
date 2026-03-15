@@ -43,26 +43,44 @@ struct PermissionsView: View {
             // Footer
             footer
         }
+        #if os(macOS)
         .frame(width: 520, height: 620)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        #endif
         .background(Color.panelBackground)
         .overlay {
             // Guidance overlay for System Settings
             if let guidanceType = permissionsManager.activeGuidance {
+                #if os(macOS)
+                let extraMessage = guidanceType == .fullDiskAccess ? "\n\nYou may need to restart the app for this change to take effect." : ""
+                let needsRestart = guidanceType == .fullDiskAccess
+                #else
+                let extraMessage = ""
+                let needsRestart = false
+                #endif
                 GuidanceOverlay(
                     title: "Grant \(guidanceType.rawValue)",
-                    message: "System Settings has been opened. Find 'AI Agent' in the list and toggle the switch to enable it." + (guidanceType == .fullDiskAccess ? "\n\nYou may need to restart the app for this change to take effect." : ""),
+                    message: "System Settings has been opened. Find 'AI Agent' in the list and toggle the switch to enable it." + extraMessage,
                     onDismiss: { permissionsManager.activeGuidance = nil },
-                    showRestart: guidanceType == .fullDiskAccess,
+                    showRestart: needsRestart,
                     onRestart: { permissionsManager.restartApp() }
                 )
             }
             
             if let bulkTypes = permissionsManager.bulkGuidanceTypes {
+                #if os(macOS)
+                let fdaSuffix = bulkTypes.contains(.fullDiskAccess) ? "\n\nYou may need to restart the app for Full Disk Access to take effect." : ""
+                let needsRestart = bulkTypes.contains(.fullDiskAccess)
+                #else
+                let fdaSuffix = ""
+                let needsRestart = false
+                #endif
                 GuidanceOverlay(
                     title: "Complete Permission Setup",
-                    message: "System Settings has been opened. Please enable the following permissions:\n\n• " + bulkTypes.map { $0.rawValue }.joined(separator: "\n• ") + (bulkTypes.contains(.fullDiskAccess) ? "\n\nYou may need to restart the app for Full Disk Access to take effect." : ""),
+                    message: "System Settings has been opened. Please enable the following permissions:\n\n• " + bulkTypes.map { $0.rawValue }.joined(separator: "\n• ") + fdaSuffix,
                     onDismiss: { permissionsManager.bulkGuidanceTypes = nil },
-                    showRestart: bulkTypes.contains(.fullDiskAccess),
+                    showRestart: needsRestart,
                     onRestart: { permissionsManager.restartApp() }
                 )
             }
@@ -81,11 +99,19 @@ struct PermissionsView: View {
                 .font(.title2.bold())
                 .foregroundColor(.textPrimary)
             
+            #if os(macOS)
             Text("AI Agent needs the following permissions to function properly. These permissions allow the agent to control your Mac and automate tasks on your behalf.")
                 .font(.body)
                 .foregroundColor(.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, ThemeConstants.spacingL)
+            #else
+            Text("AI Agent needs the following permissions to function properly. Please grant them so the app can work as expected.")
+                .font(.body)
+                .foregroundColor(.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, ThemeConstants.spacingL)
+            #endif
         }
         .padding(.vertical, ThemeConstants.spacingL)
     }
@@ -205,36 +231,53 @@ struct PermissionRow: View {
     let onOpenSettings: () -> Void
     
     var body: some View {
-        HStack(spacing: ThemeConstants.spacingM) {
-            // Icon
-            Image(systemName: permission.symbolName)
-                .font(.title2)
-                .foregroundColor(.primaryBlue)
-                .frame(width: 40)
-            
-            // Info
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(permission.rawValue)
-                        .font(.headline)
-                        .foregroundColor(.textPrimary)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: ThemeConstants.spacingM) {
+                // Icon
+                Image(systemName: permission.symbolName)
+                    .font(.title2)
+                    .foregroundColor(.primaryBlue)
+                    .frame(width: 40)
+                
+                // Info
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(permission.rawValue)
+                            .font(.headline)
+                            .foregroundColor(.textPrimary)
+                        
+                        Spacer()
+                        
+                        // Status badge
+                        StatusBadge(status: status)
+                    }
                     
-                    Spacer()
-                    
-                    // Status badge
-                    StatusBadge(status: status)
+                    Text(permission.description)
+                        .font(.caption)
+                        .foregroundColor(.textSecondary)
+                        .lineLimit(2)
                 }
                 
-                Text(permission.description)
-                    .font(.caption)
-                    .foregroundColor(.textSecondary)
-                    .lineLimit(2)
+                // Action button
+                actionButton
             }
+            .padding(ThemeConstants.spacingM)
             
-            // Action button
-            actionButton
+            // Recovery instructions for denied permissions
+            if status == .denied || status == .restricted {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.caption)
+                    Text(permission.recoveryInstructions)
+                        .font(.caption)
+                        .foregroundColor(.textSecondary)
+                }
+                .padding(.horizontal, ThemeConstants.spacingM)
+                .padding(.bottom, ThemeConstants.spacingS)
+                .padding(.top, 2)
+            }
         }
-        .padding(ThemeConstants.spacingM)
         .background(Color.cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium))
         .overlay(
@@ -251,7 +294,7 @@ struct PermissionRow: View {
                 .foregroundColor(.green)
                 .font(.title2)
         case .denied, .restricted:
-            Button("Open Settings") {
+            Button("Fix in Settings") {
                 onOpenSettings()
             }
             .buttonStyle(.bordered)
@@ -491,6 +534,7 @@ struct PermissionsOverlayView: View {
 
                 PermissionsView(permissionsManager: permissionsManager)
             }
+            #if os(macOS)
             .frame(width: 520, height: 660)
             .background(
                 RoundedRectangle(cornerRadius: 20)
@@ -502,6 +546,14 @@ struct PermissionsOverlayView: View {
                     .stroke(Color.white.opacity(0.2), lineWidth: 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: 20))
+            #else
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, ThemeConstants.spacingM)
+            .padding(.vertical, ThemeConstants.spacingXL)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusLarge))
+            .padding(ThemeConstants.spacingM)
+            #endif
         }
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
     }

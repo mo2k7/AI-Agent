@@ -1,0 +1,37 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "read_document",
+    "title": "read_document",
+    "description": "Read text, code, PDF content, or file metadata from a file on the local system.",
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "Absolute path to the target file."
+        },
+        "mode": {
+            "type": "string",
+            "enum": [
+                "text",
+                "code",
+                "pdf",
+                "metadata"
+            ],
+            "default": "text",
+            "description": "The observation mode. 'text' and 'code' extract raw strings, 'pdf' attempts PDF extraction, and 'metadata' returns file statistics."
+        },
+        "byte_range": {
+            "type": "array",
+            "items": {
+                "type": "integer"
+            },
+            "minItems": 2,
+            "maxItems": 2,
+            "description": "Optional [start, end] byte range for partial reading of large files (applies to 'text' and 'code' modes)."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "path"
+    ]
+}

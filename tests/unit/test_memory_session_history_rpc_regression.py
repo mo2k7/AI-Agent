@@ -13,6 +13,7 @@ import pytest
 from agent_host import main as main_module
 from agent_host.config import Config
 from agent_host.ipc.protocol import IncomingRequest
+from agent_host.memory.manager import MemoryManager
 
 
 @pytest.fixture
@@ -33,6 +34,9 @@ class _DummyGeminiClient:
     def __init__(self, **_kwargs: object) -> None:
         pass
 
+    def resolve_text_model(self, requested_model: str | None = None) -> str:
+        return requested_model or "gemini-test"
+
     def send_prompt_with_tools(self, **_kwargs: object) -> dict[str, object]:
         return {"text": "unused"}
 
@@ -45,6 +49,8 @@ def _continuation_ready_client(client_cls: type) -> type:
         def _wrapped_init(self, **kwargs: object) -> None:
             if callable(original_init):
                 original_init(self, **kwargs)
+            if not hasattr(self, "model_name"):
+                self.model_name = kwargs.get("model_name") or "gemini-test"
             if not hasattr(self, "_client"):
                 self._client = SimpleNamespace(
                     models=SimpleNamespace(
@@ -55,6 +61,24 @@ def _continuation_ready_client(client_cls: type) -> type:
                 )
 
         setattr(client_cls, "__init__", _wrapped_init)
+        if not hasattr(client_cls, "resolve_text_model"):
+            setattr(
+                client_cls,
+                "resolve_text_model",
+                lambda self, requested_model=None: requested_model or getattr(self, "model_name", "gemini-test"),
+            )
+        if not hasattr(client_cls, "resolve_image_model"):
+            setattr(
+                client_cls,
+                "resolve_image_model",
+                lambda self, requested_model=None: requested_model or getattr(self, "model_name", "gemini-test"),
+            )
+        if not hasattr(client_cls, "_supports_native_deep_think"):
+            setattr(
+                client_cls,
+                "_supports_native_deep_think",
+                staticmethod(lambda model_name: "thinking" in model_name or "deep-think" in model_name),
+            )
         setattr(client_cls, "_strict_runtime_ready", True)
 
     existing = getattr(client_cls, "send_continuation", None)
@@ -114,11 +138,14 @@ class _FakeServer:
 
     def __init__(
         self,
-        socket_path: str,
+        host: str = "127.0.0.1",
+        port: int = 8765,
         max_clients: int = 5,
         **_kwargs: object,
     ) -> None:
-        self.socket_path = socket_path
+        self.host = host
+        self.port = port
+        self.endpoint_url = f"ws://{host}:{port}"
         self.handlers: dict[str, object] = {}
         self.broadcast_messages: list[dict[str, object]] = []
         self._stop_event = asyncio.Event()
@@ -242,7 +269,7 @@ async def test_session_history_unknown_session_returns_invalid_request_no_side_e
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -313,7 +340,7 @@ async def test_session_history_omitted_memory_mode_does_not_mutate_existing_mode
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -387,7 +414,7 @@ async def test_session_history_rejects_memory_mode_and_does_not_mutate_session_m
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -436,6 +463,94 @@ async def test_session_history_rejects_memory_mode_and_does_not_mutate_session_m
 
 
 @pytest.mark.anyio
+async def test_session_history_page_returns_latest_and_older_pages(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(
+        "AI_AGENT_MEMORY_MASTER_KEY_B64",
+        base64.b64encode(b"p" * 32).decode("ascii"),
+    )
+    monkeypatch.setattr(main_module, "GeminiClient", _continuation_ready_client(_DummyGeminiClient))
+    import agent_host.ipc.server as server_module
+
+    monkeypatch.setattr(server_module, "IPCServer", _FakeServer)
+
+    import agent_host.ipc.hot_reload as hot_reload_module
+
+    monkeypatch.setattr(
+        hot_reload_module,
+        "init_reload_manager",
+        lambda **_kwargs: _DummyReloadManager(),
+    )
+
+    config = Config(
+        gemini_api_key="test-key",
+        schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
+        memory_root=tmp_path / "memory",
+    )
+
+    run_task = asyncio.create_task(
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
+    )
+
+    try:
+        fake_server = await _wait_for_fake_server(timeout_seconds=10.0)
+        assert "session.history_page" in fake_server.handlers
+        client = _DummyClient()
+
+        create_request = IncomingRequest(
+            id="req-create-paged",
+            method="session.create",
+            params={"memory_mode": "on"},
+        )
+        await fake_server.handlers["session.create"](create_request, client)
+        created = json.loads(client.sent[-1].get("result", {}).get("content", "{}"))
+        session_id = str(created["session_id"])
+
+        memory_manager = MemoryManager(tmp_path / "memory")
+        for index in range(10):
+            memory_manager.store.append_message(session_id, role="user", content=f"row-{index}")
+
+        client.sent.clear()
+        latest_request = IncomingRequest(
+            id="req-history-page-latest",
+            method="session.history_page",
+            params={"session_id": session_id, "direction": "latest", "limit": 4},
+        )
+        await fake_server.handlers["session.history_page"](latest_request, client)
+        latest_payload = json.loads(client.sent[-1].get("result", {}).get("content", "{}"))
+        latest_rows = latest_payload.get("messages", [])
+        assert [row.get("turn_index") for row in latest_rows] == [6, 7, 8, 9]
+        assert latest_payload.get("has_older") is True
+        assert latest_payload.get("oldest_turn_index") == 6
+        assert latest_payload.get("newest_turn_index") == 9
+
+        client.sent.clear()
+        older_request = IncomingRequest(
+            id="req-history-page-older",
+            method="session.history_page",
+            params={
+                "session_id": session_id,
+                "direction": "older",
+                "anchor_turn_index": 6,
+                "limit": 4,
+            },
+        )
+        await fake_server.handlers["session.history_page"](older_request, client)
+        older_payload = json.loads(client.sent[-1].get("result", {}).get("content", "{}"))
+        older_rows = older_payload.get("messages", [])
+        assert [row.get("turn_index") for row in older_rows] == [2, 3, 4, 5]
+        assert older_payload.get("has_older") is True
+    finally:
+        latest = _FakeServer.latest
+        if latest is not None:
+            latest.release()
+        result = await asyncio.wait_for(run_task, timeout=5.0)
+        assert result == main_module.EXIT_SUCCESS
+
+
+@pytest.mark.anyio
 async def test_memory_unknown_session_returns_invalid_request_without_db_creation(
     monkeypatch,
     tmp_path: Path,
@@ -464,7 +579,7 @@ async def test_memory_unknown_session_returns_invalid_request_without_db_creatio
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -526,7 +641,7 @@ async def test_session_set_mode_registered_and_updates_mode(monkeypatch, tmp_pat
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -610,7 +725,7 @@ async def test_session_mutation_handlers_emit_lifecycle_system_events(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -704,7 +819,7 @@ async def test_notes_and_memory_mutations_emit_lifecycle_system_events(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -794,7 +909,7 @@ async def test_prompt_record_interaction_emits_session_activity_event(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -858,7 +973,7 @@ async def test_prompt_omitted_memory_mode_uses_existing_session_mode(monkeypatch
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -934,7 +1049,7 @@ async def test_prompt_rejects_invalid_memory_mode_and_unknown_session(monkeypatc
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1027,7 +1142,7 @@ async def test_prompt_rejects_invalid_verbosity_value(monkeypatch, tmp_path: Pat
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1083,7 +1198,7 @@ async def test_prompt_rejects_invalid_execution_mode(monkeypatch, tmp_path: Path
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1140,7 +1255,7 @@ async def test_prompt_teacher_mode_auto_captures_note(monkeypatch, tmp_path: Pat
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1165,7 +1280,7 @@ async def test_prompt_teacher_mode_auto_captures_note(monkeypatch, tmp_path: Pat
         assert not any(message.get("type") == "error" for message in request_messages)
         assert any(
             message.get("type") == "tool_call"
-            and str(message.get("tool", {}).get("name")) == "take_note"
+            and str(message.get("tool", {}).get("name")) == "manage_notes"
             and str(message.get("tool", {}).get("status")) == "success"
             for message in request_messages
         )
@@ -1212,7 +1327,7 @@ async def test_prompt_teacher_mode_no_text_returns_error(monkeypatch, tmp_path: 
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1276,7 +1391,7 @@ async def test_prompt_rejects_non_boolean_deep_think(monkeypatch, tmp_path: Path
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1333,7 +1448,7 @@ async def test_prompt_rejects_deep_think_for_unsupported_model(monkeypatch, tmp_
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1393,7 +1508,7 @@ async def test_prompt_rejects_invalid_presentation_and_stream_animation_modes(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1473,7 +1588,7 @@ async def test_prompt_validates_input_paths_and_plan_mode_statuses(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1585,7 +1700,7 @@ async def test_prompt_plan_mode_discovery_allowed_after_planner_bootstrap(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1685,7 +1800,7 @@ async def test_prompt_plan_mode_allows_discovery_after_planner_tool_runs(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1769,7 +1884,7 @@ async def test_prompt_plan_mode_requests_clarification_before_planning(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1855,7 +1970,7 @@ async def test_prompt_plan_mode_clarification_reply_advances_to_planning(
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -1983,7 +2098,7 @@ async def test_prompt_plan_mode_clarification_reply_does_not_loop_when_model_rea
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -2078,7 +2193,7 @@ async def test_session_create_and_history_reject_invalid_memory_mode(monkeypatch
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -2205,7 +2320,7 @@ async def test_notes_update_rejects_non_boolean_is_pinned(monkeypatch, tmp_path:
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -2280,7 +2395,7 @@ async def test_notes_delete_rejects_unknown_session(monkeypatch, tmp_path: Path)
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -2297,6 +2412,70 @@ async def test_notes_delete_rejects_unknown_session(monkeypatch, tmp_path: Path)
         assert "unknown session" in str(
             client.sent[0].get("error", {}).get("message", "")
         ).lower()
+    finally:
+        latest = _FakeServer.latest
+        if latest is not None:
+            latest.release()
+        result = await asyncio.wait_for(run_task, timeout=5.0)
+        assert result == main_module.EXIT_SUCCESS
+
+
+@pytest.mark.anyio
+async def test_session_list_limit_zero_returns_all_saved_sessions(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(
+        "AI_AGENT_MEMORY_MASTER_KEY_B64",
+        base64.b64encode(b"2" * 32).decode("ascii"),
+    )
+    monkeypatch.setattr(main_module, "GeminiClient", _continuation_ready_client(_DummyGeminiClient))
+    import agent_host.ipc.server as server_module
+
+    monkeypatch.setattr(server_module, "IPCServer", _FakeServer)
+
+    import agent_host.ipc.hot_reload as hot_reload_module
+
+    monkeypatch.setattr(
+        hot_reload_module,
+        "init_reload_manager",
+        lambda **_kwargs: _DummyReloadManager(),
+    )
+
+    config = Config(
+        gemini_api_key="test-key",
+        schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
+        memory_root=tmp_path / "memory",
+    )
+
+    run_task = asyncio.create_task(
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
+    )
+
+    try:
+        fake_server = await _wait_for_fake_server()
+        client = _DummyClient()
+        created_session_ids: list[str] = []
+
+        for index in range(3):
+            request = IncomingRequest(
+                id=f"req-create-session-{index}",
+                method="session.create",
+                params={"title": f"Session {index}", "memory_mode": "ephemeral"},
+            )
+            await fake_server.handlers["session.create"](request, client)
+            payload = json.loads(client.sent[-1].get("result", {}).get("content", "{}"))
+            created_session_ids.append(str(payload["session_id"]))
+
+        client.sent.clear()
+        list_request = IncomingRequest(
+            id="req-list-all-sessions",
+            method="session.list",
+            params={"limit": 0},
+        )
+        await fake_server.handlers["session.list"](list_request, client)
+
+        assert client.sent and client.sent[0].get("type") == "result"
+        sessions = json.loads(client.sent[0].get("result", {}).get("content", "[]"))
+        returned_ids = {str(row.get("session_id")) for row in sessions}
+        assert set(created_session_ids).issubset(returned_ids)
     finally:
         latest = _FakeServer.latest
         if latest is not None:

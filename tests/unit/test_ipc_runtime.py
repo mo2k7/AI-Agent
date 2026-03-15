@@ -17,6 +17,7 @@ from agent_host import main as main_module
 from agent_host.config import Config
 from agent_host.ipc.protocol import ErrorMessage, IncomingRequest
 from agent_host.ipc.server import IPCServer
+from tests.unit.websocket_test_harness import connect_line_transport, reserve_tcp_port
 
 TEST_IPC_AUTH_TOKEN = "test-ipc-auth-token"
 
@@ -48,6 +49,26 @@ def _embedding_ready_gemini_client(gemini_client_cls: type) -> type:
                         )
                     )
                 )
+            configured_model = kwargs.get("model_name")
+            if not hasattr(self, "model_name"):
+                self.model_name = configured_model or "gemini-test"
+
+        def resolve_text_model(self, requested_model: str | None = None) -> str:
+            if requested_model:
+                return requested_model
+            configured = getattr(self, "model_name", None)
+            if isinstance(configured, str) and configured.strip():
+                return configured
+            return "gemini-test"
+
+        def resolve_image_model(
+            self,
+            requested_model: str | None = None,
+            *,
+            require_generation: bool = False,
+        ) -> str:
+            del require_generation
+            return self.resolve_text_model(requested_model)
 
         def send_continuation(self, **kwargs: object) -> dict[str, object]:
             base_impl = getattr(gemini_client_cls, "send_continuation", None)
@@ -59,6 +80,17 @@ def _embedding_ready_gemini_client(gemini_client_cls: type) -> type:
             return {"text": ""}
 
     return _EmbeddingReadyGeminiClient
+
+
+def test_live_web_audit_instruction_requires_browse_or_ready_prefix() -> None:
+    instruction = main_module._build_live_web_audit_instruction(
+        root_prompt="What are the newest model rankings right now?",
+        draft_response="Based on early 2025, model X leads.",
+    )
+
+    assert "browse_web" in instruction
+    assert main_module._FINAL_ANSWER_READY_PREFIX in instruction
+    assert "Do not describe this audit step to the user." in instruction
 
 
 class _DummyClient:
@@ -74,7 +106,7 @@ class _DummyClient:
 @pytest.mark.anyio
 async def test_handle_message_parse_error_falls_back_to_global_id() -> None:
     """Malformed JSON parse errors should use the global fallback request id."""
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-parse.sock")
+    server = IPCServer()
     client = _DummyClient()
 
     malformed_payload = '{"jsonrpc":"2.0","id":"req-parse-1","method":"prompt",'
@@ -89,7 +121,7 @@ async def test_handle_message_parse_error_falls_back_to_global_id() -> None:
 
 @pytest.mark.anyio
 async def test_handle_message_invalid_request_rejects_non_string_method() -> None:
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-invalid-method.sock")
+    server = IPCServer()
     client = _DummyClient()
 
     payload = json.dumps(
@@ -112,7 +144,7 @@ async def test_handle_message_invalid_request_rejects_non_string_method() -> Non
 
 @pytest.mark.anyio
 async def test_handle_message_invalid_request_rejects_non_object_payload() -> None:
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-invalid-shape.sock")
+    server = IPCServer()
     client = _DummyClient()
 
     await server._handle_message("client-invalid-shape", client, '["not","an","object"]')
@@ -127,7 +159,7 @@ async def test_handle_message_invalid_request_rejects_non_object_payload() -> No
 @pytest.mark.anyio
 async def test_handle_message_internal_error_includes_request_id() -> None:
     """Internal handler failures should return an error mapped to the request id."""
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-internal.sock")
+    server = IPCServer()
     client = _DummyClient()
 
     async def broken_handler(*_args: object) -> None:
@@ -156,7 +188,7 @@ async def test_handle_message_internal_error_includes_request_id() -> None:
 @pytest.mark.anyio
 async def test_handle_message_internal_error_falls_back_when_exception_is_empty() -> None:
     """Internal handler failures with empty exception text should still be descriptive."""
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-internal-empty.sock")
+    server = IPCServer()
     client = _DummyClient()
 
     async def broken_handler(*_args: object) -> None:
@@ -187,7 +219,7 @@ async def test_handle_message_internal_error_falls_back_when_exception_is_empty(
 
 def test_trace_message_write_failure_is_non_fatal(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AI_AGENT_DEBUG_PROTOCOL_TRACE", "1")
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-trace-write-failure.sock")
+    server = IPCServer()
     # Force write failure: assigning a directory path causes open("a") to fail.
     server._trace_enabled = True
     server._trace_path = tmp_path
@@ -199,19 +231,45 @@ def test_trace_message_write_failure_is_non_fatal(tmp_path, monkeypatch: pytest.
     )
 
 
-async def _wait_for_socket(path: Path, timeout_seconds: float = 10.0) -> None:
-    """Wait until the Unix socket path appears."""
+def test_build_ssl_context_allows_plain_ws_when_tls_not_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AI_AGENT_REQUIRE_TLS", raising=False)
+    monkeypatch.delenv("AI_AGENT_TLS_CERT", raising=False)
+    monkeypatch.delenv("AI_AGENT_TLS_KEY", raising=False)
+
+    server = IPCServer()
+
+    assert server._build_ssl_context() is None
+
+
+def test_build_ssl_context_refuses_plain_ws_when_tls_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AI_AGENT_REQUIRE_TLS", "1")
+    monkeypatch.delenv("AI_AGENT_TLS_CERT", raising=False)
+    monkeypatch.delenv("AI_AGENT_TLS_KEY", raising=False)
+
+    server = IPCServer()
+
+    with pytest.raises(RuntimeError, match="AI_AGENT_REQUIRE_TLS"):
+        server._build_ssl_context()
+
+
+async def _connect_transport(endpoint_url: str, timeout_seconds: float = 10.0):
+    """Connect to the WebSocket endpoint once the server is ready."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
-        if path.exists():
-            return
-        await asyncio.sleep(0.02)
-    raise TimeoutError(f"Socket did not appear in time: {path}")
+        try:
+            return await connect_line_transport(endpoint_url)
+        except OSError:
+            await asyncio.sleep(0.02)
+    raise TimeoutError(f"WebSocket endpoint did not become ready in time: {endpoint_url}")
 
 
 async def _authenticate_socket(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
+    reader,
+    writer,
     *,
     token: str = TEST_IPC_AUTH_TOKEN,
     timeout_seconds: float = 5.0,
@@ -250,8 +308,8 @@ async def _authenticate_socket(
 
 
 async def _create_session_via_socket(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
+    reader,
+    writer,
     *,
     timeout_seconds: float = 5.0,
 ) -> str:
@@ -327,19 +385,19 @@ async def test_run_server_cancel_cancels_inflight_prompt(monkeypatch) -> None:
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -412,8 +470,6 @@ async def test_run_server_cancel_cancels_inflight_prompt(monkeypatch) -> None:
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -462,7 +518,8 @@ async def test_run_server_cancel_rejects_cross_client_request_id(monkeypatch, tm
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-cancel-auth-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -470,14 +527,13 @@ async def test_run_server_cancel_rejects_cross_client_request_id(monkeypatch, tm
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader1, writer1 = await asyncio.open_unix_connection(str(socket_path))
+        reader1, writer1 = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader1, writer1)
-        reader2, writer2 = await asyncio.open_unix_connection(str(socket_path))
+        reader2, writer2 = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader2, writer2)
         try:
             session_id = await _create_session_via_socket(reader1, writer1)
@@ -568,8 +624,6 @@ async def test_run_server_cancel_rejects_cross_client_request_id(monkeypatch, tm
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -623,7 +677,8 @@ async def test_run_server_rejects_oversized_unterminated_request_buffer(
     monkeypatch.setattr(server_module.IPCServer, "MAX_INCOMING_BUFFER", 512)
     monkeypatch.setenv("AI_AGENT_IPC_AUTH_TOKEN", "a")
 
-    socket_path = Path(f"/tmp/ai-agent-test-buffer-cap-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -631,28 +686,18 @@ async def test_run_server_rejects_oversized_unterminated_request_buffer(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer, token="a")
         try:
             writer.write(b"x" * 1024)
             await writer.drain()
 
             line = await asyncio.wait_for(reader.readline(), timeout=3.0)
-            assert line
-            message = json.loads(line.decode("utf-8"))
-            assert message.get("id") == "global"
-            assert message.get("type") == "error"
-            assert message.get("error", {}).get("code") == ErrorMessage.PARSE_ERROR
-            assert "too large" in str(message.get("error", {}).get("message", "")).lower()
-
-            # Connection should be closed by server after emitting the parse error.
-            eof = await asyncio.wait_for(reader.readline(), timeout=3.0)
-            assert eof == b""
+            assert line == b""
         finally:
             writer.close()
             await writer.wait_closed()
@@ -660,8 +705,6 @@ async def test_run_server_rejects_oversized_unterminated_request_buffer(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -709,19 +752,19 @@ async def test_run_server_rejects_non_string_or_blank_prompt(monkeypatch, prompt
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-prompt-validate-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             request_id = "req-prompt-validate-1"
@@ -749,8 +792,6 @@ async def test_run_server_rejects_non_string_or_blank_prompt(monkeypatch, prompt
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -796,11 +837,14 @@ async def test_prompt_disconnect_mid_request_suppresses_post_disconnect_emission
 
         def __init__(
             self,
-            socket_path: str,
+            host: str = "127.0.0.1",
+            port: int = 8765,
             max_clients: int = 5,
             **_kwargs: object,
         ) -> None:
-            self.socket_path = socket_path
+            self.host = host
+            self.port = port
+            self.endpoint_url = f"ws://{host}:{port}"
             self.handlers: dict[str, object] = {}
             self._stop_event = asyncio.Event()
             _FakeServer.latest = self
@@ -880,7 +924,7 @@ async def test_prompt_disconnect_mid_request_suppresses_post_disconnect_emission
     )
 
     run_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path="/tmp/fake.sock", verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=8765, verbose=False)
     )
 
     try:
@@ -975,7 +1019,8 @@ async def test_run_server_executes_tool_call_and_returns_result(monkeypatch, tmp
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-tool-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -987,12 +1032,11 @@ async def test_run_server_executes_tool_call_and_returns_result(monkeypatch, tmp
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -1043,8 +1087,154 @@ async def test_run_server_executes_tool_call_and_returns_result(monkeypatch, tmp
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
+
+
+@pytest.mark.anyio
+async def test_run_server_audits_text_only_answer_and_forces_browse_before_finalizing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(
+        "AI_AGENT_MEMORY_MASTER_KEY_B64",
+        base64.b64encode(b"b" * 32).decode("ascii"),
+    )
+
+    state = {"prompt_calls": 0, "continuation_calls": 0, "browse_calls": 0}
+
+    class _AuditedBrowseGeminiClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def send_prompt_with_tools(self, **_kwargs: object) -> dict[str, object]:
+            state["prompt_calls"] += 1
+            return {"text": "Based on the early 2025 landscape, here is the ranking."}
+
+        def send_continuation(self, **_kwargs: object) -> dict[str, object]:
+            state["continuation_calls"] += 1
+            if state["continuation_calls"] == 1:
+                return {
+                    "function_call": {
+                        "name": "browse_web",
+                        "args": {"search_query": "latest llm leaderboard", "timeout_seconds": 3},
+                    }
+                }
+            return {"text": "Live lookup complete with current web sources."}
+
+    class _DummyReloadManager:
+        version = 1
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+        def on_reload(self, _callback) -> None:
+            return None
+
+        def reload_modules(self, trigger: str):
+            return SimpleNamespace(success=True, error=None, trigger=trigger)
+
+    monkeypatch.setattr(
+        main_module,
+        "GeminiClient",
+        _embedding_ready_gemini_client(_AuditedBrowseGeminiClient),
+    )
+
+    import agent_host.ipc.hot_reload as hot_reload_module
+    import agent_host.tools.browse_web as browse_web_module
+
+    monkeypatch.setattr(
+        hot_reload_module,
+        "init_reload_manager",
+        lambda **_kwargs: _DummyReloadManager(),
+    )
+
+    def _fake_browse_handle(_executor, _arguments):
+        state["browse_calls"] += 1
+        return {
+            "ok": True,
+            "title": "LLM rankings",
+            "content": "Fresh web content",
+            "final_url": "https://example.com/leaderboard",
+            "effective_browse_profile": "standard",
+            "policy_warnings": [],
+        }
+
+    monkeypatch.setattr(browse_web_module, "handle", _fake_browse_handle)
+
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
+    config = Config(
+        gemini_api_key="test-key",
+        schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
+        memory_root=tmp_path / "memory",
+        automations_dir=tmp_path / "automations",
+    )
+
+    server_task = asyncio.create_task(
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
+    )
+
+    try:
+        reader, writer = await _connect_transport(endpoint_url)
+        await _authenticate_socket(reader, writer)
+        try:
+            session_id = await _create_session_via_socket(reader, writer)
+            request_id = "req-browse-audit-1"
+            prompt_request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "prompt",
+                "params": {
+                    "prompt": "What are the latest LLM rankings right now?",
+                    "model": "gemini-3-flash-preview",
+                    "session_id": session_id,
+                },
+            }
+            writer.write((json.dumps(prompt_request) + "\n").encode("utf-8"))
+            await writer.drain()
+
+            saw_live_web_status = False
+            saw_browse_tool = False
+            final_result = ""
+            saw_complete = False
+
+            deadline = asyncio.get_running_loop().time() + 8.0
+            while asyncio.get_running_loop().time() < deadline:
+                remaining = deadline - asyncio.get_running_loop().time()
+                line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+                if not line:
+                    break
+
+                message = json.loads(line.decode("utf-8"))
+                if message.get("id") != request_id:
+                    continue
+                if message.get("type") == "status":
+                    if message.get("detail") == "Verifying whether live web lookup is needed...":
+                        saw_live_web_status = True
+                    if message.get("status") == "calling_tool" and message.get("detail") == "browse_web":
+                        saw_browse_tool = True
+                    if message.get("status") == "complete":
+                        saw_complete = True
+                if message.get("type") == "result":
+                    final_result = str(message.get("result", {}).get("content", ""))
+                if saw_live_web_status and saw_browse_tool and final_result and saw_complete:
+                    break
+
+            assert saw_live_web_status, "Expected live web audit status before finalizing."
+            assert saw_browse_tool, "Expected browse_web to be called after audit."
+            assert final_result == "Live lookup complete with current web sources."
+            assert "early 2025" not in final_result
+            assert state["browse_calls"] == 1
+            assert state["continuation_calls"] >= 2
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(server_task, timeout=5.0)
 
 
 @pytest.mark.anyio
@@ -1083,21 +1273,21 @@ async def test_run_server_executes_generate_image_tool_and_persists_file(
         def send_continuation(self, **_kwargs: object) -> dict[str, object]:
             return {"text": "Image created successfully."}
 
-        def generate_images(self, **kwargs: object) -> dict[str, object]:
+        def generate_image(self, **kwargs: object) -> dict[str, object]:
             state["generate_calls"] += 1
             assert kwargs.get("prompt") == "A simple sketch of a cat."
             assert kwargs.get("number_of_images") == 1
             return {
-                "model": "imagen-4.0-fast-generate-001",
+                "model": "gemini-2.0-flash-exp-image-generation",
                 "images": [
                     {
                         "bytes": b"\x89PNG\r\n\x1a\nfake",
-                        "width": 512,
-                        "height": 512,
-                        "rai_filtered_reason": "",
-                        "safety_attributes": None,
+                        "mime_type": "image/png",
+                        "width": 0,
+                        "height": 0,
                     }
                 ],
+                "text_responses": [],
             }
 
     class _DummyReloadManager:
@@ -1128,7 +1318,8 @@ async def test_run_server_executes_generate_image_tool_and_persists_file(
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-generate-image-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -1141,12 +1332,11 @@ async def test_run_server_executes_generate_image_tool_and_persists_file(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -1210,8 +1400,6 @@ async def test_run_server_executes_generate_image_tool_and_persists_file(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -1246,9 +1434,9 @@ async def test_run_server_generate_image_rejects_invalid_boolean_inputs(
         def send_continuation(self, **_kwargs: object) -> dict[str, object]:
             return {"text": "Handled validation error."}
 
-        def generate_images(self, **_kwargs: object) -> dict[str, object]:
+        def generate_image(self, **_kwargs: object) -> dict[str, object]:
             state["generate_calls"] += 1
-            return {"model": "imagen-4.0-fast-generate-001", "images": []}
+            return {"model": "gemini-2.0-flash-exp-image-generation", "images": [], "text_responses": []}
 
     class _DummyReloadManager:
         version = 1
@@ -1278,9 +1466,8 @@ async def test_run_server_generate_image_rejects_invalid_boolean_inputs(
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(
-        f"/tmp/ai-agent-test-generate-image-invalid-{uuid.uuid4().hex[:8]}.sock"
-    )
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -1292,12 +1479,11 @@ async def test_run_server_generate_image_rejects_invalid_boolean_inputs(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -1353,8 +1539,6 @@ async def test_run_server_generate_image_rejects_invalid_boolean_inputs(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -1406,7 +1590,8 @@ async def test_apply_ops_tool_waits_for_confirmation_before_execution(monkeypatc
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-confirm-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -1418,12 +1603,11 @@ async def test_apply_ops_tool_waits_for_confirmation_before_execution(monkeypatc
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -1528,8 +1712,6 @@ async def test_apply_ops_tool_waits_for_confirmation_before_execution(monkeypatc
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -1581,7 +1763,8 @@ async def test_apply_ops_tool_denied_confirmation_fails_without_execution(monkey
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-deny-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -1593,12 +1776,11 @@ async def test_apply_ops_tool_denied_confirmation_fails_without_execution(monkey
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -1694,8 +1876,6 @@ async def test_apply_ops_tool_denied_confirmation_fails_without_execution(monkey
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -1798,7 +1978,8 @@ async def test_plan_ops_chains_to_apply_ops_via_send_continuation(
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-chain-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -1810,12 +1991,11 @@ async def test_plan_ops_chains_to_apply_ops_via_send_continuation(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -1931,8 +2111,6 @@ async def test_plan_ops_chains_to_apply_ops_via_send_continuation(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -1985,7 +2163,8 @@ async def test_plan_mode_rejects_apply_ops_without_prior_plan(
 
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    socket_path = Path(f"/tmp/ai-agent-test-plan-mode-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -1997,12 +2176,11 @@ async def test_plan_mode_rejects_apply_ops_without_prior_plan(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -2064,8 +2242,6 @@ async def test_plan_mode_rejects_apply_ops_without_prior_plan(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -2123,7 +2299,8 @@ async def test_plan_mode_rejects_create_directory_tool(
 
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    socket_path = Path(f"/tmp/ai-agent-test-plan-mode-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -2132,12 +2309,11 @@ async def test_plan_mode_rejects_create_directory_tool(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -2199,8 +2375,6 @@ async def test_plan_mode_rejects_create_directory_tool(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()
 
 
 @pytest.mark.anyio
@@ -2262,7 +2436,8 @@ async def test_tool_chain_depth_limit_returns_last_non_terminal_result(
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    socket_path = Path(f"/tmp/ai-agent-test-depth-{uuid.uuid4().hex[:8]}.sock")
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
     config = Config(
         gemini_api_key="test-key",
         schemas_dir=Path(__file__).resolve().parents[2] / "schemas",
@@ -2274,12 +2449,11 @@ async def test_tool_chain_depth_limit_returns_last_non_terminal_result(
     )
 
     server_task = asyncio.create_task(
-        main_module.run_server(config=config, socket_path=str(socket_path), verbose=False)
+        main_module.run_server(config=config, host="127.0.0.1", port=port, verbose=False)
     )
 
     try:
-        await _wait_for_socket(socket_path)
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         await _authenticate_socket(reader, writer)
         try:
             session_id = await _create_session_via_socket(reader, writer)
@@ -2338,5 +2512,3 @@ async def test_tool_chain_depth_limit_returns_last_non_terminal_result(
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(server_task, timeout=5.0)
-        if socket_path.exists():
-            socket_path.unlink()

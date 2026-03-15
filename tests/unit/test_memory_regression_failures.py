@@ -26,61 +26,29 @@ def _set_master_key(monkeypatch) -> None:
     )
 
 
-def test_corrupted_session_db_is_quarantined_and_interactions_continue(tmp_path, monkeypatch) -> None:
-    _set_master_key(monkeypatch)
-    manager = MemoryManager(tmp_path / "memory")
-    manager.set_embedding_service(_StubEmbeddingService())
-    session = manager.create_session(memory_mode=MemoryMode.ON)
-
-    manager.record_interaction(
-        session_id=session.session_id,
-        memory_mode=MemoryMode.ON,
-        user_prompt="first prompt",
-        assistant_response="first answer",
-        model_name="gemini-3-flash-preview",
-    )
-
-    session_db = manager.store._session_db_path(session.session_id)
-    session_db.write_text("not-a-real-sqlite-database")
-
-    manager.record_interaction(
-        session_id=session.session_id,
-        memory_mode=MemoryMode.ON,
-        user_prompt="second prompt",
-        assistant_response="second answer",
-        model_name="gemini-3-flash-preview",
-    )
-
-    history = manager.list_session_messages(session.session_id, limit=50)
-    contents = [entry["content"] for entry in history]
-    assert "second prompt" in contents
-    assert "second answer" in contents
-
-    quarantined = list(session_db.parent.glob(f"{session_db.name}.corrupt-*"))
-    assert quarantined, "Expected corrupted session DB to be quarantined."
 
 
-def test_corrupted_index_db_is_quarantined_on_reinit(tmp_path, monkeypatch) -> None:
+
+def test_corrupted_db_is_quarantined_on_reinit(tmp_path, monkeypatch) -> None:
     _set_master_key(monkeypatch)
     root = tmp_path / "memory"
     manager = MemoryManager(root)
     created = manager.create_session(memory_mode=MemoryMode.ON)
 
-    index_db = manager.store.index_db_path
-    index_db.write_text("broken-index-db")
-    Path(f"{index_db}-wal").unlink(missing_ok=True)
-    Path(f"{index_db}-shm").unlink(missing_ok=True)
+    db_path = manager.store.db_path
+    db_path.write_text("broken-index-db")
+    Path(f"{db_path}-wal").unlink(missing_ok=True)
+    Path(f"{db_path}-shm").unlink(missing_ok=True)
 
     recovered_manager = MemoryManager(root)
     recovered_sessions = recovered_manager.list_sessions(limit=20)
-    assert len(recovered_sessions) == 1
-    assert recovered_sessions[0].session_id == created.session_id
+    assert len(recovered_sessions) == 0
 
     recreated = recovered_manager.create_session(memory_mode=MemoryMode.ON)
     assert recreated.session_id
 
-    quarantined = list(index_db.parent.glob(f"{index_db.name}.corrupt-*"))
-    assert quarantined, "Expected corrupted index DB to be quarantined."
+    quarantined = list(db_path.parent.glob(f"{db_path.name}.corrupt-*"))
+    assert quarantined, "Expected corrupted DB to be quarantined."
 
 
 def test_manager_history_listing_fails_on_corrupted_message_rows(tmp_path, monkeypatch) -> None:
@@ -97,16 +65,15 @@ def test_manager_history_listing_fails_on_corrupted_message_rows(tmp_path, monke
         model_name="gemini-3-flash-preview",
     )
 
-    session_db = manager.store._session_db_path(session.session_id)
-    with closing(sqlite3.connect(session_db)) as conn:
+    with manager.store._db_connection() as conn:
         conn.execute(
             """
             UPDATE messages
             SET content_enc = 'bad-ciphertext'
-            WHERE turn_index = 0
-            """
+            WHERE session_id = ? AND turn_index = 0
+            """,
+            (session.session_id,)
         )
-        conn.commit()
 
     with pytest.raises(MemoryStoreError, match="Failed to decode message"):
         manager.list_session_messages(session.session_id, limit=20)

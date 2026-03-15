@@ -2,7 +2,7 @@
 # start_latest_app.sh — Complete clean-build startup for the AI Agent.
 #
 # Guarantees every launch runs against freshly compiled code with no
-# stale threads, sockets, caches, or derived data from previous runs.
+# stale threads, listeners, caches, or derived data from previous runs.
 #
 # Safety:  SIGTERM first, SIGKILL only after grace period.
 #          Process-group kill so child trees die too.
@@ -54,10 +54,6 @@ fi
 export AI_AGENT_BOOTSTRAPPED=1
 
 _resolve_poetry_bin() {
-  if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/poetry" ]]; then
-    printf "%s\n" "${VIRTUAL_ENV}/bin/poetry"
-    return 0
-  fi
   if command -v poetry >/dev/null 2>&1; then
     command -v poetry
     return 0
@@ -73,20 +69,34 @@ _resolve_poetry_bin() {
   return 1
 }
 
+_resolve_runtime_python() {
+  if [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
+    printf "%s\n" "${PROJECT_ROOT}/.venv/bin/python"
+    return 0
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    printf "%s\n" "${VIRTUAL_ENV}/bin/python"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+RUNTIME_PYTHON="$(_resolve_runtime_python || true)"
+
 POETRY_BIN=""
 if POETRY_BIN="$(_resolve_poetry_bin)"; then
   :
-elif [[ "${SKIP_BACKEND}" -eq 0 ]]; then
+elif [[ "${SKIP_BACKEND}" -eq 0 ]] && [[ -z "${RUNTIME_PYTHON}" ]]; then
   if ! command -v python3 >/dev/null 2>&1; then
     echo "[prereq] Poetry missing and python3 unavailable for Poetry install." >&2
     exit 1
   fi
   echo "[prereq] Poetry not found; installing Poetry..." >&2
-  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    python3 -m pip install "poetry>=1.8,<2.0" >&2
-  else
-    python3 -m pip install --user "poetry>=1.8,<2.0" >&2
-  fi
+  python3 -m pip install --user "poetry>=1.8,<2.0" >&2
   hash -r
   if ! POETRY_BIN="$(_resolve_poetry_bin)"; then
     echo "[prereq] Poetry install completed but poetry binary is still unavailable." >&2
@@ -229,16 +239,12 @@ _collect_child_pids() {
   return 0
 }
 
-_collect_pids_from_sockets() {
+_collect_pids_from_backend_port() {
   command -v lsof >/dev/null 2>&1 || return 0
-  local sock pid
-  shopt -s nullglob
-  for sock in /tmp/ai-agent-*.sock; do
-    while IFS= read -r pid; do
-      _add_target_pid_if_agent "${pid}"
-    done < <(lsof -t -- "${sock}" 2>/dev/null || true)
-  done
-  shopt -u nullglob
+  local pid
+  while IFS= read -r pid; do
+    _add_target_pid_if_agent "${pid}"
+  done < <(lsof -tiTCP:"${AI_AGENT_BACKEND_PORT}" -sTCP:LISTEN 2>/dev/null || true)
   return 0
 }
 
@@ -246,7 +252,7 @@ _collect_related_pids() {
   TARGET_PIDS=()
   TARGET_PGIDS=()
   _collect_pids_from_pid_files
-  _collect_pids_from_sockets
+  _collect_pids_from_backend_port
   _collect_pids_by_substring "${PROJECT_ROOT}/scripts/start_latest_app.sh"
   _collect_pids_by_substring "${PROJECT_ROOT}/scripts/run_backend.sh"
   _collect_pids_by_substring "${PROJECT_ROOT}/scripts/run_frontend.sh"
@@ -324,16 +330,21 @@ _terminate_collected_pids() {
 }
 
 # ──────────────────────────────────────────────────────────────
-# Stale socket cleanup
+# Listener cleanup
 # ──────────────────────────────────────────────────────────────
-_clean_stale_sockets() {
-  local sock
-  shopt -s nullglob
-  for sock in /tmp/ai-agent-*.sock; do
-    echo "[cleanup] Removing stale socket: ${sock}"
-    rm -f "${sock}"
-  done
-  shopt -u nullglob
+_assert_backend_port_released() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    echo "[cleanup] Releasing stale backend listener on port ${AI_AGENT_BACKEND_PORT} (pid ${pid})"
+    kill -TERM "${pid}" 2>/dev/null || true
+  done < <(lsof -tiTCP:"${AI_AGENT_BACKEND_PORT}" -sTCP:LISTEN 2>/dev/null || true)
+  sleep 0.2
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    kill -9 "${pid}" 2>/dev/null || true
+  done < <(lsof -tiTCP:"${AI_AGENT_BACKEND_PORT}" -sTCP:LISTEN 2>/dev/null || true)
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -410,7 +421,7 @@ _fresh_start_cleanup() {
   done
   shopt -u nullglob
 
-  _clean_stale_sockets
+  _assert_backend_port_released
   _clean_python_cache
   _rotate_artifacts
 }
@@ -479,15 +490,15 @@ if ! command -v swift >/dev/null 2>&1; then
   echo "[prereq] swift is required but was not found in PATH." >&2
   exit 1
 fi
-if [[ "${SKIP_BACKEND}" -eq 0 ]] && [[ -z "${POETRY_BIN}" ]]; then
-  echo "[prereq] poetry is required but was not found in PATH or standard install locations." >&2
+if [[ "${SKIP_BACKEND}" -eq 0 ]] && [[ -z "${POETRY_BIN}" ]] && [[ -z "${RUNTIME_PYTHON}" ]]; then
+  echo "[prereq] no usable Python runtime or Poetry toolchain was found." >&2
   exit 1
 fi
 
 mkdir -p "${AI_AGENT_RUN_DIR}"
 echo "[config] run_id    = ${AI_AGENT_RUN_ID}"
 echo "[config] run_dir   = ${AI_AGENT_RUN_DIR}"
-echo "[config] socket    = ${AI_AGENT_SOCKET_PATH}"
+echo "[config] backend   = ${AI_AGENT_BACKEND_URL}"
 echo "[config] build_log = ${BUILD_LOG}"
 
 PROJECT_CACHE_ROOT="${PROJECT_ROOT}/.ai-agent-cache"
@@ -505,10 +516,11 @@ _compute_file_sha256() {
 
 _compute_poetry_deps_fingerprint() {
   local poetry_version python_version lock_hash pyproject_hash
-  poetry_version="$("${POETRY_BIN}" --version 2>/dev/null | tr -s ' ' || printf "unknown")"
+  poetry_version="$("${POETRY_BIN:-poetry-missing}" --version 2>/dev/null | tr -s ' ' || printf "unknown")"
   python_version="$(
     cd "${PROJECT_ROOT}" \
-      && "${POETRY_BIN}" run python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>/dev/null \
+      && [[ -n "${RUNTIME_PYTHON}" ]] \
+      && "${RUNTIME_PYTHON}" -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>/dev/null \
       || printf "unknown"
   )"
   lock_hash="$(_compute_file_sha256 "${PROJECT_ROOT}/poetry.lock")"
@@ -520,7 +532,8 @@ _compute_poetry_deps_fingerprint() {
 _poetry_env_ready() {
   (
     cd "${PROJECT_ROOT}" \
-      && "${POETRY_BIN}" run python -c "import agent_host"
+      && [[ -n "${RUNTIME_PYTHON}" ]] \
+      && "${RUNTIME_PYTHON}" -c "import importlib; [importlib.import_module(name) for name in ('agent_host','google.genai','jsonschema','dotenv','cryptography','unified_planning','spacy','bs4','websockets')]"
   ) >/dev/null 2>&1
 }
 
@@ -557,13 +570,15 @@ if [[ "${SKIP_BACKEND}" -eq 0 ]]; then
     && [[ "$(cat "${POETRY_DEPS_STAMP}")" == "${POETRY_DEPS_FINGERPRINT}" ]] \
     && _poetry_env_ready; then
     echo "[build] Python dependencies unchanged; using cached Poetry environment."
+  elif _poetry_env_ready; then
+    printf "%s" "${POETRY_DEPS_FINGERPRINT}" > "${POETRY_DEPS_STAMP}"
+    echo "[build] Python environment validated; reusing installed Poetry environment."
   else
     POETRY_INSTALL_REQUIRED=1
     echo "[build] Syncing Python dependencies (background)…"
     (
       cd "${PROJECT_ROOT}"
-      "${POETRY_BIN}" install --no-interaction --sync --quiet 2>&1 \
-        || "${POETRY_BIN}" install --no-interaction --quiet 2>&1
+      "${POETRY_BIN}" install --no-interaction --sync
     ) > "${AI_AGENT_RUN_DIR}/poetry_install.log" 2>&1 &
     POETRY_PID=$!
   fi

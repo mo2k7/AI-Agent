@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  PermissionsManager.swift
 //  AIAgentUI
@@ -60,6 +61,20 @@ enum PermissionType: String, CaseIterable, Identifiable {
             return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
         case .screenRecording:
             return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        }
+    }
+
+    /// Recovery instructions shown when the permission is denied
+    var recoveryInstructions: String {
+        switch self {
+        case .accessibility:
+            return "Open System Settings → Privacy & Security → Accessibility, find 'AI Agent' and toggle the switch on."
+        case .automation:
+            return "Open System Settings → Privacy & Security → Automation, find 'AI Agent' and enable the apps listed below it."
+        case .fullDiskAccess:
+            return "Open System Settings → Privacy & Security → Full Disk Access, find 'AI Agent' and toggle the switch on. A restart may be required."
+        case .screenRecording:
+            return "Open System Settings → Privacy & Security → Screen & System Audio Recording, find 'AI Agent' and toggle the switch on."
         }
     }
 }
@@ -141,15 +156,23 @@ final class PermissionsManager: ObservableObject {
     /// List of permissions requiring action for bulk flow
     @Published var bulkGuidanceTypes: [PermissionType]?
     
+    // MARK: - Callbacks
+
+    /// Fires when any individual permission status changes.
+    /// AppDelegate uses this to re-register the global hotkey when Accessibility is granted.
+    var onPermissionChange: ((PermissionType, PermissionStatus) -> Void)?
+    
     // MARK: - Private Properties
     
     private let logger = Logger(subsystem: "com.aiagent.ui", category: "Permissions")
     private var screenRecordingProbeInFlight = false
+    private var lifecycleObserver: NSObjectProtocol?
     
     // MARK: - Initialization
     
     private init() {
         checkAllPermissions()
+        startLifecycleObserving()
     }
     
     // MARK: - Public Methods
@@ -233,9 +256,7 @@ final class PermissionsManager: ObservableObject {
             // Triggers macOS TCC prompt for screen recording
             requestScreenRecordingPermission()
         }
-        
-        // Start polling for permission changes to update UI when user completes action
-        startPermissionPolling()
+        // No polling — lifecycle re-check fires when user returns from Settings
     }
     
     /// Triggers system permission requests for all missing permissions
@@ -277,8 +298,7 @@ final class PermissionsManager: ObservableObject {
             }
         }
         
-        // Start polling for permission changes
-        startPermissionPolling()
+        // No polling — lifecycle re-check fires when user returns from Settings
     }
     
     /// Opens System Settings to the appropriate privacy pane
@@ -523,55 +543,65 @@ final class PermissionsManager: ObservableObject {
         return "\(granted)/\(total) permissions granted"
     }
     
-    // MARK: - Permission Polling
+    // MARK: - Event-Driven Lifecycle Re-checks
     
-    private var pollingTask: Task<Void, Never>?
-    
-    /// Starts polling for permission changes (useful after opening System Settings)
-    func startPermissionPolling() {
-        stopPermissionPolling()
-        
-        pollingTask = Task {
-            // Poll every 2 seconds for 60 seconds
-            for iteration in 0..<30 {
-                if Task.isCancelled { break }
-                
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                
-                await MainActor.run {
-                    // Only run AppleScript-based automation probe periodically
-                    // to avoid repeated intrusive checks during polling.
-                    let shouldProbeAutomation = iteration % 5 == 0
-                    self.checkAllPermissions(performAutomationProbe: shouldProbeAutomation)
-                }
-                
-                // Stop polling if all permissions are granted
-                if await MainActor.run(body: { self.allPermissionsGranted }) {
-                    await MainActor.run {
-                        self.logger.info("All permissions granted - stopping poll")
-                        self.showPermissionsGrantedNotification()
-                    }
-                    break
-                }
+    /// Registers for app activation notifications.
+    /// When the user returns from System Settings, permissions are re-checked instantly.
+    /// This replaces polling — zero timers, zero wasted CPU.
+    private func startLifecycleObserving() {
+        lifecycleObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.handleAppDidBecomeActive()
             }
+        }
+        logger.info("Permission lifecycle observer registered")
+    }
+    
+    /// Called every time the app regains focus.
+    /// Uses lightweight checks (no AppleScript probe) to avoid intrusive prompts.
+    private func handleAppDidBecomeActive() {
+        let previousStatuses = permissionStatuses
+        
+        // Re-check all permissions (lightweight — no automation probe)
+        checkAllPermissions(performAutomationProbe: false)
+        
+        // Fire callbacks for any permission that changed
+        for permissionType in PermissionType.allCases {
+            let oldStatus = previousStatuses[permissionType]
+            let newStatus = permissionStatuses[permissionType]
+            if oldStatus != newStatus, let newStatus {
+                logger.info("Permission changed on activation: \(permissionType.rawValue) \(oldStatus?.displayName ?? "nil") → \(newStatus.displayName)")
+                onPermissionChange?(permissionType, newStatus)
+            }
+        }
+        
+        // Auto-dismiss modal when all permissions are granted
+        if allPermissionsGranted && showPermissionsModal {
+            showPermissionsModal = false
+            logger.info("All permissions granted — auto-dismissed modal on app activation")
         }
     }
     
-    /// Stops permission polling
-    func stopPermissionPolling() {
-        pollingTask?.cancel()
-        pollingTask = nil
-    }
+    /// No-op stubs kept for API compatibility during transition.
+    func startPermissionPolling() {}
+    func stopPermissionPolling() {}
     
-    /// Shows a notification when all permissions are granted.
-    ///
-    /// IMPORTANT: Must NOT use NSAlert.runModal() here. This app uses a floating
-    /// NSPanel (window level .floating). runModal() enters a modal event loop that
-    /// blocks ALL other windows while the alert renders beside/behind the panel,
-    /// making the entire app appear frozen with beeps on every click.
-    private func showPermissionsGrantedNotification() {
-        showPermissionsModal = false
-        logger.info("All permissions granted — dismissed permissions modal.")
+    /// Waits for the initial async Screen Recording probe to complete.
+    /// Called during startup to avoid the race where SCShareableContent
+    /// hasn't resolved yet and the status shows `.notDetermined`.
+    func awaitInitialProbes() async {
+        // If a screen recording probe is already in flight, wait for it
+        for _ in 0..<20 {
+            if !screenRecordingProbeInFlight { break }
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        }
+        // Force one final synchronous re-check
+        checkAllPermissions(performAutomationProbe: true)
     }
     
     /// Relaunches the application
@@ -593,14 +623,12 @@ final class PermissionsManager: ObservableObject {
 
 extension PermissionsManager {
     
-    /// Performs initial permission check and shows modal if needed
+    /// Performs initial permission check and shows modal if any permission is missing.
+    /// All permissions are considered important — not just Accessibility and Automation.
     func performStartupCheck() {
         checkAllPermissions()
         
-        // Show modal if critical permissions are missing
-        let accessibilityAuthorized = permissionStatuses[.accessibility]?.isAuthorized ?? false
-        let automationAuthorized = permissionStatuses[.automation]?.isAuthorized ?? false
-        if !accessibilityAuthorized || !automationAuthorized {
+        if !allPermissionsGranted {
             showPermissionsModal = true
         }
     }
@@ -613,3 +641,4 @@ extension PermissionStatus {
         self == .authorized
     }
 }
+#endif

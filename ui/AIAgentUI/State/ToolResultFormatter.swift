@@ -39,6 +39,8 @@ enum ToolResultFormatter {
             return renderRunAutomation(payload: payload) ?? content
         case "generate_image":
             return renderGenerateImage(payload: payload) ?? content
+        case "browse_web":
+            return renderBrowseWeb(payload: payload) ?? content
         default:
             // Try search_files heuristic for untagged payloads
             if let rendered = renderSearchFiles(payload: payload) {
@@ -368,6 +370,58 @@ enum ToolResultFormatter {
         return lines.joined(separator: "\n")
     }
 
+    // MARK: - browse_web
+
+    private static func renderBrowseWeb(payload: [String: Any]) -> String? {
+        let output = extractOutput(from: payload)
+        guard output["final_url"] != nil || output["url"] != nil || output["content"] != nil else {
+            return nil
+        }
+
+        let finalURL = ((output["final_url"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? ((output["url"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        let title = ((output["title"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        let profile = ((output["effective_browse_profile"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        let content = ((output["content"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
+        let contentType = ((output["content_type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
+        let warningLine = compactWarningLine(from: output["policy_warnings"], limit: 1)
+
+        var lines: [String] = ["**Web Browse**"]
+        if let finalURL {
+            let label = (title ?? finalURL).replacingOccurrences(of: "[", with: "\\[")
+                .replacingOccurrences(of: "]", with: "\\]")
+            lines.append("Source: [\(label)](\(finalURL))")
+        } else {
+            lines.append("Source: \(title ?? "unknown")")
+        }
+        if let profile, profile.lowercased() != "strict" {
+            lines.append("Browse profile: `\(profile.lowercased())`")
+            if !warningLine.isEmpty {
+                lines.append("Policy notice: `\(profile.lowercased())` browsing allowed this result with policy warnings.")
+            } else {
+                lines.append("Policy notice: relaxed `\(profile.lowercased())` browsing rules were active for this fetch.")
+            }
+        }
+        if !warningLine.isEmpty {
+            lines.append("")
+            lines.append("Caution: \(warningLine)")
+        }
+        if content.isEmpty {
+            lines.append("")
+            lines.append("No extractable text was returned (`\(contentType)`).")
+        } else {
+            lines.append("")
+            lines.append(content)
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Helpers
 
     private static func extractOutput(from payload: [String: Any]) -> [String: Any] {
@@ -389,6 +443,30 @@ enum ToolResultFormatter {
             return nil
         }
         return parsed as? [String: Any]
+    }
+
+    private static func compactWarningLine(from value: Any?, limit: Int) -> String {
+        guard let warnings = value as? [Any] else { return "" }
+        var normalized: [String] = []
+        for warning in warnings {
+            guard let text = warning as? String else { continue }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                normalized.append(trimmed)
+            }
+        }
+        guard !normalized.isEmpty else { return "" }
+        let cappedLimit = max(1, limit)
+        let visible = Array(normalized.prefix(cappedLimit))
+        var summary = visible.joined(separator: " | ")
+        if summary.count > 180 {
+            summary = String(summary.prefix(177)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+        }
+        let remaining = normalized.count - visible.count
+        if remaining > 0 {
+            summary += " (+\(remaining) more)"
+        }
+        return summary
     }
 
     private static func humanSize(_ value: Any?) -> String {

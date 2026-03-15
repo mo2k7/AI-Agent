@@ -1,9 +1,7 @@
 """Pytest configuration and shared fixtures."""
 import os
-import socket
 import pytest
 from pathlib import Path
-from typing import Any
 
 
 @pytest.fixture
@@ -93,42 +91,3 @@ def patch_secure_planner(monkeypatch):
         "agent_host.tools.executor.ToolExecutor._build_planner_engine",
         lambda self: _FakeUnifiedPlanner(),
     )
-
-
-def _supports_unix_domain_socket_bind() -> bool:
-    probe_path = "/tmp/ai-agent-pytest-socket-probe.sock"
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        if os.path.exists(probe_path):
-            try:
-                os.unlink(probe_path)
-            except FileNotFoundError:
-                pass
-        sock.bind(probe_path)
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
-        if os.path.exists(probe_path):
-            try:
-                os.unlink(probe_path)
-            except FileNotFoundError:
-                pass
-
-
-_UNIX_SOCKET_BIND_AVAILABLE = _supports_unix_domain_socket_bind()
-_UNIX_SOCKET_TEST_PATTERNS = (
-    "tests/unit/test_ipc_runtime.py",
-    "tests/unit/test_ipc_regression_flows.py",
-    "tests/unit/test_ipc_framing_hardening.py",
-    "tests/unit/test_debug_harness_tools.py::test_stress_harness_smoke_with_fake_backend",
-)
-
-
-def pytest_runtest_setup(item: Any) -> None:
-    if _UNIX_SOCKET_BIND_AVAILABLE:
-        return
-    node_id = item.nodeid
-    if any(pattern in node_id for pattern in _UNIX_SOCKET_TEST_PATTERNS):
-        pytest.skip("Unix domain socket bind is not permitted in this sandbox")

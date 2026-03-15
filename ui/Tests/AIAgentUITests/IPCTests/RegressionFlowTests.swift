@@ -8,7 +8,7 @@ func messageDispatcherKeepsInterleavedStreamsIsolatedByRequest() {
     var updates: [(requestId: String, text: String, done: Bool)] = []
     var completions: [String: String] = [:]
 
-    dispatcher.onStreamingUpdate = { requestId, text, done in
+    dispatcher.onStreamingUpdate = { requestId, _delta, text, done in
         updates.append((requestId, text, done))
     }
     dispatcher.onComplete = { requestId, content in
@@ -149,13 +149,13 @@ func ipcMessageParserParsesSystemVersionPayload() {
 func dispatcherErrorForOneRequestDoesNotResetAnotherStreamAccumulator() {
     let dispatcher = MessageDispatcher()
     var updates: [(requestId: String, text: String, done: Bool)] = []
-    var errors: [(requestId: String, message: String, code: Int?)] = []
+    var errors: [(requestId: String, message: String, code: Int?, data: [String: Any]?)] = []
 
-    dispatcher.onStreamingUpdate = { requestId, text, done in
+    dispatcher.onStreamingUpdate = { requestId, _delta, text, done in
         updates.append((requestId, text, done))
     }
-    dispatcher.onError = { requestId, message, code in
-        errors.append((requestId, message, code))
+    dispatcher.onError = { requestId, message, code, data in
+        errors.append((requestId, message, code, data))
     }
 
     dispatcher.dispatch(
@@ -176,7 +176,7 @@ func dispatcherErrorForOneRequestDoesNotResetAnotherStreamAccumulator() {
                 id: "req-other",
                 type: "error",
                 result: nil,
-                error: .init(code: -32600, message: "Invalid request")
+                error: .init(code: -32600, message: "Invalid request", data: nil)
             )
         )
     )

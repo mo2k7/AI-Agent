@@ -126,4 +126,7 @@ poetry run mypy agent_host
 
 ## License
 
-MIT License - See LICENSE file for details.
+Closed-source proprietary software.
+
+- Legal terms: [LICENSE](/Users/muhammadabdullah/AI%20Automation%20Agent%20macOS/LICENSE)
+- Operational policy summary: [docs/licensing_policy.md](/Users/muhammadabdullah/AI%20Automation%20Agent%20macOS/docs/licensing_policy.md)

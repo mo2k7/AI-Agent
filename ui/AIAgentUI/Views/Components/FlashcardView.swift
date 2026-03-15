@@ -94,7 +94,7 @@ enum FlashcardParser {
 struct FlashcardStudyView: View {
     let noteTitle: String
     let cards: [Flashcard]
-    @Environment(\.dismiss) private var dismiss
+    var onClose: (() -> Void)? = nil
 
     @State private var currentIndex: Int = 0
     @State private var isFlipped: Bool = false
@@ -152,7 +152,7 @@ struct FlashcardStudyView: View {
             .buttonStyle(.plain)
             .help(isShuffled ? "Sequential order" : "Shuffle")
 
-            Button(action: { dismiss() }) {
+            Button(action: { onClose?() }) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 16))
                     .foregroundColor(.textSecondary.opacity(0.7))
@@ -382,7 +382,7 @@ struct FlashcardStudyView: View {
                 .buttonStyle(.plain)
             }
 
-            Button(action: { dismiss() }) {
+            Button(action: { onClose?() }) {
                 Text("Done")
                     .font(.callout.weight(.medium))
                     .foregroundColor(.textSecondary)

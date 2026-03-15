@@ -23,8 +23,9 @@ class StreamingHandler:
     
     # Default delays in seconds
     DEFAULT_CHAR_DELAY = 0.02  # 20ms per character for typewriter effect
-    DEFAULT_WORD_DELAY = 0.05  # 50ms per word
-    DEFAULT_CHUNK_DELAY = 0.1  # 100ms per chunk
+    DEFAULT_WORD_DELAY = 0.0
+    DEFAULT_CHUNK_DELAY = 0.0
+    DEFAULT_WORD_BATCH_TARGET_CHARS = 120
     
     def __init__(
         self,
@@ -50,6 +51,7 @@ class StreamingHandler:
         self._word_delay = word_delay
         self._chunk_delay = chunk_delay
         self._cancelled = False
+        self._word_batch_target_chars = self.DEFAULT_WORD_BATCH_TARGET_CHARS
     
     def cancel(self) -> None:
         """Cancels any ongoing streaming operation."""
@@ -102,7 +104,20 @@ class StreamingHandler:
         await self.send_status_streaming()
         
         tokens = re.findall(r"\s+|[^\s]+", text)
-        for i, token in enumerate(tokens):
+        chunks: list[str] = []
+        pending_parts: list[str] = []
+        pending_chars = 0
+        for token in tokens:
+            pending_parts.append(token)
+            pending_chars += len(token)
+            if pending_chars >= self._word_batch_target_chars and not token.isspace():
+                chunks.append("".join(pending_parts))
+                pending_parts = []
+                pending_chars = 0
+        if pending_parts:
+            chunks.append("".join(pending_parts))
+
+        for i, token in enumerate(chunks):
             if self._cancelled:
                 break
             
@@ -111,7 +126,7 @@ class StreamingHandler:
             chunk = StreamChunk.chunk(self._request_id, token, done=is_last)
             await self._send(chunk.to_bytes())
             
-            if not is_last and not token.isspace():
+            if not is_last and self._word_delay > 0:
                 await asyncio.sleep(self._word_delay)
     
     async def stream_chunks(
@@ -144,7 +159,7 @@ class StreamingHandler:
             chunk = StreamChunk.chunk(self._request_id, chunk_text, done=is_last)
             await self._send(chunk.to_bytes())
             
-            if not is_last:
+            if not is_last and self._chunk_delay > 0:
                 await asyncio.sleep(self._chunk_delay)
     
     async def send_chunk(self, text: str, done: bool = False) -> None:

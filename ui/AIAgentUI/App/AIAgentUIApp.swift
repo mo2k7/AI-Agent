@@ -11,6 +11,95 @@ import SwiftUI
 import ServiceManagement
 #endif
 
+struct GeminiModelOption: Identifiable, Hashable, Codable {
+    let name: String
+    let displayName: String
+    let description: String
+    let supportedActions: [String]
+    let inputTokenLimit: Int
+    let outputTokenLimit: Int
+    let isPreview: Bool
+    let supportsDeepThink: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case displayName = "display_name"
+        case description
+        case supportedActions = "supported_actions"
+        case inputTokenLimit = "input_token_limit"
+        case outputTokenLimit = "output_token_limit"
+        case isPreview = "is_preview"
+        case supportsDeepThink = "supports_deep_think"
+    }
+
+    var id: String { name }
+
+    var resolvedDisplayName: String {
+        displayName.isEmpty ? name : displayName
+    }
+
+    var resolvedDescription: String {
+        if !description.isEmpty {
+            return description
+        }
+        if supportsDeepThink {
+            return "Supports native deep-think controls."
+        }
+        return "Live Gemini model discovered from the backend catalog."
+    }
+
+    static func placeholder(name: String) -> GeminiModelOption {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackName = normalizedName.isEmpty ? "Loading live Gemini catalog…" : normalizedName
+        return GeminiModelOption(
+            name: normalizedName,
+            displayName: fallbackName,
+            description: normalizedName.isEmpty
+                ? "Model catalog will populate after the backend loads the live Gemini model list."
+                : "Stored model selection. Connect to refresh the live Gemini catalog.",
+            supportedActions: [],
+            inputTokenLimit: 0,
+            outputTokenLimit: 0,
+            isPreview: Self.isPreviewModelIdentifier(normalizedName),
+            supportsDeepThink: Self.supportsDeepThink(modelID: normalizedName)
+        )
+    }
+
+    static func supportsDeepThink(modelID: String) -> Bool {
+        let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalized.hasPrefix("gemini-") else { return false }
+        let versionPart = normalized.dropFirst("gemini-".count)
+        var digits = ""
+        var components: [Int] = []
+        for character in versionPart {
+            if character.isNumber {
+                digits.append(character)
+                continue
+            }
+            if character == ".", !digits.isEmpty {
+                components.append(Int(digits) ?? 0)
+                digits.removeAll(keepingCapacity: true)
+                continue
+            }
+            break
+        }
+        if !digits.isEmpty {
+            components.append(Int(digits) ?? 0)
+        }
+        let major = components.indices.contains(0) ? components[0] : 0
+        let minor = components.indices.contains(1) ? components[1] : 0
+        if major >= 3 { return true }
+        return major == 2 && minor >= 5
+    }
+
+    static func isPreviewModelIdentifier(_ modelID: String) -> Bool {
+        let normalized = modelID.lowercased()
+        return normalized.contains("preview") || normalized.contains("exp") || normalized.contains("experimental")
+    }
+}
+
+#if os(macOS)
+
 /// Main application entry point
 @main
 struct AIAgentUIApp: App {
@@ -238,70 +327,17 @@ struct GeneralSettingsView: View {
 
 // MARK: - Connection Settings
 
-/// Available Gemini models for selection
-enum GeminiModel: String, CaseIterable, Identifiable {
-    // Gemini 3 (Latest)
-    case gemini3ProPreview = "gemini-3-pro-preview"
-    case gemini3FlashPreview = "gemini-3-flash-preview"
-    // Gemini 2
-    case gemini2FlashExp = "gemini-2.0-flash-exp"
-    case gemini2Flash = "gemini-2.0-flash"
-    // Gemini 1.5
-    case gemini15Pro = "gemini-1.5-pro"
-    case gemini15Flash = "gemini-1.5-flash"
-    case gemini15Flash8b = "gemini-1.5-flash-8b"
-    
-    var id: String { rawValue }
-    
-    var displayName: String {
-        switch self {
-        case .gemini3ProPreview: return "Gemini 3 Pro Preview ⭐"
-        case .gemini3FlashPreview: return "Gemini 3 Flash Preview ⭐"
-        case .gemini2FlashExp: return "Gemini 2.0 Flash (Experimental)"
-        case .gemini2Flash: return "Gemini 2.0 Flash"
-        case .gemini15Pro: return "Gemini 1.5 Pro"
-        case .gemini15Flash: return "Gemini 1.5 Flash"
-        case .gemini15Flash8b: return "Gemini 1.5 Flash 8B"
-        }
-    }
-    
-    var description: String {
-        switch self {
-        case .gemini3ProPreview: return "Latest & most capable (Preview)"
-        case .gemini3FlashPreview: return "Latest & fastest (Preview)"
-        case .gemini2FlashExp: return "Fast experimental model"
-        case .gemini2Flash: return "Balanced speed and capability"
-        case .gemini15Pro: return "Highly capable for complex tasks"
-        case .gemini15Flash: return "Fast and versatile"
-        case .gemini15Flash8b: return "Lightweight and efficient"
-        }
-    }
-    
-    /// Whether this model is a preview/experimental version
-    var isPreview: Bool {
-        switch self {
-        case .gemini3ProPreview, .gemini3FlashPreview, .gemini2FlashExp:
-            return true
-        default:
-            return false
-        }
-    }
-
-    var supportsDeepThink: Bool {
-        let normalized = rawValue.lowercased()
-        return normalized.contains("gemini-3") || normalized.contains("gemini-2.5")
-    }
-}
-
 struct ConnectionSettingsView: View {
     
     @EnvironmentObject var appState: AppState
+    @ObservedObject var connectionState: ConnectionState = .shared
+    @ObservedObject var themeState: UIThemeState = .shared
     @AppStorage("autoConnect") private var autoConnect = true
     @AppStorage("reconnectOnFailure") private var reconnectOnFailure = true
     
-    private var selectedModelBinding: Binding<GeminiModel> {
+    private var selectedModelBinding: Binding<String> {
         Binding(
-            get: { appState.selectedModel },
+            get: { appState.selectedModelId },
             set: { appState.setSelectedModel($0) }
         )
     }
@@ -327,24 +363,12 @@ struct ConnectionSettingsView: View {
         )
     }
 
-    private var responsePresentationStyleBinding: Binding<ResponsePresentationStyle> {
-        Binding(
-            get: { appState.responsePresentationStyle },
-            set: { appState.setResponsePresentationStyle($0) }
-        )
-    }
+    // Style properties moved to UIThemeState in $themeState
 
-    private var readableProHighContrastBinding: Binding<Bool> {
+    private var browseRestrictionProfileBinding: Binding<BrowseRestrictionProfile> {
         Binding(
-            get: { appState.readableProHighContrastEnabled },
-            set: { appState.setReadableProHighContrastEnabled($0) }
-        )
-    }
-
-    private var streamingAnimationStyleBinding: Binding<StreamingAnimationStyle> {
-        Binding(
-            get: { appState.streamingAnimationStyle },
-            set: { appState.setStreamingAnimationStyle($0) }
+            get: { appState.browseRestrictionProfile },
+            set: { appState.setBrowseRestrictionProfile($0) }
         )
     }
     
@@ -356,28 +380,33 @@ struct ConnectionSettingsView: View {
                     Spacer()
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(appState.isConnected ? Color.green : Color.red)
+                            .fill(connectionState.isConnected ? Color.green : Color.red)
                             .frame(width: 8, height: 8)
-                        Text(appState.isConnected ? "Connected" : "Disconnected")
+                        Text(connectionState.isConnected ? "Connected" : "Disconnected")
                             .foregroundColor(.secondary)
                     }
                 }
                 
                 Toggle("Auto-connect on launch", isOn: $autoConnect)
                 Toggle("Reconnect on failure", isOn: $reconnectOnFailure)
+
+                Text("Registered capabilities: \(appState.deviceBridgeManifest.capabilities.map(\.displayName).joined(separator: ", "))")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
+
             
             Section("AI Model") {
                 Picker("Model", selection: selectedModelBinding) {
-                    ForEach(GeminiModel.allCases) { model in
-                        Text(model.displayName)
-                            .tag(model)
+                    ForEach(appState.modelSelectionOptions) { model in
+                        Text(model.resolvedDisplayName)
+                            .tag(model.id)
                     }
                 }
                 .pickerStyle(.menu)
                 
                 HStack {
-                    Text(appState.selectedModel.description)
+                    Text(appState.selectedModel.resolvedDescription)
                     if appState.selectedModel.isPreview {
                         Text("•")
                         Text("Preview")
@@ -393,23 +422,23 @@ struct ConnectionSettingsView: View {
             }
 
             Section("Response Format") {
-                Picker("Format Style", selection: responsePresentationStyleBinding) {
+                Picker("Format Style", selection: $themeState.responsePresentationStyle) {
                     ForEach(ResponsePresentationStyle.allCases) { style in
                         Text(style.displayName).tag(style)
                     }
                 }
                 .pickerStyle(.menu)
 
-                Text(appState.responsePresentationStyle.description)
+                Text(themeState.responsePresentationStyle.description)
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                Toggle("Readable Pro high contrast", isOn: readableProHighContrastBinding)
-                    .disabled(appState.responsePresentationStyle != .readablePro)
+                Toggle("Readable Pro high contrast", isOn: $themeState.readableProHighContrastEnabled)
+                    .disabled(themeState.responsePresentationStyle != .readablePro)
 
                 Text(
-                    appState.responsePresentationStyle == .readablePro
-                        ? (appState.readableProHighContrastEnabled
+                    themeState.responsePresentationStyle == .readablePro
+                        ? (themeState.readableProHighContrastEnabled
                             ? "Higher contrast is active for maximum readability."
                             : "Standard Readable Pro contrast is active.")
                         : "Switch to Readable Pro to apply this contrast setting."
@@ -417,14 +446,25 @@ struct ConnectionSettingsView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-                Picker("Streaming Animation", selection: streamingAnimationStyleBinding) {
+                Picker("Streaming Animation", selection: $themeState.streamingAnimationStyle) {
                     ForEach(StreamingAnimationStyle.allCases) { style in
                         Text(style.displayName).tag(style)
                     }
                 }
                 .pickerStyle(.menu)
 
-                Text(appState.streamingAnimationStyle.description)
+                Text(themeState.streamingAnimationStyle.description)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Picker("Web Browsing", selection: browseRestrictionProfileBinding) {
+                    ForEach(BrowseRestrictionProfile.allCases) { profile in
+                        Text(profile.displayName).tag(profile)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text(appState.browseRestrictionProfile.description)
                     .font(.caption)
                     .foregroundColor(.secondary)
 
@@ -503,6 +543,7 @@ struct ConnectionSettingsView: View {
         .onChange(of: reconnectOnFailure) { _, newValue in
             appState.handleReconnectOnFailurePreferenceChanged(newValue)
         }
+
     }
 }
 
@@ -557,15 +598,16 @@ struct AppearanceSettingsView: View {
 struct MenuBarView: View {
     
     @EnvironmentObject var appState: AppState
+    @ObservedObject var connectionState: ConnectionState = .shared
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Status row
             HStack {
                 Circle()
-                    .fill(appState.isConnected ? Color.green : Color.red)
+                    .fill(connectionState.isConnected ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
-                Text(appState.isConnected ? "Connected" : "Disconnected")
+                Text(connectionState.isConnected ? "Connected" : "Disconnected")
                     .foregroundColor(.secondary)
             }
             .padding(.horizontal)
@@ -585,7 +627,7 @@ struct MenuBarView: View {
             Button(action: { Task { await appState.reconnect() } }) {
                 Label("Reconnect", systemImage: "arrow.clockwise")
             }
-            .disabled(appState.isConnected)
+            .disabled(connectionState.isConnected)
             
             Divider()
             
@@ -597,3 +639,22 @@ struct MenuBarView: View {
         .frame(width: 200)
     }
 }
+
+#else
+
+@main
+struct AIAgentUIApp: App {
+    @StateObject private var appState = AppState.shared
+
+    var body: some Scene {
+        WindowGroup {
+            MainPanelView(appState: appState)
+                .background(Color.panelBackground.ignoresSafeArea())
+                .task {
+                    await appState.startup()
+                }
+        }
+    }
+}
+
+#endif

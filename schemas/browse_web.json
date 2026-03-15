@@ -14,12 +14,23 @@
       "items": {
         "type": "string"
       },
-      "description": "Multiple URLs to fetch in batch (max 10). Use either 'url' or 'urls', not both."
+      "description": "Multiple URLs to fetch in batch (max 20). Use either 'url' or 'urls', not both."
     },
-    "extraction_mode": {
+    "search_query": {
       "type": "string",
-      "enum": ["auto", "raw", "markdown"],
-      "description": "Content extraction strategy. 'auto' uses readability heuristics (recommended), 'raw' returns full page text, 'markdown' extracts and simplifies. Default: 'auto'."
+      "description": "Run a web search query and fetch result pages using configured engines."
+    },
+    "search_engines": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "duckduckgo",
+          "brave",
+          "google"
+        ]
+      },
+      "description": "Optional list of search engines to use with search_query."
     },
     "timeout_seconds": {
       "type": "integer",
@@ -52,6 +63,39 @@
     "verify_ssl": {
       "type": "boolean",
       "description": "Verify SSL/TLS certificates. Default: true. Setting false is blocked unless AI_AGENT_ALLOW_INSECURE_TLS=true is explicitly set for local debugging."
+    },
+    "custom_headers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Optional request headers. Only safe allowlisted headers are accepted at runtime."
+    },
+    "compliance_action": {
+      "type": "string",
+      "enum": [
+        "purge_cache_url",
+        "purge_cache_domain",
+        "purge_cache_all",
+        "delete_subject_data",
+        "acknowledge_incident"
+      ],
+      "description": "Run a compliance/retention/incident action instead of fetching URLs."
+    },
+    "target_url": {
+      "type": "string",
+      "description": "Target URL for compliance_action=purge_cache_url."
+    },
+    "target_domain": {
+      "type": "string",
+      "description": "Target domain for compliance_action=purge_cache_domain or acknowledge_incident."
+    },
+    "subject_identifiers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Subject identifiers for compliance_action=delete_subject_data."
     }
   },
   "additionalProperties": false

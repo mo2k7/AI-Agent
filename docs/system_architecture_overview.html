@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Agent macOS - System Architecture Overview</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: rgba(18, 26, 51, 0.88);
+      --panel-strong: #121a33;
+      --panel-soft: #172142;
+      --text: #e9eefc;
+      --muted: #a6b2d6;
+      --line: rgba(255,255,255,0.09);
+      --blue: #76b7ff;
+      --cyan: #76f0ff;
+      --green: #6ee7a8;
+      --amber: #ffd36e;
+      --red: #ff8f8f;
+      --purple: #b99cff;
+      --shadow: 0 24px 60px rgba(0,0,0,0.35);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at top left, rgba(118,183,255,0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(185,156,255,0.10), transparent 22%),
+        linear-gradient(180deg, #09101f 0%, #0d1427 45%, #0a0f1b 100%);
+      color: var(--text);
+    }
+
+    .shell {
+      width: min(1400px, calc(100% - 32px));
+      margin: 24px auto 64px;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 20px;
+    }
+
+    .toc {
+      position: sticky;
+      top: 18px;
+      align-self: start;
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(20px);
+    }
+
+    .toc h2,
+    .content h2,
+    .content h3 { margin: 0 0 12px; }
+
+    .toc p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .toc a {
+      display: block;
+      color: var(--text);
+      text-decoration: none;
+      padding: 9px 10px;
+      margin: 4px 0;
+      border-radius: 10px;
+      font-size: 14px;
+      border: 1px solid transparent;
+    }
+
+    .toc a:hover {
+      background: rgba(255,255,255,0.05);
+      border-color: var(--line);
+    }
+
+    .content {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .hero,
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .hero {
+      padding: 28px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -100px -100px auto;
+      width: 260px;
+      height: 260px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(118,240,255,0.16), transparent 65%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(118,183,255,0.10);
+      color: var(--blue);
+      border: 1px solid rgba(118,183,255,0.25);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      font-size: clamp(30px, 5vw, 48px);
+      line-height: 1.04;
+      margin: 14px 0 12px;
+      max-width: 900px;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 900px;
+      line-height: 1.65;
+      font-size: 16px;
+    }
+
+    .hero-grid,
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+      display: grid;
+      gap: 14px;
+    }
+
+    .hero-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 22px; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .metric,
+    .card,
+    .lane,
+    .step,
+    .stack,
+    .callout {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+    }
+
+    .metric { padding: 16px; }
+    .metric b { display: block; font-size: 22px; margin-bottom: 8px; }
+    .metric span { color: var(--muted); font-size: 13px; line-height: 1.45; }
+
+    .panel { padding: 22px; }
+    .panel > p,
+    .card p,
+    .stack p,
+    .callout p {
+      color: var(--muted);
+      line-height: 1.62;
+    }
+
+    .card,
+    .stack,
+    .callout { padding: 16px; }
+
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      background: rgba(255,255,255,0.03);
+    }
+
+    .flow {
+      display: grid;
+      gap: 12px;
+    }
+
+    .lane {
+      padding: 16px;
+      position: relative;
+    }
+
+    .lane h4,
+    .step h4,
+    .card h4,
+    .stack h4,
+    .callout h4 { margin: 0 0 8px; font-size: 15px; }
+
+    .step {
+      padding: 14px;
+      position: relative;
+    }
+
+    .step::after {
+      content: "→";
+      position: absolute;
+      right: -12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      font-size: 20px;
+    }
+
+    .flow-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .flow-row .step:last-child::after { content: none; }
+
+    .stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .stack-item {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.02);
+    }
+
+    .stack-item b {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 8px;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+
+    .dot.blue { background: var(--blue); }
+    .dot.green { background: var(--green); }
+    .dot.amber { background: var(--amber); }
+    .dot.red { background: var(--red); }
+    .dot.purple { background: var(--purple); }
+
+    code {
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 2px 6px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.06);
+      color: #d8e5ff;
+    }
+
+    ul, ol { margin: 10px 0 0 18px; color: var(--muted); }
+    li { margin: 6px 0; line-height: 1.55; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      overflow: hidden;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+    }
+
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    th { color: var(--text); background: rgba(255,255,255,0.04); }
+    td { color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+
+    .footer-note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 1100px) {
+      .shell { grid-template-columns: 1fr; }
+      .toc { position: static; }
+      .hero-grid, .grid-4, .flow-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 740px) {
+      .hero-grid, .grid-4, .grid-3, .grid-2, .flow-row { grid-template-columns: 1fr; }
+      .step::after { content: none; }
+      .shell { width: min(100% - 20px, 1400px); margin-top: 10px; }
+      .hero, .panel, .toc { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="toc">
+      <h2>Architecture Map</h2>
+      <p>High-level runtime view of the SwiftUI app, Python backend, Gemini integration, IPC transport, memory system, tools, and rendering pipeline.</p>
+      <a href="#overview">1. Overview</a>
+      <a href="#components">2. Core Components</a>
+      <a href="#startup">3. Startup Flow</a>
+      <a href="#prompt">4. Prompt Lifecycle</a>
+      <a href="#tools">5. Tool Execution Flow</a>
+      <a href="#memory">6. Sessions, Memory, Notes</a>
+      <a href="#models">7. Gemini / Model Flow</a>
+      <a href="#ui-flow">8. UI Rendering Flow</a>
+      <a href="#controls">9. Guardrails</a>
+      <a href="#rpc">10. Main IPC Methods</a>
+      <a href="#files">11. Key Files</a>
+    </aside>
+
+    <main class="content">
+      <section class="hero" id="overview">
+        <div class="eyebrow">Local-first runtime architecture</div>
+        <h1>AI Agent macOS system flow from SwiftUI input to Gemini reasoning to local tool execution</h1>
+        <p>
+          This app is a two-process system. The macOS UI runs in SwiftUI and talks over authenticated NDJSON JSON-RPC on a Unix domain socket to a Python backend. The backend owns model orchestration, tool validation, tool execution, session persistence, semantic memory, notes, and final response formatting. The frontend owns process launch, transport, state, streaming UX, and message rendering.
+        </p>
+        <div class="hero-grid">
+          <div class="metric"><b>2</b><span>Main runtime processes: SwiftUI app + Python agent host.</span></div>
+          <div class="metric"><b>1</b><span>Authenticated Unix socket transport between them.</span></div>
+          <div class="metric"><b>3</b><span>Execution modes: Direct, Plan, Teacher.</span></div>
+          <div class="metric"><b>Many</b><span>Local tools loaded from JSON schemas and executed behind a single tool gateway.</span></div>
+        </div>
+      </section>
+
+      <section class="panel" id="components">
+        <h2>Core Components</h2>
+        <div class="legend">
+          <span><i class="dot blue"></i> Frontend</span>
+          <span><i class="dot green"></i> Backend orchestration</span>
+          <span><i class="dot amber"></i> Persistence / memory</span>
+          <span><i class="dot purple"></i> Model / external service</span>
+          <span><i class="dot red"></i> Guardrails / approvals</span>
+        </div>
+        <div class="grid-4" style="margin-top: 14px;">
+          <div class="stack">
+            <h4>SwiftUI app</h4>
+            <div class="stack-item"><b>Entry</b><code>ui/AIAgentUI/App/AIAgentUIApp.swift</code></div>
+            <div class="stack-item"><b>State hub</b><code>ui/AIAgentUI/State/AppState.swift</code></div>
+            <div class="stack-item"><b>Main surface</b><code>ui/AIAgentUI/Views/MainPanelView.swift</code></div>
+            <div class="stack-item"><b>Message rendering</b><code>ui/AIAgentUI/Views/Components/ResponseBubble.swift</code></div>
+          </div>
+          <div class="stack">
+            <h4>Transport / process control</h4>
+            <div class="stack-item"><b>Backend launch</b><code>BackendLauncher.swift</code></div>
+            <div class="stack-item"><b>High-level IPC API</b><code>IPCClient.swift</code></div>
+            <div class="stack-item"><b>Socket transport</b><code>SocketManager.swift</code></div>
+            <div class="stack-item"><b>Message schema</b><code>MessageProtocol.swift</code></div>
+          </div>
+          <div class="stack">
+            <h4>Python agent host</h4>
+            <div class="stack-item"><b>Server / orchestration</b><code>agent_host/main.py</code></div>
+            <div class="stack-item"><b>Schema loading</b><code>schema_validator.py</code></div>
+            <div class="stack-item"><b>Tool execution gateway</b><code>tools/executor.py</code></div>
+            <div class="stack-item"><b>Response formatting</b><code>response_formatter.py</code></div>
+          </div>
+          <div class="stack">
+            <h4>Persistence / intelligence</h4>
+            <div class="stack-item"><b>Gemini client</b><code>gemini_client.py</code></div>
+            <div class="stack-item"><b>Session + semantic memory</b><code>memory/manager.py</code></div>
+            <div class="stack-item"><b>Encrypted SQLite store</b><code>memory/store.py</code></div>
+            <div class="stack-item"><b>Embeddings</b><code>memory/embeddings.py</code></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="startup">
+        <h2>Startup Flow</h2>
+        <div class="flow">
+          <div class="flow-row">
+            <div class="step"><h4>1. Swift app boots</h4><p><code>AIAgentUIApp</code> creates <code>AppState.shared</code> and window/panel surfaces.</p></div>
+            <div class="step"><h4>2. Backend process launches</h4><p><code>BackendLauncher</code> resolves Python env, validates runtime requirements, and starts <code>python -m agent_host.main --server</code>.</p></div>
+            <div class="step"><h4>3. Socket becomes available</h4><p>The backend starts the IPC server and emits readiness logs including socket context and auth token.</p></div>
+            <div class="step"><h4>4. Frontend connects</h4><p><code>SocketManager</code> opens the Unix socket, <code>IPCClient</code> authenticates, and <code>AppState</code> begins session/bootstrap refresh.</p></div>
+          </div>
+        </div>
+        <div class="chip-row">
+          <span class="chip">Swift process owns UX and connection recovery</span>
+          <span class="chip">Python process owns request orchestration</span>
+          <span class="chip">Transport is local-only</span>
+          <span class="chip">Auth token rotates across reconnects</span>
+        </div>
+      </section>
+
+      <section class="panel" id="prompt">
+        <h2>End-to-End Prompt Lifecycle</h2>
+        <div class="flow">
+          <div class="lane">
+            <h4>Frontend path</h4>
+            <ol>
+              <li>User types into <code>MainPanelView</code>.</li>
+              <li><code>AppState.sendPrompt()</code> validates connection, active session, selected model, memory mode, execution mode, browse profile, and deep-think compatibility.</li>
+              <li><code>IPCClient.send(...)</code> builds a <code>PromptRequest</code> JSON-RPC envelope and sends it via <code>SocketManager</code>.</li>
+              <li>UI enters thinking/streaming state and waits for status, stream, tool, and result messages.</li>
+            </ol>
+          </div>
+          <div class="lane">
+            <h4>Backend path</h4>
+            <ol>
+              <li><code>main.py::handle_prompt()</code> parses request params and validates request shape.</li>
+              <li>Backend resolves session, memory mode, execution mode, verbosity, presentation style, deep-think flag, browse profile, and input paths.</li>
+              <li><code>MemoryManager.prepare_prompt_context()</code> augments the user prompt with recent turns, semantic hits, summaries, and notes.</li>
+              <li><code>build_system_prompt()</code> + <code>inject_model_identity()</code> produce the final system instruction.</li>
+              <li><code>GeminiClient.send_prompt_with_tools()</code> calls Gemini with runtime tool declarations.</li>
+            </ol>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 14px;">
+          <h4>Critical orchestration idea</h4>
+          <p>
+            The backend does not just ask the model for plain text. It sends the model a full tool belt, validates any returned function call against local JSON schemas, and then either executes the tool locally or continues the reasoning loop until it has a final answer or a plan/result to return.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" id="tools">
+        <h2>Tool Execution Flow</h2>
+        <div class="flow-row">
+          <div class="step"><h4>1. Model proposes a tool</h4><p><code>ToolCallParser</code> extracts the first function call from the Gemini response.</p></div>
+          <div class="step"><h4>2. Local schema validation</h4><p><code>SchemaValidator</code> validates tool arguments against the JSON file under <code>schemas/</code>.</p></div>
+          <div class="step"><h4>3. Execution gateway</h4><p><code>ToolExecutor.execute()</code> routes the validated call to the correct local handler with path normalization, policy checks, and timeout control.</p></div>
+          <div class="step"><h4>4. Result returns to model</h4><p>The backend wraps the tool result as a Gemini <code>function_response</code> and continues the chain.</p></div>
+        </div>
+        <div class="grid-3" style="margin-top: 14px;">
+          <div class="card">
+            <h4>General tools</h4>
+            <p>Search, metadata, text reading, extraction, file operations, automation, and browsing all go through <code>agent_host/tools/executor.py</code>.</p>
+          </div>
+          <div class="card">
+            <h4>Special-case tool families</h4>
+            <p><code>read_screen</code> is delegated back to the frontend through IPC because the backend cannot directly inspect the user’s current screen. Notes/image note flows are dispatched through <code>tools/registry.py</code>.</p>
+          </div>
+          <div class="card">
+            <h4>Approval gates</h4>
+            <p>Destructive actions are intercepted. The backend emits <code>awaiting_approval</code>, the UI shows the confirmation state, and execution resumes only after <code>tool.confirm</code>.</p>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Primary files</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tool declaration</td>
+              <td><code>schemas/*.json</code>, <code>schema_validator.py</code></td>
+              <td>Canonical argument contract passed to Gemini and enforced locally.</td>
+            </tr>
+            <tr>
+              <td>Tool routing</td>
+              <td><code>tool_parser.py</code>, <code>main.py</code></td>
+              <td>Converts model output into executable tool calls.</td>
+            </tr>
+            <tr>
+              <td>Execution</td>
+              <td><code>tools/executor.py</code>, <code>tools/*.py</code></td>
+              <td>Performs bounded local actions.</td>
+            </tr>
+            <tr>
+              <td>Result formatting</td>
+              <td><code>response_formatter.py</code></td>
+              <td>Turns raw execution payloads into UI-safe markdown/text.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" id="memory">
+        <h2>Sessions, Memory, and Notes</h2>
+        <div class="grid-2">
+          <div class="stack">
+            <h4>Session model</h4>
+            <div class="stack-item"><b>Persistent transcript</b> All chat turns are appended to the session store so session switching and history paging work regardless of semantic memory mode.</div>
+            <div class="stack-item"><b>Memory modes</b> <code>on</code>, <code>off</code>, <code>ephemeral</code> change retrieval and semantic persistence behavior, not whether the chat transcript exists.</div>
+            <div class="stack-item"><b>History paging</b> The UI uses <code>session.history_page</code> to keep only a bounded live message window loaded.</div>
+          </div>
+          <div class="stack">
+            <h4>Semantic memory</h4>
+            <div class="stack-item"><b>Preparation</b> <code>MemoryManager.prepare_prompt_context()</code> pulls recent turns, summaries, semantic hits, and notes into the prompt context.</div>
+            <div class="stack-item"><b>Persistence</b> <code>record_interaction()</code> appends user/assistant messages and optionally updates semantic memory.</div>
+            <div class="stack-item"><b>Embeddings</b> <code>EmbeddingService</code> is late-bound to the Gemini client and used for retrieval/ranking.</div>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 14px;">
+          <h4>Notes are first-class data</h4>
+          <p>
+            Notes are not just formatted assistant output. They have dedicated CRUD IPC methods, version history, note images, and special tool flows. Teacher mode can automatically capture study notes through the note tool path.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" id="models">
+        <h2>Gemini / Model Flow</h2>
+        <div class="flow">
+          <div class="flow-row">
+            <div class="step"><h4>1. Live catalog load</h4><p>The backend exposes <code>models.list</code>, backed by <code>GeminiClient.list_text_models()</code>.</p></div>
+            <div class="step"><h4>2. UI selection</h4><p>The Swift app fetches the live model catalog and stores only a selected model ID, not a hardcoded enum.</p></div>
+            <div class="step"><h4>3. Request-time identity</h4><p><code>inject_model_identity()</code> prepends the actual model ID into the system prompt so the assistant can answer truthfully about its current model.</p></div>
+            <div class="step"><h4>4. Capability checks</h4><p>Deep-think and image model selection are derived from live metadata / model IDs, not a frozen UI model list.</p></div>
+          </div>
+        </div>
+        <div class="grid-3" style="margin-top: 14px;">
+          <div class="card">
+            <h4>Text generation</h4>
+            <p><code>GeminiClient.send_prompt_with_tools()</code> and <code>send_continuation()</code> call <code>client.models.generate_content()</code> with tools, system instruction, and optional thinking config.</p>
+          </div>
+          <div class="card">
+            <h4>Continuation loop</h4>
+            <p>The backend preserves Gemini <code>Content</code> history and feeds back <code>function_response</code> parts, so the model can chain tools instead of hallucinating a final answer too early.</p>
+          </div>
+          <div class="card">
+            <h4>Image generation</h4>
+            <p>Image-capable models are discovered from the live model catalog. The backend ranks available image models instead of pinning retired model IDs.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="ui-flow">
+        <h2>UI Rendering and Streaming Flow</h2>
+        <div class="grid-2">
+          <div class="stack">
+            <h4>Inbound messages from backend</h4>
+            <div class="stack-item"><b>Status</b> thinking, planning, calling tool, awaiting approval, executing plan, streaming, complete.</div>
+            <div class="stack-item"><b>Stream chunks</b> delta text plus <code>done</code> flag.</div>
+            <div class="stack-item"><b>Tool lifecycle</b> pending, executing, success, failed.</div>
+            <div class="stack-item"><b>Final result</b> formatted assistant message and optional tool summary payload.</div>
+          </div>
+          <div class="stack">
+            <h4>UI state ownership</h4>
+            <div class="stack-item"><b><code>IPCClient</code></b> parses transport-level messages and exposes typed callbacks.</div>
+            <div class="stack-item"><b><code>AppState</code></b> owns message rows, streaming text, request lifecycle, session paging, selected model, permissions state, and settings.</div>
+            <div class="stack-item"><b><code>MainPanelView</code></b> renders the live chat window.</div>
+            <div class="stack-item"><b><code>ResponseBubble</code></b> renders assistant/user messages, streaming state, tool status in the compact response header, and browse warnings.</div>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 14px;">
+          <h4>Current chat-window architecture</h4>
+          <p>
+            The newest region stays live while older messages load on demand. The UI uses a bounded live window and history paging to avoid rendering the full transcript at once. This keeps long sessions responsive while preserving the current conversation tail in real time.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" id="controls">
+        <h2>Security and Operational Guardrails</h2>
+        <div class="grid-4">
+          <div class="card"><h4>Schema validation</h4><p>Every tool call must match the local JSON schema before execution.</p></div>
+          <div class="card"><h4>Path normalization</h4><p>ToolExecutor clamps and validates user paths against allowed roots and safety rules.</p></div>
+          <div class="card"><h4>Approval gates</h4><p>Destructive operations pause for explicit user confirmation.</p></div>
+          <div class="card"><h4>Timeouts / retries</h4><p>Model calls, DB operations, and tool execution are wrapped with bounded timeouts and request-in-flight checks.</p></div>
+        </div>
+        <div class="grid-3" style="margin-top: 14px;">
+          <div class="card"><h4>Browse controls</h4><p><code>browse_web.py</code> layers SSRF defenses, host blocking, prompt-injection checks, robots/compliance policy, and profile-based browsing rules.</p></div>
+          <div class="card"><h4>Memory privacy</h4><p>Semantic memory flows run through guardrails, sanitization, quarantine checks, and encrypted local storage.</p></div>
+          <div class="card"><h4>Transport safety</h4><p>Local socket only, authenticated handshake, version/feature negotiation, structured errors, and reconnect handling.</p></div>
+        </div>
+      </section>
+
+      <section class="panel" id="rpc">
+        <h2>Main IPC Methods</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Direction</th>
+              <th>Why it exists</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>prompt</code></td>
+              <td>UI → backend</td>
+              <td>Primary request path for model reasoning and tool orchestration.</td>
+            </tr>
+            <tr>
+              <td><code>cancel</code></td>
+              <td>UI → backend</td>
+              <td>Cancel active request and clean up in-flight state.</td>
+            </tr>
+            <tr>
+              <td><code>tool.confirm</code></td>
+              <td>UI → backend</td>
+              <td>Resume or deny destructive tool execution after approval prompt.</td>
+            </tr>
+            <tr>
+              <td><code>screen.capture_response</code></td>
+              <td>UI → backend</td>
+              <td>Send the captured screenshot/OCR result back for <code>read_screen</code>.</td>
+            </tr>
+            <tr>
+              <td><code>session.create</code>, <code>session.list</code>, <code>session.history_page</code></td>
+              <td>UI ↔ backend</td>
+              <td>Session management and bounded transcript retrieval.</td>
+            </tr>
+            <tr>
+              <td><code>memory.list</code>, <code>memory.delete</code></td>
+              <td>UI ↔ backend</td>
+              <td>Inspect or prune semantic memory entries.</td>
+            </tr>
+            <tr>
+              <td><code>notes.*</code></td>
+              <td>UI ↔ backend</td>
+              <td>Notes CRUD, note image retrieval, and version history.</td>
+            </tr>
+            <tr>
+              <td><code>models.list</code></td>
+              <td>UI ↔ backend</td>
+              <td>Fetch the live Gemini model catalog for the UI picker.</td>
+            </tr>
+            <tr>
+              <td><code>version</code>, <code>reload</code>, <code>ping</code></td>
+              <td>UI ↔ backend</td>
+              <td>Health, compatibility, and development reload support.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" id="files">
+        <h2>Key Files to Read Next</h2>
+        <div class="grid-2">
+          <div class="card">
+            <h4>If you want the complete request path</h4>
+            <ul>
+              <li><code>ui/AIAgentUI/State/AppState.swift</code></li>
+              <li><code>ui/AIAgentUI/IPC/IPCClient.swift</code></li>
+              <li><code>ui/AIAgentUI/IPC/SocketManager.swift</code></li>
+              <li><code>agent_host/main.py</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>If you want the model/tool contract</h4>
+            <ul>
+              <li><code>agent_host/system_prompt.py</code></li>
+              <li><code>agent_host/gemini_client.py</code></li>
+              <li><code>agent_host/schema_validator.py</code></li>
+              <li><code>schemas/*.json</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>If you want storage and memory</h4>
+            <ul>
+              <li><code>agent_host/memory/manager.py</code></li>
+              <li><code>agent_host/memory/store.py</code></li>
+              <li><code>agent_host/memory/embeddings.py</code></li>
+              <li><code>agent_host/memory/migration.py</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>If you want UI rendering behavior</h4>
+            <ul>
+              <li><code>ui/AIAgentUI/Views/MainPanelView.swift</code></li>
+              <li><code>ui/AIAgentUI/Views/Components/ResponseBubble.swift</code></li>
+              <li><code>ui/AIAgentUI/Views/InlineSettingsView.swift</code></li>
+              <li><code>ui/AIAgentUI/App/AIAgentUIApp.swift</code></li>
+            </ul>
+          </div>
+        </div>
+        <p class="footer-note" style="margin-top: 16px;">
+          This document is intentionally high-level but file-accurate. It is based on the current SwiftUI frontend, Python IPC server, Gemini client, tool executor, memory manager, and the live model-catalog path now used by the app.
+        </p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -123,7 +123,7 @@ struct ToolCallHeader: View {
     @Binding var isExpanded: Bool
     
     var body: some View {
-        Button(action: { isExpanded.toggle() }) {
+        Button(action: { withAnimation(AnimationConstants.snappy) { isExpanded.toggle() } }) {
             HStack(spacing: ThemeConstants.spacingS) {
                 ToggleArrow(isExpanded: $isExpanded, color: statusColor)
                 

@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  EdgeSnapping.swift
 //  AIAgentUI
@@ -410,3 +411,4 @@ final class PanelPositionManager {
         positionHistory.removeAll()
     }
 }
+#endif

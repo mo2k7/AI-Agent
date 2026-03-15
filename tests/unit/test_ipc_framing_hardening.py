@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
-import uuid
 from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
 from agent_host.ipc.server import IPCServer
+from tests.unit.websocket_test_harness import connect_line_transport, reserve_tcp_port
 
 
 class _DummyClient:
@@ -24,7 +23,7 @@ class _DummyClient:
 
 @pytest.mark.anyio
 async def test_invalid_params_shape_does_not_crash_dispatch() -> None:
-    server = IPCServer(socket_path="/tmp/pytest-ai-agent-invalid-params.sock")
+    server = IPCServer()
     client = _DummyClient()
 
     # params is intentionally invalid (array instead of object).
@@ -48,25 +47,19 @@ async def test_invalid_params_shape_does_not_crash_dispatch() -> None:
 
 @pytest.mark.anyio
 async def test_oversized_unframed_payload_is_rejected(tmp_path: Path) -> None:
-    socket_path = Path(f"/tmp/ai-agent-ipc-fuzz-{uuid.uuid4().hex[:8]}.sock")
-    server = IPCServer(socket_path=str(socket_path))
+    del tmp_path
+    port = reserve_tcp_port()
+    endpoint_url = f"ws://127.0.0.1:{port}"
+    server = IPCServer(host="127.0.0.1", port=port)
     server_task = asyncio.create_task(server.serve_forever())
 
     try:
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while not socket_path.exists() and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.02)
-        assert socket_path.exists()
-
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(endpoint_url)
         try:
             writer.write(b"a" * (IPCServer.MAX_INCOMING_BUFFER + 128))
             await writer.drain()
             line = await asyncio.wait_for(reader.readline(), timeout=3.0)
-            assert line
-            payload = json.loads(line.decode("utf-8"))
-            assert payload["type"] == "error"
-            assert payload["error"]["code"] == -32700
+            assert line == b""
         finally:
             writer.close()
             await writer.wait_closed()
@@ -79,21 +72,16 @@ async def test_oversized_unframed_payload_is_rejected(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_auth_required_rejects_non_auth_first_request() -> None:
-    socket_path = Path(f"/tmp/ai-agent-ipc-auth-{uuid.uuid4().hex[:8]}.sock")
     server = IPCServer(
-        socket_path=str(socket_path),
+        host="127.0.0.1",
+        port=reserve_tcp_port(),
         require_auth=True,
         auth_token="secret-token",
     )
     server_task = asyncio.create_task(server.serve_forever())
 
     try:
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while not socket_path.exists() and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.02)
-        assert socket_path.exists()
-
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(server.endpoint_url)
         try:
             payload = {
                 "jsonrpc": "2.0",
@@ -121,21 +109,16 @@ async def test_auth_required_rejects_non_auth_first_request() -> None:
 
 @pytest.mark.anyio
 async def test_auth_hello_rejects_invalid_token() -> None:
-    socket_path = Path(f"/tmp/ai-agent-ipc-auth-mismatch-{uuid.uuid4().hex[:8]}.sock")
     server = IPCServer(
-        socket_path=str(socket_path),
+        host="127.0.0.1",
+        port=reserve_tcp_port(),
         require_auth=True,
         auth_token="secret-token",
     )
     server_task = asyncio.create_task(server.serve_forever())
 
     try:
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while not socket_path.exists() and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.02)
-        assert socket_path.exists()
-
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await _connect_transport(server.endpoint_url)
         try:
             payload = {
                 "jsonrpc": "2.0",
@@ -167,33 +150,24 @@ async def test_auth_hello_rejects_invalid_token() -> None:
 
 
 @pytest.mark.anyio
-async def test_server_start_refuses_non_socket_unlink(tmp_path: Path) -> None:
-    socket_path = tmp_path / "ipc.sock"
-    socket_path.write_text("not-a-socket", encoding="utf-8")
-    server = IPCServer(socket_path=str(socket_path))
-
-    with pytest.raises(RuntimeError, match="Refusing to remove non-socket path"):
-        await server.start()
-
-    assert socket_path.exists()
-
-
-@pytest.mark.anyio
-async def test_server_start_replaces_stale_socket_file() -> None:
-    socket_path = Path(f"/tmp/ai-agent-stale-{uuid.uuid4().hex[:8]}.sock")
-    socket_path.unlink(missing_ok=True)
-    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        stale.bind(str(socket_path))
-    finally:
-        stale.close()
-    assert socket_path.exists()
-
-    server = IPCServer(socket_path=str(socket_path))
+async def test_server_start_binds_ephemeral_port_and_stop_clears_running_state(tmp_path: Path) -> None:
+    del tmp_path
+    server = IPCServer(host="127.0.0.1", port=0)
     await server.start()
     try:
-        assert socket_path.exists()
+        assert server.is_running is True
+        assert server.endpoint_url.startswith("ws://127.0.0.1:")
     finally:
         await server.stop()
 
-    assert not socket_path.exists()
+    assert server.is_running is False
+
+
+async def _connect_transport(endpoint_url: str, timeout_seconds: float = 5.0):
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            return await connect_line_transport(endpoint_url)
+        except OSError:
+            await asyncio.sleep(0.02)
+    raise TimeoutError(f"WebSocket endpoint did not become ready in time: {endpoint_url}")

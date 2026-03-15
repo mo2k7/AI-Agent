@@ -14,6 +14,7 @@ import json
 import shutil
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -124,7 +125,7 @@ def _remove_ghost_ipc_sessions(memory_root: Path) -> int:
         return 0
 
     removed = 0
-    with sqlite3.connect(index_db) as index_conn:
+    with closing(sqlite3.connect(index_db)) as index_conn, index_conn:
         rows = index_conn.execute(
             "SELECT session_id FROM sessions WHERE session_id LIKE 'ipc-%'"
         ).fetchall()
@@ -139,7 +140,7 @@ def _remove_ghost_ipc_sessions(memory_root: Path) -> int:
                 should_remove = True
             else:
                 try:
-                    with sqlite3.connect(session_db) as session_conn:
+                    with closing(sqlite3.connect(session_db)) as session_conn:
                         message_count = _read_sqlite_count(
                             session_conn,
                             "SELECT COUNT(*) FROM messages",
@@ -172,7 +173,7 @@ def _upgrade_legacy_semantic_hmac_rows(memory_root: Path, master_key: bytes) -> 
 
     upgraded_rows = 0
     for session_db in sorted(sessions_dir.glob("*.db")):
-        with sqlite3.connect(session_db) as connection:
+        with closing(sqlite3.connect(session_db)) as connection, connection:
             connection.row_factory = sqlite3.Row
             table_row = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='semantic_memories'"
@@ -225,59 +226,15 @@ def _upgrade_legacy_semantic_hmac_rows(memory_root: Path, master_key: bytes) -> 
 
 
 def run_preflight_migration(memory_root: Path) -> MigrationResult:
-    """Run strict one-time migration before runtime operations."""
-    root = memory_root.expanduser().resolve(strict=False)
-    root.mkdir(parents=True, exist_ok=True)
-    marker = _marker_path(root)
-    if marker.exists():
-        return MigrationResult(
-            migration_id=MIGRATION_ID,
-            version=MIGRATION_VERSION,
-            upgraded_hmac_rows=0,
-            removed_ghost_sessions=0,
-            backup_path="",
-            marker_path=str(marker),
-            already_migrated=True,
-        )
-
-    try:
-        key_material = get_or_create_master_key()
-    except KeychainError as exc:
-        raise MemoryMigrationError(
-            "Memory migration requires keychain-backed master key initialization."
-        ) from exc
-
-    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    backup_dir = _backup_root(root) / f"{MIGRATION_ID}-{timestamp}"
-
-    try:
-        _snapshot_memory_state(root, backup_dir)
-        removed = _remove_ghost_ipc_sessions(root)
-        upgraded = _upgrade_legacy_semantic_hmac_rows(root, key_material.raw)
-    except Exception as exc:
-        raise MemoryMigrationError(
-            f"Strict memory migration failed before runtime startup: {exc}"
-        ) from exc
-
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker_payload = {
-        "migration_id": MIGRATION_ID,
-        "version": MIGRATION_VERSION,
-        "completed_at_unix": time.time(),
-        "backup_path": str(backup_dir),
-        "upgraded_hmac_rows": upgraded,
-        "removed_ghost_sessions": removed,
-    }
-    marker.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
-
+    """Old v2 preflight migration is now a no-op since v3 is a unified DB clean break."""
     return MigrationResult(
         migration_id=MIGRATION_ID,
         version=MIGRATION_VERSION,
-        upgraded_hmac_rows=upgraded,
-        removed_ghost_sessions=removed,
-        backup_path=str(backup_dir),
-        marker_path=str(marker),
-        already_migrated=False,
+        upgraded_hmac_rows=0,
+        removed_ghost_sessions=0,
+        backup_path="",
+        marker_path="",
+        already_migrated=True,
     )
 
 

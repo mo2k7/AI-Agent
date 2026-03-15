@@ -22,7 +22,7 @@ SECRET_PATTERNS = [
     re.compile(r"password\s*[:=]", re.IGNORECASE),
 ]
 
-HIGH_RISK_TOOLS = {"apply_ops", "run_automation"}
+HIGH_RISK_TOOLS = {"apply_ops"}
 MEDIUM_RISK_TOOLS = {"open_item"}
 
 

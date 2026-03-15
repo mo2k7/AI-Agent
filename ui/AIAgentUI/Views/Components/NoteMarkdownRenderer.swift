@@ -11,8 +11,8 @@ import SwiftUI
 // MARK: - Shared Markdown Block Model
 
 /// A single parsed markdown block. Shared between ResponseBubble and NoteCard.
-struct MarkdownBlock: Identifiable {
-    enum Kind {
+struct MarkdownBlock: Identifiable, Sendable {
+    enum Kind: Sendable {
         case heading(level: Int, text: String)
         case paragraph(String)
         case bullet(items: [String])
@@ -350,7 +350,7 @@ func noteInlineMarkdownStudy(_ source: String) -> AttributedString {
 struct NoteMarkdownView: View {
     let blocks: [MarkdownBlock]
     /// Optional async closure to fetch a note image by ID. When nil, image blocks show a placeholder.
-    var imageFetcher: ((String) async -> NSImage?)?
+    var imageFetcher: ((String) async -> PlatformImage?)?
     /// Optional note type — study-type notes get key-term pill treatment on bold text.
     var noteType: String?
     /// Optional callback when a `[[note-id]]` cross-reference link is tapped.
@@ -546,9 +546,9 @@ struct NoteMarkdownView: View {
 struct NoteImageView: View {
     let altText: String
     let imageRef: String
-    var fetcher: ((String) async -> NSImage?)?
+    var fetcher: ((String) async -> PlatformImage?)?
 
-    @State private var nsImage: NSImage?
+    @State private var platformImage: PlatformImage?
     @State private var isLoading: Bool = false
     @State private var didFail: Bool = false
 
@@ -561,9 +561,9 @@ struct NoteImageView: View {
 
     var body: some View {
         Group {
-            if let nsImage {
+            if let platformImage {
                 VStack(spacing: 4) {
-                    Image(nsImage: nsImage)
+                    platformImageView(platformImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .frame(maxWidth: .infinity, maxHeight: 300)
@@ -626,9 +626,18 @@ struct NoteImageView: View {
         isLoading = true
         defer { isLoading = false }
         if let image = await fetcher(imageId) {
-            nsImage = image
+            platformImage = image
         } else {
             didFail = true
         }
+    }
+
+    @ViewBuilder
+    private func platformImageView(_ image: PlatformImage) -> Image {
+        #if os(macOS)
+        Image(nsImage: image)
+        #else
+        Image(uiImage: image)
+        #endif
     }
 }

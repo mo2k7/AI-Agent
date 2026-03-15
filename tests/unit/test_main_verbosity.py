@@ -97,6 +97,23 @@ def test_parse_deep_think_flag_strict_invalid(raw_value: object) -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("strict", "strict"),
+        (" STANDARD ", "standard"),
+        ("flexible", "flexible"),
+    ],
+)
+def test_parse_browse_profile_strict_valid(raw_value: object, expected: str) -> None:
+    assert main_module._parse_browse_profile_strict(raw_value) == expected
+
+
+@pytest.mark.parametrize("raw_value", ["", "relaxed", "wide_open", None, 3, object()])
+def test_parse_browse_profile_strict_invalid(raw_value: object) -> None:
+    assert main_module._parse_browse_profile_strict(raw_value) is None
+
+
+@pytest.mark.parametrize(
     ("model_name", "expected"),
     [
         ("gemini-3-pro-preview", True),
@@ -217,7 +234,9 @@ def test_build_teacher_note_body_includes_required_sections() -> None:
         ("0", 0),
         ("1", 1),
         ("8", 8),
-        ("9", 8),
+        ("9", 9),
+        ("20", 20),
+        ("25", 20),
         ("-2", 0),
         (" 4 ", 4),
     ],

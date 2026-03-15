@@ -52,9 +52,12 @@ def encode_text_semantic(
     tokens = tokenize(text)
     if embedding_service is None:
         raise RuntimeError("Embedding service is required for semantic retrieval.")
-    vector = embedding_service.embed(text, task_type=task_type)
+    try:
+        vector = embedding_service.embed(text, task_type=task_type)
+    except Exception:
+        vector = None
     if vector is None:
-        raise RuntimeError("Embedding service returned no vector.")
+        raise RuntimeError("Embedding service returned no vector")
     return EncodedText(tokens=tokens, vector=vector)
 
 

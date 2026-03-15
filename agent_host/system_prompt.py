@@ -97,6 +97,11 @@ def format_tool_belt(tools: Sequence[dict[str, Any]]) -> str:
         tools,
         key=lambda item: str(item.get("name", "")).lower(),
     )
+    available_tool_names = {
+        str(tool.get("name", "")).strip()
+        for tool in sorted_tools
+        if str(tool.get("name", "")).strip()
+    }
 
     for tool in sorted_tools:
         name = str(tool.get("name", "")).strip() or "unknown_tool"
@@ -117,13 +122,85 @@ def format_tool_belt(tools: Sequence[dict[str, Any]]) -> str:
     lines.extend(
         [
             "",
+            "## CONVERSATION-FIRST RULES",
+            "",
+            "Before calling any tool, first decide whether the user is continuing the current conversation, asking to transform existing session content, or asking for genuinely new external data.",
+            "Prefer using the current conversation, recent session context, and provided user details before reaching for tools.",
+            "If the user is refining, clarifying, summarizing, rewriting, elaborating, or continuing something already in the conversation, answer from existing context unless a tool is strictly needed.",
+            "Do not browse the web, search files, or inspect the screen merely because the user asked a follow-up question.",
+            "",
             "## TOOL SELECTION RULES",
             "",
-            "1. If user intent maps cleanly to one tool, call that tool directly.",
-            "2. If task requires multiple tools, chain them in a minimal safe sequence.",
-            "3. Never use broad destructive operations without explicit user confirmation.",
-            "4. If required arguments are missing, ask only for the missing fields.",
-            "5. If a request is out of tool scope, explain limits and offer alternatives.",
+            "1. If the conversation context already answers the request, do not call a tool.",
+            "2. If user intent maps cleanly to one tool and fresh evidence is actually needed, call that tool directly.",
+            "3. If task requires multiple tools, chain them in the smallest verifiable sequence.",
+            "4. Prefer lookup tools before action tools; inspect first, then modify.",
+            "5. Never use destructive or broad execution tools when a narrower read-only tool can answer first.",
+            "6. If required arguments are missing, ask only for the missing fields.",
+            "7. If a request is out of tool scope, explain limits and offer alternatives.",
+            "",
+            "## TOOL ROUTING PLAYBOOK",
+            "",
+        ]
+    )
+
+    if "search_files" in available_tool_names:
+        lines.extend(
+            [
+                "- Use `search_files` to discover candidate local paths when the user does not provide exact paths.",
+                "- Do not pass the full user sentence as `query`; extract only filename/content tokens plus structured filters.",
+            ]
+        )
+    if "read_document" in available_tool_names:
+        lines.append(
+            "- Use `read_document` to inspect files. Adjust the `mode` to switch between plain text, code analysis, PDF scraping, or bare metadata lookup."
+        )
+    if "manage_notes" in available_tool_names:
+        lines.append(
+            "- Use `manage_notes` for ALL note-taking requests. If the user asks you to format, summarize, or generate a quiz, compose the content yourself and then use `action=\"update\"` or `action=\"create\"` to save it."
+        )
+    if "browse_web" in available_tool_names:
+        lines.extend(
+            [
+                "- Use `browse_web` only for web content. Prefer `search_query` when the user needs web discovery, and `url` when they provide a specific page.",
+                "- Do not use `browse_web` for local files, session notes, or current on-screen content that `read_screen` already covers.",
+                "- Use `browse_web` when the answer materially depends on current external facts, live availability, or web-only source verification.",
+                "- If the user explicitly asks you to look up, verify, browse, search online, or get the latest/current web information, you MUST use `browse_web` before answering.",
+                "- Do not use `browse_web` just to restate, reformat, or continue an existing conversation.",
+                "- Do not answer time-sensitive web questions from memory first when `browse_web` is available.",
+                "- If `browse_web` fails, say the live lookup failed and keep that separate from any non-live background knowledge.",
+            ]
+        )
+    if "read_screen" in available_tool_names:
+        lines.append(
+            "- Use `read_screen` only when the user refers to visible screen content like 'this page', 'this site', or 'what's on screen'. Do not replace it with web search."
+        )
+    if "planner" in available_tool_names:
+        lines.append(
+            "- Use `planner` to analyze or re-evaluate a complex operational goal before proposing execution steps."
+        )
+    if "plan_ops" in available_tool_names:
+        lines.append(
+            "- Use `plan_ops` to build explicit file operation sequences. Do not call it for pure explanation or information-only tasks."
+        )
+    if "apply_ops" in available_tool_names:
+        lines.append(
+            "- Use `apply_ops` only when a concrete plan already exists and the user wants execution, not merely advice or a preview."
+        )
+
+    lines.extend(
+        [
+            "",
+            "## TOOL CHOICE ANTI-PATTERNS",
+            "",
+            "- Do not call read/write/execute tools when a conversational answer is sufficient.",
+            "- Do not browse or search just because a tool exists; every call must unlock information you do not already have.",
+            "- Do not treat every follow-up as a new research task.",
+            "- Do not call `search_files` after the user already gave an exact absolute path.",
+            "- Do not call `read_document` until you have a real file path.",
+            "- Do not call `apply_ops` just because the user mentioned organization or cleanup; inspect and plan first.",
+            "- Do not call `browse_web` for local-machine questions, repository inspection, or note editing.",
+            "- Do not answer latest/current web questions from stale memory when `browse_web` is available.",
             "",
             "## SEARCH TOOL BEST PRACTICES",
             "",
@@ -300,3 +377,66 @@ def _runtime_deep_think_rubric() -> str:
 def get_system_prompt(prompt_path: Optional[Path] = None) -> str:
     """Get the current base system prompt without runtime tool injection."""
     return load_system_prompt(prompt_path=prompt_path)
+
+
+def build_device_context_block(device_info: Optional[dict[str, Any]] = None) -> str:
+    """Build a device-awareness block for the system prompt.
+
+    Injected per-request so the AI knows which device the user is on
+    and scopes tool behavior accordingly.
+
+    Args:
+        device_info: Device registration payload from device.register RPC,
+                     containing platform, device_name, capabilities, etc.
+
+    Returns:
+        A system prompt section string, or empty string if no device info.
+    """
+    if not isinstance(device_info, dict):
+        return ""
+
+    platform = str(device_info.get("platform", "")).strip()
+    device_name = str(device_info.get("device_name", "")).strip() or "Unknown Device"
+    capabilities = device_info.get("capabilities", [])
+    if not isinstance(capabilities, list):
+        capabilities = []
+    caps_text = ", ".join(str(c) for c in capabilities) if capabilities else "none"
+
+    if not platform:
+        return ""
+
+    is_mobile = platform.lower() in {"ios", "ipados"}
+
+    lines: list[str] = [
+        "## CONNECTED DEVICE CONTEXT",
+        "",
+        f"The user is on **{platform}** (device: \"{device_name}\").",
+        f"Device capabilities: {caps_text}",
+        "",
+    ]
+
+    if is_mobile:
+        lines.extend([
+            "### CRITICAL: Mobile Device Tool Execution",
+            "",
+            "The user is on their **phone/tablet**.",
+            "Tools are **proxied to the user's device** — they execute natively on the iPhone/iPad, NOT on the Mac backend.",
+            "When tool results include `executed_on: iPhone`, it means the tool ran on the user's phone.",
+            "",
+            "Rules when user is on iOS/iPadOS:",
+            "- `search_files` searches the **iPhone** via Spotlight, NOT the Mac filesystem.",
+            "- `read_document` reads files on the **iPhone**, NOT the Mac.",
+            "- `open_item` opens items on the **iPhone**, NOT the Mac.",
+            "- Results are from the user's **phone**. NEVER say 'searched your Mac' when results have `executed_on: iPhone`.",
+            "- When presenting results, say 'on your iPhone' or 'on your device', never 'on your Mac'.",
+            "- If a search returns no results, say the file was not found on the iPhone.",
+            "",
+        ])
+    else:
+        lines.extend([
+            "Tools execute locally on this machine.",
+            "",
+        ])
+
+    return "\n".join(lines)
+

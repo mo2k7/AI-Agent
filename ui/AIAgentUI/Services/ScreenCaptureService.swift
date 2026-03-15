@@ -1,3 +1,4 @@
+#if os(macOS)
 import CoreGraphics
 import Vision
 import AppKit
@@ -12,6 +13,7 @@ struct ScreenCaptureResult: Sendable {
     let width: Int
     let height: Int
 }
+#endif
 
 // MARK: - Errors
 

@@ -7,7 +7,11 @@
 //
 
 import SwiftUI
+#if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 /// Blue theme color definitions for the AI Agent UI
 /// Based on Apple's Human Interface Guidelines with custom accents
@@ -27,16 +31,32 @@ extension Color {
     /// Light blue for subtle backgrounds
     static let lightBlue = Color(hex: "E1F0FF")
     
+    // MARK: - Ambient Glow Colors
+
+    /// Ambient glow for the app icon ring (idle state)
+    static let ambientGlow = Color(hex: "007AFF").opacity(0.25)
+
+    /// Active ambient glow for busy states
+    static let ambientGlowActive = Color(hex: "5AC8FA").opacity(0.4)
+
     // MARK: - Glass Effect Colors
     
     /// Glass background color (adapts to appearance)
     static var glassBg: Color {
-        Color(NSColor.windowBackgroundColor).opacity(0.75)
+        #if os(macOS)
+        return Color(PlatformColor.windowBackgroundColor).opacity(0.75)
+        #else
+        return Color(PlatformColor.systemBackground).opacity(0.75)
+        #endif
     }
     
     /// Glass stroke/border color (adapts to appearance)
     static var glassStroke: Color {
-        Color(NSColor.separatorColor).opacity(0.35)
+        #if os(macOS)
+        return Color(PlatformColor.separatorColor).opacity(0.35)
+        #else
+        return Color(PlatformColor.separator).opacity(0.35)
+        #endif
     }
     
     /// Glass inner highlight
@@ -52,16 +72,40 @@ extension Color {
     // MARK: - Text Colors
     
     /// Primary text color (adapts to appearance)
-    static var textPrimary: Color { Color(NSColor.labelColor) }
+    static var textPrimary: Color {
+        #if os(macOS)
+        return Color(PlatformColor.labelColor)
+        #else
+        return Color(PlatformColor.label)
+        #endif
+    }
     
     /// Secondary text color (adapts to appearance)
-    static var textSecondary: Color { Color(NSColor.secondaryLabelColor) }
+    static var textSecondary: Color {
+        #if os(macOS)
+        return Color(PlatformColor.secondaryLabelColor)
+        #else
+        return Color(PlatformColor.secondaryLabel)
+        #endif
+    }
     
     /// Tertiary text color for hints (adapts to appearance)
-    static var textTertiary: Color { Color(NSColor.tertiaryLabelColor) }
+    static var textTertiary: Color {
+        #if os(macOS)
+        return Color(PlatformColor.tertiaryLabelColor)
+        #else
+        return Color(PlatformColor.tertiaryLabel)
+        #endif
+    }
     
     /// Inverted text color for dark backgrounds
-    static var textInverted: Color { Color(NSColor.textBackgroundColor) }
+    static var textInverted: Color {
+        #if os(macOS)
+        return Color(PlatformColor.textBackgroundColor)
+        #else
+        return Color(PlatformColor.systemBackground)
+        #endif
+    }
     
     // MARK: - Semantic Colors
     
@@ -80,17 +124,39 @@ extension Color {
     // MARK: - Background Colors
     
     /// Panel background (for the floating panel)
-    static var panelBackground: Color { Color(NSColor.windowBackgroundColor) }
+    static var panelBackground: Color {
+        #if os(macOS)
+        return Color(PlatformColor.windowBackgroundColor)
+        #else
+        return Color(PlatformColor.systemBackground)
+        #endif
+    }
     
     /// Card background (for message bubbles, tool cards)
-    static var cardBackground: Color { Color(NSColor.controlBackgroundColor) }
+    static var cardBackground: Color {
+        #if os(macOS)
+        return Color(PlatformColor.controlBackgroundColor)
+        #else
+        return Color(PlatformColor.secondarySystemBackground)
+        #endif
+    }
     
     /// Input field background
-    static var inputBackground: Color { Color(NSColor.textBackgroundColor) }
+    static var inputBackground: Color {
+        #if os(macOS)
+        return Color(PlatformColor.textBackgroundColor)
+        #else
+        return Color(PlatformColor.secondarySystemBackground)
+        #endif
+    }
     
     /// Hover state background
     static var hoverBackground: Color {
-        Color(NSColor.selectedContentBackgroundColor).opacity(0.2)
+        #if os(macOS)
+        return Color(PlatformColor.selectedContentBackgroundColor).opacity(0.2)
+        #else
+        return Color(PlatformColor.systemFill).opacity(0.2)
+        #endif
     }
     
     // MARK: - Status Colors
@@ -256,6 +322,51 @@ enum ThemeConstants {
     static let shadowY: CGFloat = 5
 }
 
+// MARK: - Depth Level Constants
+
+/// Visual depth levels for the glass system
+enum DepthLevel {
+    case base       // Panel background (deepest)
+    case surface    // Message bubbles, content cards (middle)
+    case floating   // Interactive elements, chips, popovers (top)
+
+    var shadowRadius: CGFloat {
+        switch self {
+        case .base: return 22
+        case .surface: return 10
+        case .floating: return 18
+        }
+    }
+
+    var strokeOpacity: CGFloat {
+        switch self {
+        case .base: return 0.10
+        case .surface: return 0.18
+        case .floating: return 0.28
+        }
+    }
+
+    var shadowOpacity: CGFloat {
+        switch self {
+        case .base: return 0.26
+        case .surface: return 0.16
+        case .floating: return 0.32
+        }
+    }
+
+    var shadowColor: Color {
+        Color.black.opacity(shadowOpacity)
+    }
+
+    var shadowY: CGFloat {
+        switch self {
+        case .base: return 12
+        case .surface: return 5
+        case .floating: return 9
+        }
+    }
+}
+
 // MARK: - Animation Constants
 
 /// Standardized animations for UI consistency
@@ -276,7 +387,9 @@ enum AnimationConstants {
     static let blink = Animation.easeInOut(duration: 0.5)
     
     /// AppKit timing function for NSAnimationContext
+    #if os(macOS)
     static func appKitTimingFunction() -> CAMediaTimingFunction {
         CAMediaTimingFunction(name: .easeInEaseOut)
     }
+    #endif
 }

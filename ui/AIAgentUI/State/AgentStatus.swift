@@ -181,6 +181,35 @@ enum AgentStatus: Equatable {
         default: return .idle
         }
     }
+
+    var signatureKey: String {
+        switch self {
+        case .idle:
+            return "idle"
+        case .connecting:
+            return "connecting"
+        case .thinking:
+            return "thinking"
+        case .planning:
+            return "planning"
+        case .planReady(let detail):
+            return "plan_ready:\(detail)"
+        case .awaitingApproval(let detail):
+            return "awaiting_approval:\(detail)"
+        case .executingPlan(let detail):
+            return "executing_plan:\(detail)"
+        case .callingTool(let toolName):
+            return "calling_tool:\(toolName)"
+        case .capturingScreen:
+            return "capturing_screen"
+        case .streaming:
+            return "streaming"
+        case .error(let message):
+            return "error:\(message)"
+        case .complete:
+            return "complete"
+        }
+    }
 }
 
 // MARK: - Codable Support

@@ -2,52 +2,49 @@
 //  InputField.swift
 //  AIAgentUI
 //
-//  Created for Personal macOS AI Agent
-//  Status: Active - Feature-rich user input component
+//  Shared input component across macOS, iPhone, and iPad.
 //
 
 import SwiftUI
+
+#if os(macOS)
 import AppKit
+#endif
 
-// MARK: - Enhanced Input Field
-
-/// Feature-rich text input field for user prompts.
-/// Uses NSTextView under the hood for macOS-native spellcheck, autocorrect,
-/// grammar check, smart quotes, undo/redo, and dynamic text wrapping.
 struct InputField: View {
-
-    // MARK: - Properties
-
-    /// Binding to the input text
     @Binding var text: String
-
-    /// Placeholder text shown when empty
     var placeholder: String = "Ask me anything..."
-
-    /// Whether the input is disabled
     var isDisabled: Bool = false
-
-    /// Called when the user submits (presses Enter)
+    var accentColor: Color = .primaryBlue
+    var isBusy: Bool = false
+    var onAttach: (() -> Void)? = nil
     var onSubmit: () -> Void
 
-    // MARK: - State
-
     @State private var isFocused: Bool = false
-    @State private var textViewHeight: CGFloat = 34  // single-line default
+    @State private var textViewHeight: CGFloat = 34
     @State private var wordCount: Int = 0
     @State private var charCount: Int = 0
+    @State private var busyPulse: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
 
-    /// Minimum height (single line + inset)
     private let minHeight: CGFloat = 34
-    /// Maximum height before internal scrolling kicks in (~12 lines)
     private let maxHeight: CGFloat = 260
-
-    // MARK: - Body
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .bottom, spacing: ThemeConstants.spacingS) {
-                // NSTextView-backed input
+                if let onAttach = onAttach {
+                    Button(action: onAttach) {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(isDisabled ? .textTertiary : .textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isDisabled)
+                    .padding(.bottom, 6)
+                    .help("Attach files")
+                }
+
                 EnhancedTextView(
                     text: $text,
                     placeholder: placeholder,
@@ -62,32 +59,49 @@ struct InputField: View {
                 )
                 .frame(height: clampedHeight)
 
-                // Submit button
                 Button(action: submitIfPossible) {
-                    Image(systemName: isDisabled ? "hourglass" : "arrow.up.circle.fill")
-                        .font(.system(size: 24))
-                        .foregroundColor(canSubmit ? .primaryBlue : .textTertiary)
-                        .contentTransition(.symbolEffect(.replace))
+                    ZStack {
+                        Circle()
+                            .fill(canSubmit ? accentColor.opacity(0.15) : Color.cardBackground.opacity(0.55))
+                            .frame(width: 32, height: 32)
+
+                        Image(systemName: isDisabled ? "hourglass" : "arrow.up")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(canSubmit ? accentColor : .textTertiary)
+                    }
+                    .contentTransition(.symbolEffect(.replace))
+                    .scaleEffect(canSubmit ? 1.0 : 0.88)
+                    .animation(.spring(duration: 0.25, bounce: 0.3), value: canSubmit)
                 }
                 .buttonStyle(.plain)
                 .disabled(!canSubmit)
-                .help("Send (Enter)")
+                .help("Send")
             }
             .padding(ThemeConstants.spacingM)
-            .background(Color.inputBackground.opacity(0.95))
+            .background(
+                RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
+                    .fill(.regularMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
+                            .fill(composerTint)
+                    )
+            )
             .clipShape(RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium))
             .overlay(
                 RoundedRectangle(cornerRadius: ThemeConstants.cornerRadiusMedium)
-                    .stroke(
-                        isFocused ? Color.primaryBlue.opacity(0.5) : Color.glassStroke,
-                        lineWidth: isFocused ? 2 : 1
-                    )
+                    .stroke(borderStrokeColor, lineWidth: isFocused ? 2 : 1)
             )
             .animation(AnimationConstants.fast, value: isFocused)
+            .animation(
+                isBusy ? Animation.easeInOut(duration: 1.5).repeatForever(autoreverses: true) : .default,
+                value: busyPulse
+            )
+            .onChange(of: isBusy) { _, busy in
+                busyPulse = busy
+            }
 
-            // Live stats bar
             HStack(spacing: ThemeConstants.spacingS) {
-                if !text.isEmpty {
+                if charCount > 100 {
                     Text("\(wordCount) word\(wordCount == 1 ? "" : "s") · \(charCount) char\(charCount == 1 ? "" : "s")")
                         .font(.caption2.monospacedDigit())
                         .foregroundColor(.textTertiary)
@@ -97,26 +111,42 @@ struct InputField: View {
                 Spacer()
 
                 if isFocused {
-                    Text("⏎ Send · ⇧⏎ Newline")
+                    Text(keyboardHint)
                         .font(.caption2)
                         .foregroundColor(.textTertiary)
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
             }
-            .animation(.easeInOut(duration: 0.2), value: text.isEmpty)
+            .animation(.easeInOut(duration: 0.2), value: charCount > 100)
             .animation(.easeInOut(duration: 0.2), value: isFocused)
         }
     }
 
-    // MARK: - Computed Properties
-
-    /// Clamp the height between min and max for smooth dynamic sizing
     private var clampedHeight: CGFloat {
         min(max(textViewHeight, minHeight), maxHeight)
     }
 
+    private var borderStrokeColor: Color {
+        if isBusy {
+            return accentColor.opacity(busyPulse ? 0.58 : 0.22)
+        }
+        return isFocused ? accentColor.opacity(0.52) : Color.glassStroke.opacity(0.85)
+    }
+
+    private var composerTint: Color {
+        colorScheme == .dark ? Color.black.opacity(0.10) : Color.black.opacity(0.03)
+    }
+
     private var canSubmit: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isDisabled
+    }
+
+    private var keyboardHint: String {
+        #if os(macOS)
+        return "⏎ Send · ⇧⏎ Newline"
+        #else
+        return "Use Send to submit"
+        #endif
     }
 
     private func submitIfPossible() {
@@ -125,12 +155,9 @@ struct InputField: View {
     }
 }
 
-// MARK: - Enhanced Text View (NSViewRepresentable)
+#if os(macOS)
 
-/// NSTextView-backed text input with full macOS text system support:
-/// spellcheck, autocorrect, grammar, smart quotes, undo, dynamic height.
 struct EnhancedTextView: NSViewRepresentable {
-
     @Binding var text: String
     var placeholder: String
     @Binding var isFocused: Bool
@@ -151,8 +178,6 @@ struct EnhancedTextView: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.submitAction = onSubmit
         textView.placeholderString = placeholder
-
-        // Rich text system features
         textView.isRichText = false
         textView.allowsUndo = true
         textView.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
@@ -163,8 +188,6 @@ struct EnhancedTextView: NSViewRepresentable {
         textView.isEditable = !isDisabled
         textView.isSelectable = true
         textView.textContainerInset = NSSize(width: 2, height: 6)
-
-        // ✅ Intelligent text features
         textView.isContinuousSpellCheckingEnabled = true
         textView.isGrammarCheckingEnabled = true
         textView.isAutomaticSpellingCorrectionEnabled = true
@@ -175,7 +198,6 @@ struct EnhancedTextView: NSViewRepresentable {
         textView.isAutomaticLinkDetectionEnabled = false
         textView.smartInsertDeleteEnabled = true
 
-        // Scroll view (borderless)
         let scrollView = NSScrollView()
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
@@ -186,48 +208,32 @@ struct EnhancedTextView: NSViewRepresentable {
         scrollView.backgroundColor = .clear
         scrollView.scrollerStyle = .overlay
 
-        // Word wrapping
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        )
+        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
 
-        // Keep reference for height calculations
         context.coordinator.textView = textView
         context.coordinator.scrollView = scrollView
-
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? SmartSubmitTextView else { return }
-
-        // Update text if changed externally (e.g. after submit clears it)
         if textView.string != text {
             textView.string = text
             context.coordinator.recalculateHeightAndStats()
         }
-
-        // Update disabled state
         textView.isEditable = !isDisabled
         textView.textColor = isDisabled ? NSColor.tertiaryLabelColor : NSColor.labelColor
-
-        // Update submit handler
         textView.submitAction = onSubmit
-
-        // Update placeholder
         textView.placeholderString = placeholder
         textView.needsDisplay = true
     }
 
-    // MARK: - Coordinator
-
     @MainActor
-    class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: EnhancedTextView
         weak var textView: SmartSubmitTextView?
         weak var scrollView: NSScrollView?
@@ -253,32 +259,19 @@ struct EnhancedTextView: NSViewRepresentable {
         func recalculateHeightAndStats() {
             guard let textView else { return }
             let content = textView.string
-
-            // Word & char count
             let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            let words = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: .whitespacesAndNewlines)
-                .filter { !$0.isEmpty }.count
-            let chars = content.count
+            parent.wordCount = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.count
+            parent.charCount = content.count
 
-            // Dynamic height calculation
-            let layoutManager = textView.layoutManager!
-            let textContainer = textView.textContainer!
+            guard let layoutManager = textView.layoutManager, let textContainer = textView.textContainer else { return }
             layoutManager.ensureLayout(for: textContainer)
             let usedRect = layoutManager.usedRect(for: textContainer)
             let inset = textView.textContainerInset
-            let newHeight = usedRect.height + inset.height * 2
-
-            parent.wordCount = words
-            parent.charCount = chars
-            parent.desiredHeight = newHeight
+            parent.desiredHeight = usedRect.height + inset.height * 2
         }
     }
 }
 
-// MARK: - Smart Submit Text View
-
-/// Custom NSTextView: Enter submits, Shift+Enter inserts newline.
-/// Draws placeholder text when empty.
 final class SmartSubmitTextView: NSTextView {
     var submitAction: (() -> Void)?
     var placeholderString: String = "Ask me anything..."
@@ -286,7 +279,6 @@ final class SmartSubmitTextView: NSTextView {
     override func keyDown(with event: NSEvent) {
         let isEnterKey = event.keyCode == 36
         let hasShift = event.modifierFlags.contains(.shift)
-
         if isEnterKey && !hasShift {
             submitAction?()
             return
@@ -294,42 +286,89 @@ final class SmartSubmitTextView: NSTextView {
         super.keyDown(with: event)
     }
 
-    // Draw placeholder when empty
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-
-        if string.isEmpty {
-            let attributes: [NSAttributedString.Key: Any] = [
-                .foregroundColor: NSColor.tertiaryLabelColor,
-                .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
-            ]
-            let inset = textContainerInset
-            let origin = textContainerOrigin
-            let rect = NSRect(
-                x: origin.x + 5,
-                y: inset.height,
-                width: bounds.width - origin.x * 2 - 10,
-                height: bounds.height - inset.height * 2
-            )
-            placeholderString.draw(in: rect, withAttributes: attributes)
-        }
+        guard string.isEmpty else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.tertiaryLabelColor,
+            .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
+        ]
+        let inset = textContainerInset
+        let origin = textContainerOrigin
+        let rect = NSRect(
+            x: origin.x + 5,
+            y: inset.height,
+            width: bounds.width - origin.x * 2 - 10,
+            height: bounds.height - inset.height * 2
+        )
+        placeholderString.draw(in: rect, withAttributes: attributes)
     }
 
-    // Ensure placeholder redraws when text changes
     override func didChangeText() {
         super.didChangeText()
         needsDisplay = true
     }
 
-    // Accept first responder for immediate focus
     override var acceptsFirstResponder: Bool { true }
 }
 
-// MARK: - Simple Input Field (Single Line)
+#else
 
-/// A simpler single-line input field variant
+struct EnhancedTextView: View {
+    @Binding var text: String
+    var placeholder: String
+    @Binding var isFocused: Bool
+    var isDisabled: Bool
+    @Binding var desiredHeight: CGFloat
+    @Binding var wordCount: Int
+    @Binding var charCount: Int
+    var minHeight: CGFloat
+    var maxHeight: CGFloat
+    var onSubmit: () -> Void
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if text.isEmpty {
+                Text(placeholder)
+                    .foregroundColor(.textTertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 8)
+                    .allowsHitTesting(false)
+            }
+
+            TextEditor(text: $text)
+                .focused($focused)
+                .disabled(isDisabled)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
+                .padding(.horizontal, 2)
+                .padding(.vertical, 2)
+        }
+        .onAppear {
+            recalculateMetrics()
+        }
+        .onChange(of: text) { _, _ in
+            recalculateMetrics()
+        }
+        .onChange(of: focused) { _, newValue in
+            isFocused = newValue
+        }
+    }
+
+    private func recalculateMetrics() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        wordCount = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.count
+        charCount = text.count
+        let lineCount = max(1, text.components(separatedBy: "\n").count)
+        desiredHeight = min(max(CGFloat(lineCount) * 22 + 14, minHeight), maxHeight)
+    }
+}
+
+#endif
+
 struct SimpleInputField: View {
-
     @Binding var text: String
     var placeholder: String = "Type here..."
     var isDisabled: Bool = false
@@ -359,8 +398,6 @@ struct SimpleInputField: View {
     }
 }
 
-// MARK: - Preview
-
 #if DEBUG
 struct InputFieldPreview: View {
     @State private var text = ""
@@ -368,9 +405,8 @@ struct InputFieldPreview: View {
 
     var body: some View {
         VStack(spacing: ThemeConstants.spacingL) {
-            // Enhanced multi-line input
             VStack(alignment: .leading, spacing: ThemeConstants.spacingS) {
-                Text("Enhanced Input (spellcheck · autocorrect · grammar)")
+                Text("Enhanced Input")
                     .font(.caption)
                     .foregroundColor(.textSecondary)
 
@@ -381,7 +417,6 @@ struct InputFieldPreview: View {
                 )
             }
 
-            // Simple input
             VStack(alignment: .leading, spacing: ThemeConstants.spacingS) {
                 Text("Simple Input")
                     .font(.caption)
@@ -393,30 +428,10 @@ struct InputFieldPreview: View {
                     onSubmit: { print("Submitted: \(simpleText)") }
                 )
             }
-
-            // Disabled state
-            VStack(alignment: .leading, spacing: ThemeConstants.spacingS) {
-                Text("Disabled Input")
-                    .font(.caption)
-                    .foregroundColor(.textSecondary)
-
-                InputField(
-                    text: .constant(""),
-                    placeholder: "Processing...",
-                    isDisabled: true,
-                    onSubmit: {}
-                )
-            }
         }
         .padding()
         .frame(width: 400)
         .background(Color.panelBackground)
-    }
-}
-
-struct InputField_Previews: PreviewProvider {
-    static var previews: some View {
-        InputFieldPreview()
     }
 }
 #endif

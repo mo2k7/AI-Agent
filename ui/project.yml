@@ -1,0 +1,105 @@
+# xcodegen spec — run `xcodegen generate` from ui/ to regenerate AIAgent.xcodeproj
+# Mirrors the build settings from Package.swift without modifying any existing files.
+
+name: AIAgent
+
+options:
+  bundleIdPrefix: com.aiagent
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+  xcodeVersion: "26.3"
+  generateEmptyDirectories: false
+  groupSortPosition: none
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Match Package.swift: .enableExperimentalFeature("StrictConcurrency=complete")
+    SWIFT_STRICT_CONCURRENCY: complete
+    # Match Package.swift: .enableUpcomingFeature("InternalImportsByDefault")
+    OTHER_SWIFT_FLAGS: "-enable-upcoming-feature InternalImportsByDefault"
+    # Hardened Runtime for non-sandboxed notarizable app
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  AIAgentApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: AIAgentUI
+        excludes:
+          - "App/Info.plist"
+          - "Preview Content/**"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aiagent.AIAgentApp
+        PRODUCT_NAME: "AI Agent"
+        INFOPLIST_FILE: AIAgentUI/App/Info.plist
+        # Ad-hoc signing for local development. Set your team in Xcode
+        # Signing & Capabilities editor to enable Automatic signing.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION: YES
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_ENTITLEMENTS: AIAgentUI/App/AIAgent.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    scheme:
+      testTargets:
+        - AIAgentUITests
+      environmentVariables:
+        - variable: AI_AGENT_PROJECT_ROOT
+          value: $(SRCROOT)/..
+          isEnabled: true
+        - variable: AI_AGENT_DISABLE_BOOTSTRAP_REEXEC
+          value: "1"
+          isEnabled: true
+        - variable: AI_AGENT_BOOTSTRAPPED
+          value: "1"
+          isEnabled: true
+        - variable: AI_AGENT_ENV
+          value: development
+          isEnabled: true
+
+  AIAgentiOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: AIAgentUI
+        excludes:
+          - "App/Info.plist"
+          - "App/AppDelegate.swift"
+          - "IPC/BackendLauncher.swift"
+          - "Security/PermissionsManager.swift"
+          - "Services/ScreenCaptureService.swift"
+          - "Window/EdgeSnapping.swift"
+          - "Window/FloatingPanelController.swift"
+          - "Window/GlobalHotkey.swift"
+          - "Window/NotesPanelController.swift"
+          - "Preview Content/**"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aiagent.AIAgentiOS
+        PRODUCT_NAME: "AI Agent"
+        INFOPLIST_FILE: AIAgentUI/App/Info-iOS.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    scheme:
+      environmentVariables: []
+
+  AIAgentUITests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/AIAgentUITests
+    dependencies:
+      - target: AIAgentApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aiagent.AIAgentUITests

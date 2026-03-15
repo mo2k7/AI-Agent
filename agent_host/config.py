@@ -54,8 +54,13 @@ def _default_image_output_root() -> Path:
 
 
 def _default_allowed_roots() -> list[Path]:
-    """Get default filesystem roots for tool execution."""
-    return [_get_project_root()]
+    """Get default filesystem roots for tool execution.
+
+    Uses the root filesystem (Macintosh HD) so search covers the entire
+    computer.  Noisy/system paths are filtered by _path_has_noisy_components
+    and _path_is_excluded rather than by restricting roots.
+    """
+    return [Path("/")]
 
 
 def _default_automations_dir() -> Path:
@@ -83,7 +88,8 @@ class Config:
     
     Attributes:
         gemini_api_key: Google API key for Gemini (required).
-        model_name: Gemini model to use for inference.
+        model_name: Gemini model to use for inference. When empty, the backend
+            resolves the best currently available text model dynamically.
         schemas_dir: Directory containing JSON tool schemas.
         audit_log_path: Path to the JSONL audit log file.
         max_retries: Maximum number of retry attempts for API calls.
@@ -104,7 +110,7 @@ class Config:
     """
     
     gemini_api_key: str
-    model_name: str = "gemini-2.0-flash-exp"
+    model_name: str = ""
     schemas_dir: Path = field(default_factory=_default_schemas_dir)
     audit_log_path: Path = field(default_factory=_default_audit_log_path)
     max_retries: int = 3
@@ -186,7 +192,7 @@ class Config:
         Example:
             >>> config = Config.from_env()
             >>> config.model_name
-            'gemini-2.0-flash-exp'
+            ''
         """
         use_vertexai = _parse_bool_env(
             os.environ.get(f"{env_prefix}AI_AGENT_USE_VERTEXAI"),
@@ -208,7 +214,7 @@ class Config:
         # Load optional configuration values
         model_name = os.environ.get(
             f"{env_prefix}AI_AGENT_MODEL_NAME",
-            "gemini-2.0-flash-exp"
+            ""
         )
         
         schemas_dir_str = os.environ.get(f"{env_prefix}AI_AGENT_SCHEMAS_DIR")

@@ -25,6 +25,10 @@ _method_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "ai_agent_method",
     default=None,
 )
+_browse_profile_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ai_agent_browse_profile",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class RequestContextTokens:
     correlation_token: contextvars.Token[str | None]
     request_token: contextvars.Token[str | None]
     method_token: contextvars.Token[str | None]
+    browse_profile_token: contextvars.Token[str | None]
 
 
 def generate_correlation_id() -> str:
@@ -43,11 +48,13 @@ def set_request_context(
     correlation_id: str | None,
     request_id: str | None,
     method: str | None,
+    browse_profile: str | None = None,
 ) -> RequestContextTokens:
     return RequestContextTokens(
         correlation_token=_correlation_id_var.set(correlation_id),
         request_token=_request_id_var.set(request_id),
         method_token=_method_var.set(method),
+        browse_profile_token=_browse_profile_var.set(browse_profile),
     )
 
 
@@ -55,6 +62,7 @@ def reset_request_context(tokens: RequestContextTokens) -> None:
     _correlation_id_var.reset(tokens.correlation_token)
     _request_id_var.reset(tokens.request_token)
     _method_var.reset(tokens.method_token)
+    _browse_profile_var.reset(tokens.browse_profile_token)
 
 
 def get_request_context() -> dict[str, str | None]:
@@ -62,6 +70,7 @@ def get_request_context() -> dict[str, str | None]:
         "correlation_id": _correlation_id_var.get(),
         "request_id": _request_id_var.get(),
         "method": _method_var.get(),
+        "browse_profile": _browse_profile_var.get(),
     }
 
 
@@ -76,6 +85,8 @@ class RequestContextFilter(logging.Filter):
             setattr(record, "request_id", context["request_id"])
         if getattr(record, "method", None) is None:
             setattr(record, "method", context["method"])
+        if getattr(record, "browse_profile", None) is None:
+            setattr(record, "browse_profile", context["browse_profile"])
         if getattr(record, "component", None) is None:
             setattr(record, "component", record.name)
         return True
@@ -116,6 +127,7 @@ class JsonLineFormatter(logging.Formatter):
             "correlation_id": getattr(record, "correlation_id", None),
             "request_id": getattr(record, "request_id", None),
             "method": getattr(record, "method", None),
+            "browse_profile": getattr(record, "browse_profile", None),
             "duration_ms": getattr(record, "duration_ms", None),
             "error_type": getattr(record, "error_type", None),
             "error_message": getattr(record, "error_message", None),

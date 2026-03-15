@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -56,15 +57,24 @@ class ToolExecutor:
     """Executes validated tool calls against local resources."""
 
     _EXCLUDED_TOP_LEVEL_DIRS = {
-        "Library",
+        # macOS system directories — never search or operate on these.
         "System",
-        "private",
-        "usr",
+        "Library",
         "bin",
         "sbin",
+        "usr",
         "var",
+        "etc",
+        "tmp",
         "opt",
+        "private",
+        "cores",
+        "dev",
+        "Volumes",
+        "home",       # macOS NFS automount dir, not the user home
         ".Trash",
+        ".fseventsd",
+        ".vol",
     }
     # Reduced to ~50 essential stopwords.  The model now provides structured
     # search parameters (extensions, folder_hint) so heavy NLP pre-processing
@@ -220,10 +230,12 @@ class ToolExecutor:
         ".pytest_cache",
         ".spotlight-v100",
         ".svn",
+        ".trash",
         "__pycache__",
         "cache",
         "caches",
         "index.spotlightv3",
+        "library",       # /Library and ~/Library — system/app data, not user files
         "node_modules",
         "spotlight",
     }
@@ -240,13 +252,14 @@ class ToolExecutor:
         re.compile(r"live\.\d+\.directorystorefile$", re.IGNORECASE),
         re.compile(r"clientstatesmetafile$", re.IGNORECASE),
     )
-    _AUTOMATION_ALLOWED_SUFFIXES = {".sh", ".scpt", ".applescript"}
-    _AUTOMATION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$")
-    _AUTOMATION_OUTPUT_CHAR_LIMIT = 16000
-    _AUTOMATION_MAX_INPUT_SIZE_BYTES = 8192
     _HARD_DELETE_ENV_VAR = "AI_AGENT_ENABLE_HARD_DELETE"
     _TRASH_COLLISION_ATTEMPTS = 100
-    _SEARCH_RANKING_VERSION = "v1"
+    _SEARCH_RANKING_VERSION = "v2"
+    _SPOTLIGHT_CONTENT_FLOOR = 18       # min score for Spotlight content-only matches
+    _MAX_CONTENT_FLOOR_RESULTS = 15     # cap on content-floor results per search
+    _SEARCH_CACHE_MAX_ENTRIES = 8
+    _SEARCH_CACHE_TTL_SECONDS = 300.0   # 5 minutes
+    _SEARCH_CACHE_OVERLAP_BOOST = 14
     _SEARCH_MODE_VALUES = {"auto", "fast", "deep"}
     _OVERWRITE_POLICIES = {"fail", "rename", "overwrite"}
     _PLANNER_PRIVACY_POLICY_VERSION = "v2-strict-no-text"
@@ -269,12 +282,9 @@ class ToolExecutor:
         "apply_ops": 999999,
         "planner": 999999,
         "plan_ops": 999999,
-        "run_automation": 999999,
         "open_item": 999999,
         "create_directory": 999999,
-        "read_text": 999999,
-        "extract_content": 999999,
-        "get_metadata": 999999,
+        "read_document": 999999,
         "browse_web": 999999,
     }
     # Application whitelist for open_item
@@ -320,6 +330,7 @@ class ToolExecutor:
         # Rate limiting state: tool_name -> list of call timestamps
         self._rate_limit_calls: dict[str, list[float]] = {}
         self._apply_idempotency_cache: dict[str, dict[str, Any]] = {}
+        self._recent_search_cache: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
         self._planner_security_lock_reason = ""
         self._unified_planner = planner_engine or self._build_planner_engine()
 
@@ -330,31 +341,49 @@ class ToolExecutor:
             apply_ops,
             browse_web,
             create_directory,
-            extract_content,
-            get_metadata,
             open_item,
             plan_ops,
             planner_tool,
-            read_text,
-            run_automation,
+            read_document,
             search_files,
         )
 
         self._browse_rate_limiter = browse_web.DomainRateLimiter()
-        self._browse_response_cache = browse_web.ResponseCache()
         self._browse_robots_cache = browse_web.RobotsTxtCache()
         self._browse_circuit_breaker = browse_web.DomainCircuitBreaker()
+        browse_policy = browse_web._load_browse_compliance_policy()
+        retention = browse_policy.get("retention", {})
+        cache_ttl = float(retention.get("response_cache_ttl_seconds", 120))
+        cache_max_entries = int(retention.get("response_cache_max_entries", 64))
+        self._browse_response_cache = browse_web.ResponseCache(
+            max_entries=max(8, cache_max_entries),
+            ttl_seconds=max(30.0, cache_ttl),
+        )
+        incident_cfg = browse_policy.get("incident_response", {})
+        self._browse_incident_monitor = browse_web.BrowseIncidentMonitor(
+            threshold=int(incident_cfg.get("challenge_spike_threshold", 6)),
+            window_seconds=float(incident_cfg.get("window_seconds", 300)),
+            cooldown_seconds=float(incident_cfg.get("cooldown_seconds", 600)),
+            incident_log_path=str(
+                incident_cfg.get(
+                    "incident_log_path",
+                    Path.home()
+                    / "Library"
+                    / "Application Support"
+                    / "AIAgent"
+                    / "security"
+                    / "browse_incidents.jsonl",
+                )
+            ),
+        )
 
         self._handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
             "search_files": lambda args: search_files.handle(self, args),
-            "get_metadata": lambda args: get_metadata.handle(self, args),
-            "read_text": lambda args: read_text.handle(self, args),
-            "extract_content": lambda args: extract_content.handle(self, args),
+            "read_document": lambda args: read_document.handle(self, args),
             "planner": lambda args: planner_tool.handle(self, args),
             "plan_ops": lambda args: plan_ops.handle(self, args),
             "apply_ops": lambda args: apply_ops.handle(self, args),
             "open_item": lambda args: open_item.handle(self, args),
-            "run_automation": lambda args: run_automation.handle(self, args),
             "create_directory": lambda args: create_directory.handle(self, args),
             "browse_web": lambda args: browse_web.handle(self, args),
         }
@@ -695,6 +724,35 @@ class ToolExecutor:
             if re.sub(r"[^a-z0-9]", "", part)
         )
 
+    def _build_fts_query_or(
+        self,
+        *,
+        query_lower: str,
+        query_tokens: list[str],
+        query_phrases: list[str],
+    ) -> str:
+        """Build an OR-joined FTS5 query for broader recall (deep mode fallback)."""
+        terms: list[str] = []
+        for phrase in query_phrases[:2]:
+            cleaned = phrase.strip().replace('"', "")
+            if cleaned:
+                terms.append(f'"{cleaned}"')
+        for token in query_tokens[:8]:
+            normalized = re.sub(r"[^a-z0-9]", "", token.lower())
+            if not normalized:
+                continue
+            terms.append(f'"{normalized}"*')
+        if terms:
+            return " OR ".join(dict.fromkeys(terms))
+        fallback = re.sub(r"\s+", " ", query_lower.strip().replace('"', ""))
+        if not fallback:
+            return ""
+        return " OR ".join(
+            f'"{re.sub(r"[^a-z0-9]", "", part)}"*'
+            for part in fallback.split(" ")
+            if re.sub(r"[^a-z0-9]", "", part)
+        )
+
     def _upsert_search_index_entries(self, rows: list[dict[str, Any]]) -> int:
         if not self._search_index_enabled or not rows:
             return 0
@@ -777,6 +835,32 @@ class ToolExecutor:
             return 0
         return upserted
 
+    def _prune_stale_index_entries(self, max_checks: int = 100) -> int:
+        """Remove FTS index entries for files that no longer exist.
+
+        Checks the oldest entries first (most likely to be stale).
+        Called during incremental seeding with a small budget.
+        """
+        if not self._search_index_enabled:
+            return 0
+        removed = 0
+        try:
+            with self._open_search_index() as conn:
+                rows = conn.execute(
+                    "SELECT path FROM search_files ORDER BY updated_at ASC LIMIT ?",
+                    (max_checks,),
+                ).fetchall()
+                for row in rows:
+                    if not Path(row["path"]).exists():
+                        conn.execute("DELETE FROM search_files WHERE path = ?", (row["path"],))
+                        conn.execute("DELETE FROM search_files_fts WHERE path = ?", (row["path"],))
+                        removed += 1
+                if removed:
+                    conn.commit()
+        except sqlite3.Error as exc:
+            logger.debug("Stale index pruning failed: %s", exc)
+        return removed
+
     def _seed_search_index_incremental(
         self,
         *,
@@ -789,6 +873,9 @@ class ToolExecutor:
     ) -> dict[str, object]:
         if not self._search_index_enabled or max_entries <= 0 or max_seconds <= 0:
             return {"indexed": 0, "scanned": 0, "completed_cycle": False}
+
+        # Prune stale entries before seeding new ones (lightweight, ~100 checks).
+        self._prune_stale_index_entries(max_checks=100)
 
         targets: list[tuple[Path, set[str]]] = []
         for root in self.allowed_roots:
@@ -901,14 +988,23 @@ class ToolExecutor:
         folder_hints: set[str],
         path_filter: str,
         limit: int,
+        fts_fallback: bool = False,
+        fts_tokens: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int, bool]:
-        """Returns (results, scanned_count, fts_error_flag)."""
+        """Returns (results, scanned_count, fts_error_flag).
+
+        ``fts_tokens`` are used for FTS MATCH query building (defaults to
+        ``query_tokens``).  Expanded tokens (plural/singular forms) can break
+        AND semantics so callers should pass the core (pre-expansion) tokens.
+        ``query_tokens`` (expanded) are still used for path scoring.
+        """
         if not self._search_index_enabled:
             return [], 0, False
 
+        effective_fts_tokens = fts_tokens if fts_tokens is not None else query_tokens
         fts_query = self._build_fts_query(
             query_lower=query_lower,
-            query_tokens=query_tokens,
+            query_tokens=effective_fts_tokens,
             query_phrases=query_phrases,
         )
         if not fts_query:
@@ -981,8 +1077,10 @@ class ToolExecutor:
             except OSError:
                 continue
             fts_rank_raw = row["fts_rank"]
-            fts_rank = float(fts_rank_raw) if isinstance(fts_rank_raw, (int, float)) else 1000.0
-            semantic_boost = max(0.0, 60.0 - (max(0.0, fts_rank) * 8.0))
+            fts_rank = float(fts_rank_raw) if isinstance(fts_rank_raw, (int, float)) else 0.0
+            # FTS5 bm25() returns negative values; more negative = better match.
+            # -fts_rank converts to positive so better matches get higher boosts.
+            semantic_boost = min(60.0, max(0.0, -fts_rank * 8.0))
             metadata["score"] = int(base_score + semantic_boost)
             metadata["match_signals"] = {
                 **signals,
@@ -990,6 +1088,72 @@ class ToolExecutor:
                 "fts_rank": round(fts_rank, 6),
             }
             results.append(metadata)
+
+        # --- OR-based fallback for deep mode (F4) ---
+        # When AND query returns fewer results than requested and fts_fallback is
+        # enabled, re-query with OR to catch partial matches.
+        if fts_fallback and len(results) < limit:
+            or_query = self._build_fts_query_or(
+                query_lower=query_lower,
+                query_tokens=effective_fts_tokens,
+                query_phrases=query_phrases,
+            )
+            if or_query and or_query != fts_query:
+                seen_paths = {r["path"] for r in results}
+                try:
+                    with self._open_search_index() as conn:
+                        or_sql = """
+                            SELECT sf.path, sf.name, sf.display_path, sf.relative_path, sf.uri,
+                                   sf.created_at, sf.modified_at, sf.size_bytes, sf.source,
+                                   bm25(search_files_fts) AS fts_rank
+                            FROM search_files_fts
+                            JOIN search_files sf ON sf.path = search_files_fts.path
+                            WHERE search_files_fts MATCH ?
+                            ORDER BY fts_rank ASC, sf.modified_at DESC
+                            LIMIT ?
+                        """
+                        or_rows = list(conn.execute(or_sql, (or_query, max(limit * 4, limit))))
+                except sqlite3.Error:
+                    or_rows = []
+                for row in or_rows:
+                    if len(results) >= limit * 6:
+                        break
+                    path = Path(str(row["path"])).expanduser().resolve(strict=False)
+                    if str(path) in seen_paths:
+                        continue
+                    if not self._path_within_allowed_roots(path):
+                        continue
+                    if self._path_is_excluded(path):
+                        continue
+                    if not path.exists() or not path.is_file():
+                        continue
+                    base_score, or_signals = self._score_path_with_signals(
+                        query_lower=query_lower,
+                        query_tokens=query_tokens,
+                        query_phrases=query_phrases,
+                        extension_hints=extension_hints,
+                        folder_hints=folder_hints,
+                        path=path,
+                    )
+                    if base_score <= 0:
+                        continue
+                    try:
+                        metadata = self._make_search_metadata(path, score=base_score, source="index")
+                    except OSError:
+                        continue
+                    or_fts_rank = float(row["fts_rank"]) if isinstance(row["fts_rank"], (int, float)) else 0.0
+                    or_boost = min(60.0, max(0.0, -or_fts_rank * 8.0))
+                    metadata["score"] = int(base_score + or_boost)
+                    metadata["match_signals"] = {
+                        **or_signals,
+                        "semantic_boost": round(or_boost, 3),
+                        "fts_rank": round(or_fts_rank, 6),
+                        "or_fallback": True,
+                    }
+                    results.append(metadata)
+                    seen_paths.add(str(path))
+                    scanned += len(or_rows)
+
         return results, scanned, False
 
     # ------------------------------------------------------------------
@@ -1157,11 +1321,25 @@ class ToolExecutor:
     def _ordered_walk_targets(self, root: Path) -> list[tuple[Path, set[str]]]:
         """Return prioritized walk targets for a root path.
 
-        For the user's home directory, scan high-signal user folders first so
-        matches are found before the global scan budget is exhausted.
+        For the user's home directory (or the root filesystem), scan
+        high-signal user folders first so matches are found before the
+        global scan budget is exhausted.  When the root is ``/``, the
+        walker focuses on user-facing directories instead of traversing
+        the entire filesystem.
         """
         home = Path.home().expanduser().resolve(strict=False)
-        if root != home:
+        root_resolved = root.resolve(strict=False)
+
+        # Root filesystem: walk user home (prioritized) + /Applications.
+        # Never os.walk("/") directly — too expensive.
+        if root_resolved == Path("/"):
+            targets = self._ordered_walk_targets(home)
+            apps = Path("/Applications")
+            if apps.exists() and apps.is_dir():
+                targets.append((apps, set()))
+            return targets
+
+        if root_resolved != home:
             return [(root, set())]
 
         prioritized_targets: list[tuple[Path, set[str]]] = []
@@ -1237,106 +1415,6 @@ class ToolExecutor:
             result = text[:limit]
         return result, True, total_chars
 
-    @staticmethod
-    def _slugify_automation_name(raw: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
-
-    def _iter_allowlisted_automation_scripts(self) -> list[Path]:
-        scripts: list[Path] = []
-        try:
-            entries = sorted(self.automations_dir.iterdir(), key=lambda item: item.name.lower())
-        except OSError as exc:
-            raise ToolExecutionError(
-                f"Unable to list automations directory '{self.automations_dir}': {exc}"
-            ) from exc
-
-        for candidate in entries:
-            if candidate.suffix.lower() not in self._AUTOMATION_ALLOWED_SUFFIXES:
-                continue
-            if not candidate.is_file():
-                continue
-            scripts.append(candidate)
-        return scripts
-
-    @staticmethod
-    def _format_available_automations(scripts: Sequence[Path], *, limit: int = 12) -> str:
-        if not scripts:
-            return "none"
-        names = [script.name for script in scripts[:limit]]
-        if len(scripts) > limit:
-            names.append("...")
-        return ", ".join(names)
-
-    def _resolve_automation_script(self, name: str) -> tuple[Path, str]:
-        if not self._AUTOMATION_NAME_PATTERN.fullmatch(name):
-            raise ToolExecutionError(
-                "run_automation 'name' may only contain letters, numbers, spaces, '.', '_' and '-'"
-            )
-
-        scripts = self._iter_allowlisted_automation_scripts()
-        if not scripts:
-            raise ToolExecutionError(
-                f"No allowlisted automation scripts are available in {self.automations_dir}"
-            )
-
-        name_path = Path(name)
-        name_lower = name.lower()
-        name_slug = self._slugify_automation_name(name)
-        stem_lower = name_path.stem.lower()
-        stem_slug = self._slugify_automation_name(name_path.stem)
-        use_filename = name_path.suffix.lower() in self._AUTOMATION_ALLOWED_SUFFIXES
-
-        def _unique_or_ambiguous(
-            matches: list[Path],
-            *,
-            match_kind: str,
-            lookup: str,
-        ) -> tuple[Path, str] | None:
-            if not matches:
-                return None
-            if len(matches) == 1:
-                return matches[0], match_kind
-            formatted = ", ".join(item.name for item in matches)
-            raise ToolExecutionError(
-                f"Automation name '{lookup}' is ambiguous ({match_kind}): {formatted}. "
-                "Use the exact script filename."
-            )
-
-        exact_filename = [script for script in scripts if script.name == name]
-        resolved = _unique_or_ambiguous(exact_filename, match_kind="exact_filename", lookup=name)
-        if resolved:
-            return resolved
-
-        if use_filename:
-            ci_filename = [script for script in scripts if script.name.lower() == name_lower]
-            resolved = _unique_or_ambiguous(ci_filename, match_kind="casefold_filename", lookup=name)
-            if resolved:
-                return resolved
-
-        exact_stem = [script for script in scripts if script.stem == name]
-        resolved = _unique_or_ambiguous(exact_stem, match_kind="exact_stem", lookup=name)
-        if resolved:
-            return resolved
-
-        ci_stem = [script for script in scripts if script.stem.lower() == stem_lower]
-        resolved = _unique_or_ambiguous(ci_stem, match_kind="casefold_stem", lookup=name)
-        if resolved:
-            return resolved
-
-        if name_slug and name_slug == stem_slug:
-            slug_matches = [
-                script
-                for script in scripts
-                if self._slugify_automation_name(script.stem) == name_slug
-            ]
-            resolved = _unique_or_ambiguous(slug_matches, match_kind="slug_stem", lookup=name)
-            if resolved:
-                return resolved
-
-        available = self._format_available_automations(scripts)
-        raise ToolExecutionError(
-            f"No allowlisted automation script found for '{name}'. Available scripts: {available}"
-        )
 
     @staticmethod
     def _tokenize_search_query(query_lower: str) -> list[str]:
@@ -1359,6 +1437,26 @@ class ToolExecutor:
             tokens.append(cleaned)
         return tokens
 
+    @staticmethod
+    def _normalize_token_forms(token: str) -> list[str]:
+        """Generate singular/plural forms via suffix rules (no hardcoded dict).
+
+        Handles the most common English plural patterns algorithmically:
+        -ies → -y, -es → strip, -s → strip, and singular → +s.
+        """
+        forms = [token]
+        # Plural → singular
+        if token.endswith("ies") and len(token) > 4:
+            forms.append(token[:-3] + "y")   # "memories" → "memory"
+        elif token.endswith("es") and len(token) > 3:
+            forms.append(token[:-2])          # "watches" → "watch"
+        elif token.endswith("s") and len(token) > 2 and not token.endswith("ss"):
+            forms.append(token[:-1])          # "documents" → "document"
+        # Singular → plural
+        if not token.endswith("s"):
+            forms.append(token + "s")         # "document" → "documents"
+        return list(dict.fromkeys(forms))
+
     @classmethod
     def _expand_search_tokens(cls, query_tokens: list[str]) -> list[str]:
         expanded: list[str] = []
@@ -1373,14 +1471,18 @@ class ToolExecutor:
 
         for token in query_tokens:
             _add(token)
+            # Algorithmic plural/singular normalization (F6).
+            for form in cls._normalize_token_forms(token):
+                _add(form)
 
         token_set = set(expanded)
-        if "images" in token_set:
+        if "images" in token_set or "image" in token_set:
             _add("image")
-        if "photos" in token_set:
+            _add("images")
+        if "photos" in token_set or "photo" in token_set:
             _add("photo")
             _add("image")
-        if "screenshots" in token_set:
+        if "screenshots" in token_set or "screenshot" in token_set:
             _add("screenshot")
             _add("image")
         if "gemini" in token_set and ("image" in token_set or "images" in token_set):
@@ -1399,6 +1501,7 @@ class ToolExecutor:
         original_query: str,
         query_tokens: list[str],
         query_phrases: list[str],
+        extension_hints: set[str] | None = None,
     ) -> list[str]:
         variants: list[str] = []
         seen: set[str] = set()
@@ -1425,7 +1528,17 @@ class ToolExecutor:
         if {"gemini", "image"}.issubset(token_set):
             _add("gemini generated image")
 
-        return variants[:4]
+        # Filename-targeted mdfind variants via -name: sentinel prefix.
+        # mdfind -name is dramatically more precise than general content search.
+        if query_tokens:
+            _add(f"-name:{' '.join(query_tokens[:4])}")
+
+        # Extension-filtered filename variants for the top 2 extension hints.
+        if extension_hints:
+            for ext in sorted(extension_hints)[:2]:
+                _add(f"-name:.{ext}")
+
+        return variants[:6]
 
     @classmethod
     def _derive_extension_hints(cls, query_tokens: list[str]) -> set[str]:
@@ -1482,6 +1595,12 @@ class ToolExecutor:
             score += 60
             signals["normalized_stem_match"] = 60.0
 
+        # Exact stem match: the entire stem equals the query (e.g., "report"
+        # matches "report.txt" but not "monthly_report_summary.txt").
+        if query_lower and query_lower == stem_lower:
+            score += 30
+            signals["exact_stem_match"] = 30.0
+
         for phrase in query_phrases:
             if phrase in filename_lower:
                 score += 70
@@ -1489,6 +1608,10 @@ class ToolExecutor:
             elif phrase in haystack:
                 score += 40
                 signals["phrase_path_match"] = signals.get("phrase_path_match", 0.0) + 40.0
+
+        # Split filename stem into word-boundary segments for prefix matching.
+        stem_words = re.split(r"[._\-\s]+", stem_lower)
+        parent_words = re.split(r"[/_.\-\s]+", parent_lower)
 
         for token in query_tokens:
             token_score = 0
@@ -1500,6 +1623,24 @@ class ToolExecutor:
                 token_score = 16
             elif token in haystack:
                 token_score = 8
+
+            # Word-boundary prefix matching (F6): "doc" at a word boundary
+            # in "budget_document" gets a bonus, but "doc" inside
+            # "indoctrinate" does not.  Acts as primary score when no
+            # substring match found, or supplemental bonus to distinguish
+            # word-boundary hits from coincidental mid-word substrings.
+            if len(token) >= 3:
+                prefix_bonus = 0
+                for word in stem_words:
+                    if len(word) >= 3 and word.startswith(token) and word != token:
+                        prefix_bonus = 14 if not token_score else 10
+                        break
+                if not prefix_bonus:
+                    for word in parent_words:
+                        if len(word) >= 3 and word.startswith(token) and word != token:
+                            prefix_bonus = 8 if not token_score else 6
+                            break
+                token_score += prefix_bonus
 
             if token_score:
                 score += token_score
@@ -1571,6 +1712,8 @@ class ToolExecutor:
         folder_hints: set[str],
         path_filter: str,
         limit: int,
+        mdfind_timeout: int = 8,
+        collect_cap_mult: int = 3,
     ) -> tuple[list[dict[str, Any]], int]:
         if shutil.which("mdfind") is None:
             return [], 0
@@ -1587,17 +1730,23 @@ class ToolExecutor:
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
         scanned_candidates = 0
-        collect_cap = max(limit * 3, limit)
+        collect_cap = max(limit * collect_cap_mult, limit)
 
         def _run_mdfind(
             root: Path, query: str,
         ) -> subprocess.CompletedProcess[str] | None:
             try:
+                # Detect -name: sentinel prefix for filename-targeted queries (F3).
+                if query.startswith("-name:"):
+                    name_query = query[6:]
+                    cmd = ["mdfind", "-onlyin", str(root), "-name", name_query]
+                else:
+                    cmd = ["mdfind", "-onlyin", str(root), query]
                 return subprocess.run(
-                    ["mdfind", "-onlyin", str(root), query],
+                    cmd,
                     capture_output=True,
                     text=True,
-                    timeout=8,
+                    timeout=mdfind_timeout,
                     check=False,
                 )
             except (OSError, subprocess.TimeoutExpired) as mdfind_exc:
@@ -1605,6 +1754,7 @@ class ToolExecutor:
                 return None
 
         workers = min(8, len(work_items))
+        content_floor_count = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(_run_mdfind, root, query): (root, query)
@@ -1616,6 +1766,9 @@ class ToolExecutor:
                 completed = future.result()
                 if completed is None or completed.returncode not in {0, 1}:
                     continue
+
+                _orig_root, orig_query = futures[future]
+                is_content_query = not orig_query.startswith("-name:")
 
                 for line in completed.stdout.splitlines():
                     candidate_raw = line.strip()
@@ -1646,14 +1799,22 @@ class ToolExecutor:
                         folder_hints,
                         candidate,
                     )
+                    is_content_floor = False
                     if score <= 0:
-                        continue
+                        if is_content_query and content_floor_count < self._MAX_CONTENT_FLOOR_RESULTS:
+                            score = self._SPOTLIGHT_CONTENT_FLOOR
+                            content_floor_count += 1
+                            is_content_floor = True
+                        else:
+                            continue
                     try:
                         metadata = self._make_search_metadata(
                             candidate, score=score, source="spotlight",
                         )
                     except OSError:
                         continue
+                    if is_content_floor:
+                        metadata["spotlight_content_match"] = True
                     collected.append(metadata)
                     seen.add(path_key)
                     if len(collected) >= collect_cap:
@@ -1671,10 +1832,14 @@ class ToolExecutor:
         extension_hints: set[str],
         folder_hints: set[str],
     ) -> list[dict[str, Any]]:
-        merged: dict[str, dict[str, Any]] = {}
-        source_boosts = {"spotlight": 28.0, "index": 22.0, "walk": 14.0}
+        # Group candidates by source to apply Reciprocal Rank Fusion (RRF)
+        source_candidates: dict[str, list[dict[str, Any]]] = {
+            "spotlight": [],
+            "index": [],
+            "walk": [],
+        }
+        
         now_ts = time.time()
-
         for row in candidates:
             path_raw = str(row.get("path", "")).strip()
             if not path_raw:
@@ -1695,11 +1860,13 @@ class ToolExecutor:
                 folder_hints=folder_hints,
                 path=path_obj,
             )
-            if score <= 0:
-                continue
-
             source = str(row.get("source", "walk")).strip() or "walk"
-            source_boost = source_boosts.get(source, 8.0)
+            if score <= 0:
+                if source == "spotlight" and not default_signals.get("excluded_noise"):
+                    score = self._SPOTLIGHT_CONTENT_FLOOR
+                    default_signals = {"spotlight_content_floor": float(self._SPOTLIGHT_CONTENT_FLOOR)}
+                else:
+                    continue
 
             modified_at_raw = row.get("modified_at")
             modified_at = float(modified_at_raw) if isinstance(modified_at_raw, (int, float)) else now_ts
@@ -1710,19 +1877,60 @@ class ToolExecutor:
             signals = dict(signal_payload) if isinstance(signal_payload, dict) else {}
             if not signals:
                 signals.update(default_signals)
-            signals["source_boost"] = round(source_boost, 3)
-            signals["recency_boost"] = round(recency_boost, 3)
 
-            final_score = float(score) + source_boost + recency_boost
-            row["score"] = int(final_score)
+            row["_intrinsic_score"] = float(score)
+            row["recency_boost"] = recency_boost
             row["match_signals"] = signals
             row["path"] = str(path_obj)
+            row["source"] = source
+            row["modified_at"] = modified_at
 
-            existing = merged.get(str(path_obj))
-            if existing is None or int(row["score"]) > int(existing.get("score", 0)):
-                merged[str(path_obj)] = row
+            source_candidates.setdefault(source, []).append(row)
 
+        # Sort each source list by intrinsic score to determine ordinal ranks
+        for source_name, items in source_candidates.items():
+            items.sort(key=lambda x: (x.get("_intrinsic_score", 0), x.get("recency_boost", 0)), reverse=True)
+
+        # Apply Reciprocal Rank Fusion (RRF): score = sum(1 / (k + rank))
+        k = 60.0
+        merged: dict[str, dict[str, Any]] = {}
+        
+        for source_name, items in source_candidates.items():
+            for rank_idx, item in enumerate(items):
+                path_key = str(item["path"])
+                rrf_term = 1.0 / (k + rank_idx + 1)
+                
+                if path_key not in merged:
+                    item["_rrf_sum"] = rrf_term
+                    item["match_signals"][f"{source_name}_rank"] = rank_idx + 1
+                    merged[path_key] = item
+                else:
+                    existing = merged[path_key]
+                    existing["_rrf_sum"] += rrf_term
+                    existing["match_signals"][f"{source_name}_rank"] = rank_idx + 1
+                    if item["_intrinsic_score"] > existing["_intrinsic_score"]:
+                        existing["_intrinsic_score"] = item["_intrinsic_score"]
+                        existing["match_signals"].update(item["match_signals"])
+
+        # Finalize and scale scores
         ranked = list(merged.values())
+        for row in ranked:
+            base_rrf_score = row.pop("_rrf_sum") * 3000.0
+            recency = row.pop("recency_boost", 0.0)
+            
+            source_boost = 0.0
+            if "spotlight_rank" in row["match_signals"]:
+                source_boost += 8.0
+            if "index_rank" in row["match_signals"]:
+                source_boost += 4.0
+                
+            final_score = base_rrf_score + recency + source_boost
+            
+            row["score"] = int(final_score)
+            row["match_signals"]["rrf_score"] = round(base_rrf_score, 3)
+            row["match_signals"]["recency_boost"] = round(recency, 3)
+            row.pop("_intrinsic_score", None)
+
         ranked.sort(
             key=lambda item: (
                 int(item.get("score", 0)),
@@ -1732,6 +1940,146 @@ class ToolExecutor:
             reverse=True,
         )
         return ranked
+
+    # ------------------------------------------------------------------
+    # directory co-location discovery (S2)
+    # ------------------------------------------------------------------
+
+    def _discover_colocated_files(
+        self,
+        ranked_results: list[dict[str, Any]],
+        *,
+        top_n: int = 5,
+        min_shared: int = 2,
+        max_siblings: int = 10,
+        boost_score: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Add sibling files from directories with multiple top results.
+
+        When 2+ top results share a parent directory, other files in that
+        directory are likely related.  Returns new candidates only (callers
+        should extend the existing list).
+        """
+        if len(ranked_results) < min_shared:
+            return []
+
+        existing_paths = {r.get("path", "") for r in ranked_results}
+
+        # Count how many top results share each parent directory.
+        dir_counts: dict[str, int] = {}
+        for result in ranked_results[:top_n]:
+            path_raw = result.get("path", "")
+            if not path_raw:
+                continue
+            parent = str(Path(path_raw).parent)
+            dir_counts[parent] = dir_counts.get(parent, 0) + 1
+
+        siblings: list[dict[str, Any]] = []
+        for dir_path, count in dir_counts.items():
+            if count < min_shared:
+                continue
+            parent = Path(dir_path)
+            if not parent.is_dir():
+                continue
+            added = 0
+            try:
+                for child in parent.iterdir():
+                    if added >= max_siblings:
+                        break
+                    if not child.is_file():
+                        continue
+                    child_str = str(child)
+                    if child_str in existing_paths:
+                        continue
+                    if not self._path_within_allowed_roots(child):
+                        continue
+                    if self._path_is_excluded(child):
+                        continue
+                    if self._path_has_noisy_components(child):
+                        continue
+                    try:
+                        metadata = self._make_search_metadata(
+                            child, score=boost_score, source="colocation",
+                        )
+                    except OSError:
+                        continue
+                    metadata["colocation_source"] = True
+                    siblings.append(metadata)
+                    existing_paths.add(child_str)
+                    added += 1
+            except OSError:
+                continue
+        return siblings
+
+    # ------------------------------------------------------------------
+    # search result cache (S3)
+    # ------------------------------------------------------------------
+
+    def _cache_search_results(
+        self,
+        query_lower: str,
+        query_tokens: list[str],
+        result_paths: tuple[str, ...],
+        result_scores: tuple[int, ...],
+    ) -> None:
+        """Store recent search results for cross-execution recall."""
+        entry: dict[str, Any] = {
+            "query_lower": query_lower,
+            "query_tokens": frozenset(query_tokens),
+            "timestamp": time.time(),
+            "result_paths": result_paths,
+            "result_scores": result_scores,
+        }
+        while len(self._recent_search_cache) >= self._SEARCH_CACHE_MAX_ENTRIES:
+            self._recent_search_cache.popitem(last=False)
+        self._recent_search_cache[query_lower] = entry
+        self._recent_search_cache.move_to_end(query_lower)
+
+    def _apply_cache_boost(
+        self,
+        *,
+        current_query_tokens: list[str],
+        candidates: list[dict[str, Any]],
+    ) -> int:
+        """Boost candidates that appeared in recent related searches.
+
+        Returns the number of candidates that received a boost.
+        """
+        now = time.time()
+        current_tokens = set(current_query_tokens)
+        if not current_tokens:
+            return 0
+
+        boosted_paths: dict[str, float] = {}
+        for _cache_key, entry in self._recent_search_cache.items():
+            if now - entry["timestamp"] > self._SEARCH_CACHE_TTL_SECONDS:
+                continue
+            cached_tokens = entry["query_tokens"]
+            overlap = current_tokens & cached_tokens
+            if not overlap:
+                continue
+            overlap_ratio = len(overlap) / max(len(current_tokens), len(cached_tokens))
+            if overlap_ratio < 0.3:
+                continue
+            boost = self._SEARCH_CACHE_OVERLAP_BOOST * overlap_ratio
+            for path_str in entry["result_paths"]:
+                existing_boost = boosted_paths.get(path_str, 0.0)
+                boosted_paths[path_str] = max(existing_boost, boost)
+
+        if not boosted_paths:
+            return 0
+
+        boosted_count = 0
+        for candidate in candidates:
+            path = candidate.get("path", "")
+            boost = boosted_paths.get(path, 0.0)
+            if boost > 0:
+                candidate["score"] = int(candidate.get("score", 0)) + int(boost)
+                signals = candidate.get("match_signals", {})
+                signals["cache_overlap_boost"] = round(boost, 3)
+                candidate["match_signals"] = signals
+                boosted_count += 1
+        return boosted_count
 
     # ------------------------------------------------------------------
     # tool handlers
@@ -1812,6 +2160,17 @@ class ToolExecutor:
     def _trash_directory() -> Path:
         return Path.home().expanduser().resolve(strict=False) / ".Trash"
 
+    def _trash_directory_candidates(self, *, src_path: Path) -> list[Path]:
+        candidates: list[Path] = [self._trash_directory()]
+        src_resolved = src_path.expanduser().resolve(strict=False)
+        for root in self.allowed_roots:
+            if src_resolved == root or root in src_resolved.parents:
+                candidate = root / ".ai-agent-trash"
+                if candidate not in candidates:
+                    candidates.append(candidate)
+                break
+        return candidates
+
     def _next_available_trash_path(self, name: str, *, trash_dir: Path) -> Path:
         preferred = trash_dir / name
         if not preferred.exists():
@@ -1830,17 +2189,31 @@ class ToolExecutor:
         return trash_dir / f"{stem}-{uuid.uuid4().hex}{suffix}"
 
     def _move_path_to_trash(self, src_path: Path) -> Path:
-        trash_dir = self._trash_directory()
-        trash_dir.mkdir(parents=True, exist_ok=True)
-
         src_resolved = src_path.resolve(strict=False)
-        trash_resolved = trash_dir.resolve(strict=False)
-        if src_resolved.parent == trash_resolved:
-            return src_resolved
+        move_errors: list[OSError] = []
 
-        destination = self._next_available_trash_path(src_path.name, trash_dir=trash_dir)
-        shutil.move(str(src_path), str(destination))
-        return destination
+        for trash_dir in self._trash_directory_candidates(src_path=src_path):
+            try:
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                trash_resolved = trash_dir.resolve(strict=False)
+            except OSError as exc:
+                move_errors.append(exc)
+                continue
+
+            if src_resolved.parent == trash_resolved:
+                return src_resolved
+
+            destination = self._next_available_trash_path(src_path.name, trash_dir=trash_dir)
+            try:
+                shutil.move(str(src_path), str(destination))
+                return destination
+            except OSError as exc:
+                move_errors.append(exc)
+                continue
+
+        if move_errors:
+            raise move_errors[-1]
+        raise OSError("No writable trash directory available")
 
     @staticmethod
     def _next_available_destination_path(destination: Path) -> Path:

@@ -46,6 +46,7 @@ struct PromptRequest: Encodable {
         let verbosity: String?
         let presentationStyle: String?
         let streamingAnimation: String?
+        let browseProfile: String?
         let deepThink: Bool?
         let correlationId: String?
 
@@ -59,6 +60,7 @@ struct PromptRequest: Encodable {
             case verbosity
             case presentationStyle = "presentation_style"
             case streamingAnimation = "stream_animation"
+            case browseProfile = "browse_profile"
             case deepThink = "deep_think"
             case correlationId = "correlation_id"
         }
@@ -75,6 +77,7 @@ struct PromptRequest: Encodable {
         verbosity: String? = nil,
         presentationStyle: String? = nil,
         streamingAnimation: String? = nil,
+        browseProfile: String? = nil,
         deepThink: Bool? = nil,
         correlationId: String? = nil
     ) {
@@ -89,6 +92,7 @@ struct PromptRequest: Encodable {
             verbosity: verbosity,
             presentationStyle: presentationStyle,
             streamingAnimation: streamingAnimation,
+            browseProfile: browseProfile,
             deepThink: deepThink,
             correlationId: correlationId
         )
@@ -298,6 +302,7 @@ struct ResultResponse: Decodable {
     struct ErrorData: Decodable {
         let code: Int
         let message: String
+        let data: [String: AnyCodable]?
     }
 }
 
@@ -321,7 +326,8 @@ struct SystemResponse: Decodable {
         let domain: String?
         let action: String?
         let payload: [String: AnyCodable]?
-        
+        let seq: Int?
+
         enum CodingKeys: String, CodingKey {
             case event
             case protocolVersion = "protocol_version"
@@ -335,6 +341,7 @@ struct SystemResponse: Decodable {
             case domain
             case action
             case payload
+            case seq
         }
     }
 }

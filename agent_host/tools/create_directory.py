@@ -17,7 +17,24 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
         raise ToolExecutionError("create_directory requires a non-empty 'path'")
 
     exist_ok_raw = arguments.get("exist_ok", True)
-    exist_ok = bool(exist_ok_raw) if isinstance(exist_ok_raw, bool) else True
+    if isinstance(exist_ok_raw, bool):
+        exist_ok = exist_ok_raw
+    elif isinstance(exist_ok_raw, str):
+        normalized = exist_ok_raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            exist_ok = True
+        elif normalized in {"0", "false", "no", "off"}:
+            exist_ok = False
+        else:
+            raise ToolExecutionError(
+                "create_directory 'exist_ok' must be a boolean",
+                error_type="validation",
+            )
+    else:
+        raise ToolExecutionError(
+            "create_directory 'exist_ok' must be a boolean",
+            error_type="validation",
+        )
 
     path = executor._normalize_user_path(path_raw, must_exist=False)
 

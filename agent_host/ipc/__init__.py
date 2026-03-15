@@ -1,5 +1,5 @@
 """
-IPC module for Unix Domain Socket communication with the SwiftUI frontend.
+IPC module for WebSocket communication with the SwiftUI frontend.
 
 This module provides:
 - IPCServer: Async server handling client connections

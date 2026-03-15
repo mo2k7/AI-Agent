@@ -236,25 +236,31 @@ class HotReloadManager:
                 self.reload_modules(trigger="file_change", changed_files=changed_str)
     
     async def start(self) -> None:
-        """Start the file watcher."""
+        """Start the file watcher and SIGHUP handler.
+
+        When ``auto_watch`` is ``False`` (e.g. in production), no
+        background task is created and no signal handler is registered.
+        The manager still reports a stable ``version`` for protocol
+        compatibility.
+        """
         if self._running:
             return
-        
+
         self._running = True
-        
+
         if self.auto_watch:
             self._watch_task = asyncio.create_task(self._watch_loop())
-        
-        # Register signal handler for SIGHUP
-        try:
-            loop = asyncio.get_running_loop()
-            loop.add_signal_handler(
-                signal.SIGHUP,
-                lambda: self.reload_modules(trigger="signal"),
-            )
-            logger.info("SIGHUP handler registered")
-        except (ValueError, OSError) as e:
-            logger.warning(f"Could not register SIGHUP handler: {e}")
+
+            # Register SIGHUP handler only when file watching is active.
+            try:
+                loop = asyncio.get_running_loop()
+                loop.add_signal_handler(
+                    signal.SIGHUP,
+                    lambda: self.reload_modules(trigger="signal"),
+                )
+                logger.info("SIGHUP handler registered")
+            except (ValueError, OSError) as e:
+                logger.warning(f"Could not register SIGHUP handler: {e}")
     
     async def stop(self) -> None:
         """Stop the file watcher."""
@@ -283,13 +289,41 @@ def get_reload_manager() -> HotReloadManager:
     return _reload_manager
 
 
+def is_hot_reload_enabled() -> bool:
+    """Return True if hot reload should be active in the current environment.
+
+    Hot reload is enabled when AI_AGENT_ENV is "development" or "test", or
+    when AI_AGENT_HOT_RELOAD is explicitly set to a truthy value.  It is
+    disabled in all other environments (including production) to prevent
+    accidental code injection via dropped .py files.
+    """
+    explicit = os.environ.get("AI_AGENT_HOT_RELOAD", "").strip().lower()
+    if explicit in ("1", "true", "yes", "on"):
+        return True
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    env = os.environ.get("AI_AGENT_ENV", "").strip().lower()
+    return env in ("development", "test", "dev")
+
+
 def init_reload_manager(
     watch_dir: Optional[Path] = None,
     poll_interval: float = 2.0,
     auto_watch: bool = True,
 ) -> HotReloadManager:
-    """Initialize the global HotReloadManager with custom settings."""
+    """Initialize the global HotReloadManager with custom settings.
+
+    File watching and automatic reloading are disabled unless the
+    environment is explicitly marked as development/test (see
+    ``is_hot_reload_enabled``).  The manager is still created so that
+    callers can reference ``reload_manager.version`` unconditionally, but
+    ``auto_watch`` is forced to ``False`` when disabled.
+    """
     global _reload_manager
+    enabled = is_hot_reload_enabled()
+    if not enabled:
+        auto_watch = False
+        logger.info("Hot reload disabled (AI_AGENT_ENV is not development/test)")
     _reload_manager = HotReloadManager(
         watch_dir=watch_dir,
         poll_interval=poll_interval,

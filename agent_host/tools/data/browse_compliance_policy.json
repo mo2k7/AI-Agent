@@ -1,0 +1,88 @@
+{
+  "policy_version": "2026-03-01",
+  "jurisdiction_mode": "us_only",
+  "allowed_jurisdictions": [
+    "US"
+  ],
+  "blocked_tlds_for_jurisdiction": [
+    ".ru",
+    ".by",
+    ".kp",
+    ".ir",
+    ".sy"
+  ],
+  "egress": {
+    "allowlist_mode": false,
+    "allow_domains": [],
+    "deny_domains": [
+      "metadata.google.internal",
+      "localhost"
+    ],
+    "deny_domain_suffixes": [
+      ".onion",
+      ".internal",
+      ".local"
+    ],
+    "deny_url_patterns": [
+      "(?i)/admin/login",
+      "(?i)/wp-admin",
+      "(?i)/signin\\b",
+      "(?i)/checkout\\b"
+    ]
+  },
+  "tos": {
+    "enforce_terms_gate": true,
+    "blocked_path_patterns": [
+      "(?i)/terms\\b",
+      "(?i)/legal\\b",
+      "(?i)/privacy\\b",
+      "(?i)/account\\b",
+      "(?i)/signin\\b",
+      "(?i)/login\\b",
+      "(?i)/checkout\\b"
+    ],
+    "blocked_body_patterns": [
+      "(?i)sign in to continue",
+      "(?i)please log in",
+      "(?i)subscription required",
+      "(?i)members only",
+      "(?i)paywall"
+    ]
+  },
+  "privacy": {
+    "redact_pii": true,
+    "block_on_pii_detection": true,
+    "pii_patterns": {
+      "email": "\\b[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}\\b",
+      "phone": "\\b(?:\\+?1[-.\\s]?)?(?:\\(?\\d{3}\\)?[-.\\s]?)\\d{3}[-.\\s]?\\d{4}\\b",
+      "ssn": "\\b\\d{3}-\\d{2}-\\d{4}\\b",
+      "credit_card": "\\b(?:4\\d{3}|5[1-5]\\d{2}|2[2-7]\\d{2}|3[47]\\d{2}|6(?:011|5\\d{2}))[ -]?\\d{4}[ -]?\\d{4}[ -]?\\d{1,7}\\b",
+      "ip_address": "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b"
+    }
+  },
+  "retention": {
+    "response_cache_ttl_seconds": 120,
+    "response_cache_max_entries": 64,
+    "audit_retention_days": 30
+  },
+  "copyright": {
+    "enforce_excerpt_limit": true,
+    "max_excerpt_chars": 5000,
+    "require_source_attribution": true
+  },
+  "security_attestation": {
+    "require_recent_attestation": true,
+    "max_age_days": 30
+  },
+  "incident_response": {
+    "kill_switch_env": "AI_AGENT_BROWSE_DISABLED",
+    "challenge_spike_threshold": 6,
+    "window_seconds": 300,
+    "cooldown_seconds": 600,
+    "incident_log_path": "/Users/muhammadabdullah/Library/Application Support/AIAgent/security/browse_incidents.jsonl"
+  },
+  "change_management": {
+    "require_signature_metadata": true,
+    "signature_review_sla_days": 7
+  }
+}

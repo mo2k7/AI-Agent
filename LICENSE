@@ -1,0 +1,113 @@
+Personal AI Agent Proprietary License
+Version 1.0
+
+Copyright (c) 2025-2026 Muhammad Abdullah.
+All rights reserved.
+
+1. Scope
+
+This repository, the source code, object code, binaries, application bundles,
+models, prompts, schemas, workflows, build scripts, assets, screenshots,
+documentation, tests, and all related materials distributed with this project
+(collectively, the "Software") are proprietary and confidential.
+
+2. Ownership
+
+All right, title, and interest in and to the Software, including all
+copyrights, trade secrets, know-how, and other intellectual property rights,
+remain exclusively with Muhammad Abdullah unless a separate written agreement
+states otherwise.
+
+3. No Open-Source Grant
+
+The Software is not licensed under an open-source license. Nothing in this
+license grants any right to publicly use, redistribute, sublicense, host,
+publish, sell, lease, transfer, disclose, or otherwise exploit the Software
+except as expressly permitted in a separate written authorization.
+
+4. Authorized Use
+
+Unless separately approved in writing by Muhammad Abdullah, the Software may be
+used only for private, internal, or evaluation purposes by an authorized person
+who lawfully received access to it. Any broader use requires prior written
+permission.
+
+5. Restrictions
+
+Without prior express written permission from Muhammad Abdullah, you may not:
+
+- copy, reproduce, republish, or redistribute the Software;
+- provide the Software to any third party;
+- modify, adapt, translate, or create derivative works based on the Software;
+- reverse engineer, decompile, disassemble, or attempt to derive source or
+  non-public implementation details from any compiled portion of the Software,
+  except to the limited extent a non-waivable law expressly prohibits this
+  restriction;
+- remove, alter, or obscure any copyright, trademark, attribution, or
+  proprietary notices;
+- use the Software to build or train a competing system, benchmark suite, or
+  derivative commercial product;
+- use the Software in violation of law, regulation, contract, or third-party
+  rights.
+
+6. Source and Binary Confidentiality
+
+The Software contains confidential and proprietary information. You must use at
+least reasonable care to protect it from unauthorized access, disclosure, or
+distribution. If you become aware of unauthorized access or disclosure, you
+must stop further distribution immediately and notify Muhammad Abdullah.
+
+7. No Implied Rights
+
+No rights are granted by implication, estoppel, exhaustion, or otherwise. Any
+rights not expressly granted are reserved.
+
+8. Feedback
+
+If you provide suggestions, bug reports, design ideas, or other feedback
+regarding the Software, Muhammad Abdullah may use that feedback without
+restriction or compensation unless a separate written agreement states
+otherwise.
+
+9. Third-Party Components
+
+The Software may include, link to, or depend on third-party components that are
+licensed under separate open-source or third-party terms. Those components
+remain subject to their own licenses. This license applies only to the
+proprietary portions of this repository and does not replace or narrow any
+rights or obligations that apply to third-party software under its own terms.
+
+10. No Trademark License
+
+This license does not grant any right to use any name, logo, brand, or mark of
+Muhammad Abdullah except as strictly necessary to identify the Software in its
+unmodified form for authorized internal use.
+
+11. Termination
+
+Any unauthorized use automatically terminates any permission to possess or use
+the Software. Upon termination, you must stop using the Software and destroy
+all unauthorized copies under your control, except to the extent retention is
+required by law.
+
+12. Warranty Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT,
+ACCURACY, QUIET ENJOYMENT, OR THAT THE SOFTWARE WILL BE ERROR-FREE OR
+UNINTERRUPTED.
+
+13. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, MUHAMMAD ABDULLAH SHALL NOT BE LIABLE
+FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE
+DAMAGES, OR FOR ANY LOSS OF DATA, PROFITS, REVENUE, GOODWILL, OR BUSINESS
+INTERRUPTION, ARISING OUT OF OR RELATED TO THE SOFTWARE OR THIS LICENSE,
+WHETHER IN CONTRACT, TORT, STRICT LIABILITY, OR OTHERWISE, EVEN IF ADVISED OF
+THE POSSIBILITY OF SUCH DAMAGES.
+
+14. Entire License
+
+This license states the entire default license policy for the Software unless
+superseded by a separate written agreement signed by Muhammad Abdullah.

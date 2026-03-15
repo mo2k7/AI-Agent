@@ -15,6 +15,7 @@ cryptography = "^46.0.4"
 unified-planning = "^1.2.0"
 spacy = "^3.8.11"
 beautifulsoup4 = "^4.13.0"
+websockets = "^15.0.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"

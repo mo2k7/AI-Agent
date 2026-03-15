@@ -53,10 +53,6 @@ else
 fi
 
 _resolve_poetry_bin() {
-  if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/poetry" ]]; then
-    printf "%s\n" "${VIRTUAL_ENV}/bin/poetry"
-    return 0
-  fi
   if command -v poetry >/dev/null 2>&1; then
     command -v poetry
     return 0
@@ -81,11 +77,7 @@ else
     exit 1
   fi
   echo "[run_all] Poetry not found; installing Poetry..." >&2
-  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    python3 -m pip install "poetry>=1.8,<2.0" >&2
-  else
-    python3 -m pip install --user "poetry>=1.8,<2.0" >&2
-  fi
+  python3 -m pip install --user "poetry>=1.8,<2.0" >&2
   hash -r
   if ! POETRY_BIN="$(_resolve_poetry_bin)"; then
     echo "[run_all] FATAL: Poetry install completed but poetry binary is still unavailable." >&2
@@ -101,7 +93,7 @@ REPORT_PATH="${AI_AGENT_RUN_DIR}/stress_report.json"
 
 echo "run_id=${AI_AGENT_RUN_ID}"
 echo "run_dir=${AI_AGENT_RUN_DIR}"
-echo "socket_path=${AI_AGENT_SOCKET_PATH}"
+echo "backend_url=${AI_AGENT_BACKEND_URL}"
 
 cleanup() {
   set +e
@@ -144,7 +136,8 @@ set +e
 (
   cd "${PROJECT_ROOT}"
   "${POETRY_BIN}" run python scripts/stress_rpc.py \
-    --socket-path "${AI_AGENT_SOCKET_PATH}" \
+    --backend-url "${AI_AGENT_BACKEND_URL}" \
+    --auth-token "${AI_AGENT_IPC_AUTH_TOKEN}" \
     --duration "${DURATION}" \
     --concurrency "${CONCURRENCY}" \
     --seed "${SEED}" \

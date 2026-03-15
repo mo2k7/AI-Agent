@@ -1,0 +1,148 @@
+{
+  "version": "2026-03-01",
+  "metadata": {
+    "approved_sources": [
+      "https://developers.cloudflare.com/cloudflare-challenges/",
+      "https://docs.aws.amazon.com/waf/latest/developerguide/waf-captcha-and-challenge-actions.html",
+      "https://developers.google.com/recaptcha/docs/verify",
+      "https://docs.hcaptcha.com/"
+    ],
+    "reviewed_by": [
+      "security-team",
+      "platform-team"
+    ],
+    "release_signature_sha256": "f1017f9546d0e3a4eb895cbb9af5d1c4c3bf558eda85ded5048e689b9928bada"
+  },
+  "providers": [
+    {
+      "id": "cloudflare",
+      "error_class": "cloudflare_challenge",
+      "confidence": "high",
+      "status_codes": [403, 429, 503],
+      "header_keys_any": ["cf-ray", "cf-cache-status", "cf-mitigated"],
+      "header_values_contains": {
+        "server": ["cloudflare"],
+        "cf-mitigated": ["challenge"]
+      },
+      "body_patterns": [
+        "(?i)attention required!.*cloudflare",
+        "(?i)checking your browser",
+        "(?i)cf-browser-verification",
+        "(?i)cf-challenge",
+        "(?i)__cf_chl_",
+        "(?i)why do i have to complete a captcha"
+      ],
+      "cookie_markers": ["__cf_bm", "cf_clearance", "cf_chl_"],
+      "script_patterns": [
+        "(?i)/cdn-cgi/challenge-platform/",
+        "(?i)challenges\\.cloudflare\\.com/turnstile/"
+      ],
+      "min_signals": 2
+    },
+    {
+      "id": "aws_waf",
+      "error_class": "waf_challenge",
+      "confidence": "high",
+      "status_codes": [202, 405],
+      "header_values_contains": {
+        "x-amzn-waf-action": ["challenge", "captcha"]
+      },
+      "body_patterns": [
+        "(?i)awswaf",
+        "(?i)captcha",
+        "(?i)challenge"
+      ],
+      "min_signals": 1
+    },
+    {
+      "id": "akamai_bot_manager",
+      "error_class": "waf_challenge",
+      "confidence": "medium",
+      "status_codes": [403, 429],
+      "header_keys_any": ["x-akamai-request-id", "akamai-origin-hop"],
+      "header_values_contains": {
+        "server": ["akamai"]
+      },
+      "body_patterns": [
+        "(?i)akamai bot manager",
+        "(?i)access denied reference"
+      ],
+      "cookie_markers": ["_abck", "bm_sz", "ak_bmsc"],
+      "min_signals": 2
+    },
+    {
+      "id": "imperva_incapsula",
+      "error_class": "waf_challenge",
+      "confidence": "medium",
+      "status_codes": [403, 429],
+      "header_keys_any": ["x-iinfo"],
+      "body_patterns": [
+        "(?i)incapsula incident id",
+        "(?i)request unsuccessful",
+        "(?i)imperva"
+      ],
+      "cookie_markers": ["incap_ses", "visid_incap"],
+      "min_signals": 2
+    },
+    {
+      "id": "datadome",
+      "error_class": "waf_challenge",
+      "confidence": "high",
+      "status_codes": [403, 429],
+      "header_keys_any": ["x-datadome"],
+      "body_patterns": [
+        "(?i)datadome",
+        "(?i)captcha delivery network"
+      ],
+      "cookie_markers": ["datadome"],
+      "min_signals": 1
+    },
+    {
+      "id": "perimeterx_distil",
+      "error_class": "waf_challenge",
+      "confidence": "medium",
+      "status_codes": [403, 429],
+      "header_keys_any": ["x-px", "x-distil-cs"],
+      "body_patterns": [
+        "(?i)perimeterx",
+        "(?i)press & hold",
+        "(?i)distil network"
+      ],
+      "cookie_markers": ["_pxhd", "_pxvid", "_px3"],
+      "min_signals": 2
+    },
+    {
+      "id": "kasada",
+      "error_class": "waf_challenge",
+      "confidence": "medium",
+      "status_codes": [403, 429],
+      "body_patterns": [
+        "(?i)kasada",
+        "(?i)kpsdk"
+      ],
+      "script_patterns": [
+        "(?i)kpsdk\\.js",
+        "(?i)kasada\\.io"
+      ],
+      "min_signals": 1
+    },
+    {
+      "id": "captcha_generic",
+      "error_class": "captcha_challenge",
+      "confidence": "medium",
+      "status_codes": [403, 405, 429],
+      "body_patterns": [
+        "(?i)\\bg-recaptcha\\b",
+        "(?i)\\bhcaptcha\\b",
+        "(?i)\\bcf-turnstile\\b",
+        "(?i)\\bcaptcha\\b"
+      ],
+      "script_patterns": [
+        "(?i)www\\.google\\.com/recaptcha/",
+        "(?i)hcaptcha\\.com/1/api\\.js",
+        "(?i)challenges\\.cloudflare\\.com/turnstile/"
+      ],
+      "min_signals": 1
+    }
+  ]
+}

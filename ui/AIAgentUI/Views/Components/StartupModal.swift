@@ -14,6 +14,9 @@ enum StartupPhase: Equatable {
     case startingBackend
     case connectingToBackend
     case performingHealthCheck
+    case loadingDiagnostics
+    case loadingModels
+    case loadingSessions
     case ready
     case failed(String)
     
@@ -27,6 +30,12 @@ enum StartupPhase: Equatable {
             return "Connecting"
         case .performingHealthCheck:
             return "Verifying"
+        case .loadingDiagnostics:
+            return "System Check"
+        case .loadingModels:
+            return "AI Models"
+        case .loadingSessions:
+            return "Restoring Sync"
         case .ready:
             return "Ready"
         case .failed:
@@ -44,6 +53,12 @@ enum StartupPhase: Equatable {
             return "Establishing connection..."
         case .performingHealthCheck:
             return "Running health checks..."
+        case .loadingDiagnostics:
+            return "Validating end-to-end setup..."
+        case .loadingModels:
+            return "Fetching available AI models..."
+        case .loadingSessions:
+            return "Synchronizing local data..."
         case .ready:
             return "AI Agent is ready!"
         case .failed(let message):
@@ -61,6 +76,12 @@ enum StartupPhase: Equatable {
             return "network"
         case .performingHealthCheck:
             return "stethoscope"
+        case .loadingDiagnostics:
+            return "cpu"
+        case .loadingModels:
+            return "sparkles"
+        case .loadingSessions:
+            return "arrow.triangle.2.circlepath"
         case .ready:
             return "checkmark.circle"
         case .failed:
@@ -70,7 +91,8 @@ enum StartupPhase: Equatable {
     
     var color: Color {
         switch self {
-        case .initializing, .startingBackend, .connectingToBackend, .performingHealthCheck:
+        case .initializing, .startingBackend, .connectingToBackend, .performingHealthCheck,
+             .loadingDiagnostics, .loadingModels, .loadingSessions:
             return .primaryBlue
         case .ready:
             return .green
@@ -81,7 +103,8 @@ enum StartupPhase: Equatable {
     
     var isLoading: Bool {
         switch self {
-        case .initializing, .startingBackend, .connectingToBackend, .performingHealthCheck:
+        case .initializing, .startingBackend, .connectingToBackend, .performingHealthCheck,
+             .loadingDiagnostics, .loadingModels, .loadingSessions:
             return true
         case .ready, .failed:
             return false
@@ -232,28 +255,29 @@ struct StartupModal: View {
 /// Startup overlay that can be shown over the main content
 struct StartupOverlay: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var connectionState: ConnectionState = .shared
     
     var body: some View {
         Group {
-            switch appState.startupPhase {
+            switch connectionState.startupPhase {
             case .ready:
                 EmptyView()
             default:
                 StartupModal(
-                    phase: appState.startupPhase,
+                    phase: connectionState.startupPhase,
                     onRetry: {
                         Task {
                             await appState.retryStartup()
                         }
                     },
                     onQuit: {
-                        NSApplication.shared.terminate(nil)
+                        PlatformAppActions.terminate()
                     }
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
         }
-        .animation(AnimationConstants.standard, value: appState.startupPhase)
+        .animation(AnimationConstants.standard, value: connectionState.startupPhase)
     }
 }
 

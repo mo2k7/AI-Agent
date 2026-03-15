@@ -8,9 +8,9 @@
 
 import Foundation
 
-/// Parses streaming data from the Unix Domain Socket
+/// Parses streaming data from the WebSocket transport
 /// Handles buffering and JSON line separation
-final class StreamingParser {
+final class StreamingParser: @unchecked Sendable {
     
     /// Buffer for incomplete JSON lines
     private var buffer = Data()
@@ -176,7 +176,7 @@ final class MessageDispatcher {
     var onStatusUpdate: ((AgentStatus, String, String?) -> Void)?
     
     /// Handler for streaming text updates
-    var onStreamingUpdate: ((String, String, Bool) -> Void)? // requestId, text, isDone
+    var onStreamingUpdate: ((String, String, String, Bool) -> Void)? // requestId, delta, text, isDone
     
     /// Handler for tool call updates
     var onToolCall: ((ToolCall, String) -> Void)? // toolCall, requestId
@@ -185,7 +185,7 @@ final class MessageDispatcher {
     var onComplete: ((String, String?) -> Void)? // requestId, finalContent
     
     /// Handler for errors
-    var onError: ((String, String, Int?) -> Void)? // requestId, message, code
+    var onError: ((String, String, Int?, [String: Any]?) -> Void)? // requestId, message, code, data
     
     /// Handler for system messages (version, reload, etc.)
     var onSystemMessage: ((SystemResponse, String) -> Void)? // response, requestId
@@ -206,7 +206,7 @@ final class MessageDispatcher {
                 let toolCall = try response.toToolCall()
                 onToolCall?(toolCall, response.id)
             } catch {
-                onError?(response.id, error.localizedDescription, nil)
+                onError?(response.id, error.localizedDescription, nil, nil)
             }
             
         case .result(let response):
@@ -248,7 +248,7 @@ final class MessageDispatcher {
         }
         let accumulator = getAccumulator(for: response.id)
         accumulator.append(delta: response.delta, done: response.done)
-        onStreamingUpdate?(response.id, accumulator.text, response.done)
+        onStreamingUpdate?(response.id, response.delta, accumulator.text, response.done)
         
         if response.done {
             removeAccumulator(for: response.id)
@@ -257,7 +257,8 @@ final class MessageDispatcher {
     
     private func handleResult(_ response: ResultResponse) {
         if let error = response.error {
-            onError?(response.id, error.message, error.code)
+            let payload = error.data?.mapValues { $0.value }
+            onError?(response.id, error.message, error.code, payload)
         } else if let result = response.result {
             onComplete?(response.id, result.content)
         }
@@ -267,7 +268,8 @@ final class MessageDispatcher {
     private func handleError(_ response: ResultResponse) {
         let message = response.error?.message ?? "Unknown error"
         let code = response.error?.code
-        onError?(response.id, message, code)
+        let payload = response.error?.data?.mapValues { $0.value }
+        onError?(response.id, message, code, payload)
         removeAccumulator(for: response.id)
     }
 }

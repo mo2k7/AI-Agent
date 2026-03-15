@@ -161,6 +161,26 @@ def _ts_to_str(ts: object) -> str:
         return "—"
 
 
+def _compact_warning_line(warnings: object, *, limit: int = 1) -> str:
+    if not isinstance(warnings, list):
+        return ""
+    normalized = [
+        str(item).strip()
+        for item in warnings
+        if str(item).strip()
+    ]
+    if not normalized:
+        return ""
+    visible = normalized[:max(1, limit)]
+    summary = " | ".join(visible)
+    if len(summary) > 180:
+        summary = summary[:177].rstrip() + "..."
+    remaining = len(normalized) - len(visible)
+    if remaining > 0:
+        summary += f" (+{remaining} more)"
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Per-tool formatters
 # ---------------------------------------------------------------------------
@@ -526,35 +546,7 @@ def _format_open_item(
     return content, content
 
 
-def _format_run_automation(
-    output: dict[str, object],
-    execution: dict[str, object],
-) -> tuple[str, str]:
-    name = str(output.get("name", execution.get("name", ""))).strip() or "unknown"
-    exit_code = output.get("exit_code", execution.get("exit_code"))
-    ok = execution.get("ok", output.get("ok", False))
-    timed_out = output.get("timed_out", execution.get("timed_out", False))
-    stdout = str(output.get("stdout", execution.get("stdout", ""))).strip()
-    stderr = str(output.get("stderr", execution.get("stderr", ""))).strip()
-    error = str(output.get("error", execution.get("error", ""))).strip()
 
-    exit_display = str(exit_code) if exit_code is not None else "—"
-    icon = "✅" if ok else "❌"
-    if timed_out:
-        icon = "⏱️"
-
-    lines = [f"**Automation**: `{name}` — Exit code: {exit_display} {icon}"]
-
-    if error:
-        lines.append(f"\n⚠️ {error}")
-
-    if stdout:
-        lines.extend(["", "**stdout**:", "```", stdout, "```"])
-    if stderr:
-        lines.extend(["", "**stderr**:", "```", stderr, "```"])
-
-    content = "\n".join(lines)
-    return content, content[:1200]
 
 
 def _format_create_directory(
@@ -634,6 +626,53 @@ def _format_generate_image(
     return content, summary_text
 
 
+def _format_browse_web(
+    output: dict[str, object],
+    execution: dict[str, object],
+) -> tuple[str, str]:
+    final_url = str(output.get("final_url", output.get("url", ""))).strip()
+    title = str(output.get("title", "")).strip()
+    profile = str(output.get("effective_browse_profile", "")).strip().lower()
+    content = str(output.get("content", "")).strip()
+    content_type = str(output.get("content_type", "")).strip() or "unknown"
+    warning_line = _compact_warning_line(output.get("policy_warnings"), limit=1)
+
+    if final_url:
+        label = title or final_url
+        source_line = f"Source: [{label}]({final_url})"
+    else:
+        source_line = f"Source: {title or 'unknown'}"
+
+    lines = ["**Web Browse**"]
+    lines.append(source_line)
+
+    if profile and profile != "strict":
+        lines.append(f"Browse profile: `{profile}`")
+        if warning_line:
+            lines.append(
+                f"Policy notice: `{profile}` browsing allowed this result with policy warnings."
+            )
+        else:
+            lines.append(
+                f"Policy notice: relaxed `{profile}` browsing rules were active for this fetch."
+            )
+
+    if warning_line:
+        lines.append("")
+        lines.append(f"Caution: {warning_line}")
+
+    if content:
+        lines.extend(["", content])
+    else:
+        lines.append("")
+        lines.append(f"No extractable text was returned (`{content_type}`).")
+
+    rendered = "\n".join(lines)
+    summary_lines = [line for line in lines if line]
+    summary = "\n".join(summary_lines[:5])
+    return rendered, summary[:1200]
+
+
 def _format_planner(
     output: dict[str, object],
     execution: dict[str, object],
@@ -694,7 +733,7 @@ _FORMATTERS: dict[
     "plan_ops": _format_plan_ops,
     "apply_ops": _format_apply_ops,
     "open_item": _format_open_item,
-    "run_automation": _format_run_automation,
     "create_directory": _format_create_directory,
     "generate_image": _format_generate_image,
+    "browse_web": _format_browse_web,
 }

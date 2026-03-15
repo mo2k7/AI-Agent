@@ -1,8 +1,8 @@
 """
 IPC Protocol definitions for communication with SwiftUI frontend.
 
-Uses JSON-RPC 2.0 inspired message format over Unix Domain Socket.
-All messages are newline-delimited JSON.
+Uses JSON-RPC 2.0 inspired message format over WebSocket transport.
+Each WebSocket frame carries one JSON payload.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -314,12 +314,22 @@ class ErrorMessage(IPCMessage):
     error: dict[str, Any] = field(default_factory=dict)
     
     @classmethod
-    def create(cls, request_id: str, code: int, message: str) -> "ErrorMessage":
+    def create(
+        cls,
+        request_id: str,
+        code: int,
+        message: str,
+        *,
+        data: Optional[dict[str, Any]] = None,
+    ) -> "ErrorMessage":
         """Creates an error message."""
-        return cls(
-            id=request_id,
-            error={"code": code, "message": _normalize_error_message(message)},
-        )
+        payload: dict[str, Any] = {
+            "code": code,
+            "message": _normalize_error_message(message),
+        }
+        if data:
+            payload["data"] = data
+        return cls(id=request_id, error=payload)
     
     # Standard error codes
     PARSE_ERROR = -32700
@@ -330,6 +340,8 @@ class ErrorMessage(IPCMessage):
     AUTH_REQUIRED = -32010
     AUTH_FAILED = -32011
     PROTOCOL_MISMATCH = -32012
+    RATE_LIMITED = -32013
+    REQUEST_TIMEOUT = -32014
     
     @classmethod
     def parse_error(cls, request_id: str, detail: str = "") -> "ErrorMessage":
@@ -375,7 +387,15 @@ class ErrorMessage(IPCMessage):
         if detail:
             msg += f": {detail}"
         return cls.create(request_id, cls.PROTOCOL_MISMATCH, msg)
-    
+
+    @classmethod
+    def rate_limited(cls, request_id: str, detail: str = "") -> "ErrorMessage":
+        """Creates a rate limited error message."""
+        msg = "Rate limited"
+        if detail:
+            msg += f": {detail}"
+        return cls.create(request_id, cls.RATE_LIMITED, msg)
+
     @classmethod
     def internal_error(cls, request_id: str, detail: str = "") -> "ErrorMessage":
         """Creates an internal error message."""

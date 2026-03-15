@@ -2,7 +2,7 @@
 # run_backend.sh — Start the Python backend server.
 #
 # Improvements:
-# - Cleans stale socket before launch
+# - Uses WebSocket IPC over loopback
 # - Uses Poetry deterministically for environment/runtime
 # - Avoids non-portable setsid dependency on macOS
 set -euo pipefail
@@ -47,28 +47,16 @@ if [[ -z "${PID_FILE}" ]]; then
 fi
 
 LOG_FILE="${AI_AGENT_RUN_DIR}/backend.log"
-SOCKET_PATH="${AI_AGENT_SOCKET_PATH}"
+BACKEND_HOST="${AI_AGENT_BACKEND_HOST}"
+BACKEND_PORT="${AI_AGENT_BACKEND_PORT}"
+BACKEND_URL="${AI_AGENT_BACKEND_URL}"
 PROJECT_CACHE_ROOT="${PROJECT_ROOT}/.ai-agent-cache"
 POETRY_DEPS_STAMP="${PROJECT_CACHE_ROOT}/poetry-deps.stamp"
 
 mkdir -p "${AI_AGENT_RUN_DIR}"
 mkdir -p "${PROJECT_CACHE_ROOT}"
 
-# Clean stale socket only when the existing path is a socket node.
-if [[ -e "${SOCKET_PATH}" ]]; then
-  if [[ -S "${SOCKET_PATH}" ]]; then
-    rm -f -- "${SOCKET_PATH}"
-  else
-    echo "[backend] FATAL: refusing to remove non-socket path: ${SOCKET_PATH}" >&2
-    exit 1
-  fi
-fi
-
 _resolve_poetry_bin() {
-  if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/poetry" ]]; then
-    printf "%s\n" "${VIRTUAL_ENV}/bin/poetry"
-    return 0
-  fi
   if command -v poetry >/dev/null 2>&1; then
     command -v poetry
     return 0
@@ -84,6 +72,41 @@ _resolve_poetry_bin() {
   return 1
 }
 
+_resolve_runtime_python() {
+  if [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
+    printf "%s\n" "${PROJECT_ROOT}/.venv/bin/python"
+    return 0
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    printf "%s\n" "${VIRTUAL_ENV}/bin/python"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+_refresh_runtime_python() {
+  if [[ -n "${RUNTIME_PYTHON:-}" ]] && [[ -x "${RUNTIME_PYTHON}" ]]; then
+    return 0
+  fi
+  RUNTIME_PYTHON="$(_resolve_runtime_python || true)"
+  if [[ -n "${RUNTIME_PYTHON}" ]]; then
+    return 0
+  fi
+  if [[ -n "${POETRY_BIN:-}" ]]; then
+    local poetry_env
+    poetry_env="$("${POETRY_BIN}" env info -p 2>/dev/null || true)"
+    if [[ -n "${poetry_env}" ]] && [[ -x "${poetry_env}/bin/python" ]]; then
+      RUNTIME_PYTHON="${poetry_env}/bin/python"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 _compute_file_sha256() {
   local path="$1"
   if [[ -f "${path}" ]]; then
@@ -95,10 +118,11 @@ _compute_file_sha256() {
 
 _compute_poetry_deps_fingerprint() {
   local poetry_version python_version lock_hash pyproject_hash
-  poetry_version="$("${POETRY_BIN}" --version 2>/dev/null | tr -s ' ' || printf "unknown")"
+  poetry_version="$("${POETRY_BIN:-poetry-missing}" --version 2>/dev/null | tr -s ' ' || printf "unknown")"
   python_version="$(
     cd "${PROJECT_ROOT}" \
-      && "${POETRY_BIN}" run python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>/dev/null \
+      && [[ -n "${RUNTIME_PYTHON}" ]] \
+      && "${RUNTIME_PYTHON}" -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>/dev/null \
       || printf "unknown"
   )"
   lock_hash="$(_compute_file_sha256 "${PROJECT_ROOT}/poetry.lock")"
@@ -110,28 +134,30 @@ _compute_poetry_deps_fingerprint() {
 _poetry_env_ready() {
   (
     cd "${PROJECT_ROOT}" \
-      && "${POETRY_BIN}" run python -c "import agent_host"
+      && [[ -n "${RUNTIME_PYTHON}" ]] \
+      && "${RUNTIME_PYTHON}" -c "import importlib; [importlib.import_module(name) for name in ('agent_host','google.genai','jsonschema','dotenv','cryptography','unified_planning','spacy','bs4','websockets')]"
   ) >/dev/null 2>&1
 }
+
+RUNTIME_PYTHON="$(_resolve_runtime_python || true)"
 
 POETRY_BIN=""
 if POETRY_BIN="$(_resolve_poetry_bin)"; then
   :
 else
-  if ! command -v python3 >/dev/null 2>&1; then
+  if [[ -n "${RUNTIME_PYTHON}" ]]; then
+    :
+  elif ! command -v python3 >/dev/null 2>&1; then
     echo "[backend] FATAL: Poetry missing and python3 not available for Poetry install." >&2
     exit 1
-  fi
-  echo "[backend] Poetry not found; installing Poetry..." >&2
-  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    python3 -m pip install "poetry>=1.8,<2.0" >&2
   else
+    echo "[backend] Poetry not found; installing Poetry..." >&2
     python3 -m pip install --user "poetry>=1.8,<2.0" >&2
-  fi
-  hash -r
-  if ! POETRY_BIN="$(_resolve_poetry_bin)"; then
-    echo "[backend] FATAL: Poetry install completed but binary still unavailable." >&2
-    exit 1
+    hash -r
+    if ! POETRY_BIN="$(_resolve_poetry_bin)"; then
+      echo "[backend] FATAL: Poetry install completed but binary still unavailable." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -141,16 +167,22 @@ if [[ -f "${POETRY_DEPS_STAMP}" ]] \
   && _poetry_env_ready; then
   echo "[backend] Using cached Poetry environment."
 elif ! _poetry_env_ready; then
-  echo "[backend] WARNING: agent_host not importable — running poetry install" >&2
-  (cd "${PROJECT_ROOT}" && "${POETRY_BIN}" install --no-interaction --quiet)
+  echo "[backend] Python environment incomplete — running poetry install" >&2
+  (cd "${PROJECT_ROOT}" && "${POETRY_BIN}" install --no-interaction --sync)
+  _refresh_runtime_python || true
   POETRY_DEPS_FINGERPRINT="$(_compute_poetry_deps_fingerprint)"
   printf "%s" "${POETRY_DEPS_FINGERPRINT}" > "${POETRY_DEPS_STAMP}"
 else
-  # Env is usable but dependency metadata changed; mark the current fingerprint.
+  echo "[backend] Python environment validated; reusing installed Poetry environment."
   printf "%s" "${POETRY_DEPS_FINGERPRINT}" > "${POETRY_DEPS_STAMP}"
 fi
 
-echo "backend_socket_path=${SOCKET_PATH}"
+if ! _refresh_runtime_python; then
+  echo "[backend] FATAL: no usable project Python runtime found." >&2
+  exit 1
+fi
+
+echo "backend_url=${BACKEND_URL}"
 echo "backend_log=${LOG_FILE}"
 
 _env_bool_true() {
@@ -160,76 +192,13 @@ _env_bool_true() {
   [[ "${lowered}" != "0" && "${lowered}" != "false" && "${lowered}" != "no" && "${lowered}" != "off" ]]
 }
 
-_ensure_required_spacy_model() {
-  local preload_required="${AI_AGENT_PLAN_MODE_NLP_PRELOAD_REQUIRED:-1}"
-  local model_name="${AI_AGENT_PLAN_MODE_NLP_MODEL:-en_core_web_trf}"
-  local model_key model_stamp_file model_fingerprint
-  model_name="$(printf "%s" "${model_name}" | xargs)"
-  [[ -z "${model_name}" ]] && model_name="en_core_web_trf"
-  model_key="$(printf "%s" "${model_name}" | tr -cs 'A-Za-z0-9._-' '_')"
-  model_stamp_file="${PROJECT_CACHE_ROOT}/spacy-model-${model_key}.stamp"
-
-  if ! _env_bool_true "${preload_required}"; then
-    return 0
-  fi
-
-  model_fingerprint="$(
-    cd "${PROJECT_ROOT}" \
-      && AI_AGENT_PLAN_MODE_NLP_MODEL="${model_name}" \
-      "${POETRY_BIN}" run python -c "import os,spacy,sys; print(f\"model={os.environ['AI_AGENT_PLAN_MODE_NLP_MODEL']}\\nspacy={spacy.__version__}\\npython={'.'.join(map(str, sys.version_info[:3]))}\")" 2>/dev/null \
-      || printf "model=%s\nspacy=unknown\npython=unknown\n" "${model_name}"
-  )"
-
-  if [[ -f "${model_stamp_file}" ]] \
-    && [[ "$(cat "${model_stamp_file}")" == "${model_fingerprint}" ]] \
-    && (
-      cd "${PROJECT_ROOT}" \
-      && AI_AGENT_PLAN_MODE_NLP_MODEL="${model_name}" \
-        "${POETRY_BIN}" run python -c "import importlib.util,os,sys; sys.exit(0 if importlib.util.find_spec(os.environ['AI_AGENT_PLAN_MODE_NLP_MODEL']) else 1)"
-    ) >/dev/null 2>&1; then
-    echo "[backend] Using cached spaCy model: ${model_name}"
-    return 0
-  fi
-
-  echo "[backend] Verifying required spaCy model: ${model_name}"
-  if (
-    cd "${PROJECT_ROOT}" \
-    && AI_AGENT_PLAN_MODE_NLP_MODEL="${model_name}" \
-      "${POETRY_BIN}" run python -c "import os,spacy;spacy.load(os.environ['AI_AGENT_PLAN_MODE_NLP_MODEL'])"
-  ) >/dev/null 2>&1; then
-    printf "%s" "${model_fingerprint}" > "${model_stamp_file}"
-    return 0
-  fi
-
-  echo "[backend] Installing required spaCy model: ${model_name}" >&2
-  (cd "${PROJECT_ROOT}" && "${POETRY_BIN}" run python -m spacy download "${model_name}") >&2
-
-  if ! (
-    cd "${PROJECT_ROOT}" \
-    && AI_AGENT_PLAN_MODE_NLP_MODEL="${model_name}" \
-      "${POETRY_BIN}" run python -c "import os,spacy;spacy.load(os.environ['AI_AGENT_PLAN_MODE_NLP_MODEL'])"
-  ) >/dev/null 2>&1; then
-    echo "[backend] FATAL: Required spaCy model '${model_name}' is not loadable after install." >&2
-    exit 1
-  fi
-  model_fingerprint="$(
-    cd "${PROJECT_ROOT}" \
-      && AI_AGENT_PLAN_MODE_NLP_MODEL="${model_name}" \
-      "${POETRY_BIN}" run python -c "import os,spacy,sys; print(f\"model={os.environ['AI_AGENT_PLAN_MODE_NLP_MODEL']}\\nspacy={spacy.__version__}\\npython={'.'.join(map(str, sys.version_info[:3]))}\")" 2>/dev/null \
-      || printf "model=%s\nspacy=unknown\npython=unknown\n" "${model_name}"
-  )"
-  printf "%s" "${model_fingerprint}" > "${model_stamp_file}"
-}
-
-_ensure_required_spacy_model
-
 # Generate IPC auth token if not already set (mirrors BackendLauncher.swift).
 if [[ -z "${AI_AGENT_IPC_AUTH_TOKEN:-}" ]]; then
   export AI_AGENT_IPC_AUTH_TOKEN
   AI_AGENT_IPC_AUTH_TOKEN="$(uuidgen)"
 fi
 
-cmd=("${POETRY_BIN}" run python -m agent_host.main --server --socket-path "${SOCKET_PATH}" --verbose)
+cmd=("${RUNTIME_PYTHON}" -m agent_host.main --server --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" --verbose)
 
 if [[ "${BACKGROUND}" -eq 1 ]]; then
   # Launch backend in background (portable across macOS/Linux).
@@ -242,17 +211,36 @@ if [[ "${BACKGROUND}" -eq 1 ]]; then
   echo "backend_pid=${BACKEND_PID}"
 
   deadline=$((SECONDS + 60))
-  while [[ ! -S "${SOCKET_PATH}" && ${SECONDS} -lt ${deadline} ]]; do
+  while [[ ${SECONDS} -lt ${deadline} ]]; do
     if ! kill -0 "${BACKEND_PID}" 2>/dev/null; then
+      break
+    fi
+    if python3 - <<'PY' "${BACKEND_HOST}" "${BACKEND_PORT}" >/dev/null 2>&1
+import socket, sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.settimeout(0.2)
+    sock.connect((host, port))
+PY
+    then
       break
     fi
     sleep 0.1
   done
-  if [[ ! -S "${SOCKET_PATH}" ]]; then
+  if ! python3 - <<'PY' "${BACKEND_HOST}" "${BACKEND_PORT}" >/dev/null 2>&1
+import socket, sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.settimeout(0.2)
+    sock.connect((host, port))
+PY
+  then
     if ! kill -0 "${BACKEND_PID}" 2>/dev/null; then
-      echo "Backend process exited before creating socket: ${SOCKET_PATH}" >&2
+      echo "Backend process exited before listening on ${BACKEND_URL}" >&2
     else
-      echo "Backend failed to create socket within 60s: ${SOCKET_PATH}" >&2
+      echo "Backend failed to listen within 60s: ${BACKEND_URL}" >&2
     fi
     # Dump last 20 lines of log for debugging
     tail -20 "${LOG_FILE}" 2>/dev/null || true

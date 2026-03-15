@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  GlobalHotkey.swift
 //  AIAgentUI
@@ -360,3 +361,4 @@ final class HotKeyMonitor {
         }
     }
 }
+#endif

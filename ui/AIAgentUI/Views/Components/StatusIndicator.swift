@@ -379,14 +379,16 @@ struct HeaderStatusIndicator: View {
     
     var body: some View {
         HStack(spacing: 6) {
-            // Animated icon based on status
+            // Animated icon based on status — smooth symbol transitions
             statusIcon
-            
+                .contentTransition(.symbolEffect(.replace))
+
             // Timer (only for thinking/processing states)
             if status.isBusy {
                 Text(formattedTime)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(statusColor.opacity(0.9))
+                    .contentTransition(.numericText())
             }
         }
         .padding(.horizontal, 8)

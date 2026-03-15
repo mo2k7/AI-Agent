@@ -7,7 +7,9 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidTag
 
+import agent_host.memory.store as store_module
 from agent_host.memory.crypto import compute_hmac
 from agent_host.memory.store import MemoryStore, MemoryStoreError
 from agent_host.memory.types import MemoryKind, MemoryMode
@@ -15,6 +17,16 @@ from agent_host.memory.types import MemoryKind, MemoryMode
 
 def _build_store(tmp_path) -> MemoryStore:
     return MemoryStore(root_dir=tmp_path / "memory-store", master_key=b"m" * 32)
+
+
+class _TrackingConnection(sqlite3.Connection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.closed_explicitly = False
+
+    def close(self) -> None:
+        self.closed_explicitly = True
+        super().close()
 
 
 class _StubEmbeddingService:
@@ -83,15 +95,13 @@ def test_semantic_memory_detects_policy_flag_tampering(tmp_path) -> None:
         embedding_service=_StubEmbeddingService(),
     )
 
-    session_db = store._session_db_path(session.session_id)
-    with closing(sqlite3.connect(session_db)) as conn:
+    with store._db_connection() as conn:
         conn.execute(
             "UPDATE semantic_memories SET policy_flags_json = ? WHERE memory_id = ?",
             ('["quarantine"]', memory.memory_id),
         )
-        conn.commit()
 
-    with pytest.raises(MemoryStoreError, match="Failed to decode memory record"):
+    with pytest.raises(MemoryStoreError, match="HMAC verification failed"):
         store.list_session_memories(session.session_id, limit=20)
 
 
@@ -116,8 +126,7 @@ def test_semantic_memory_legacy_hmac_rows_fail_without_preflight_migration(tmp_p
         embedding_service=_StubEmbeddingService(),
     )
 
-    session_db = store._session_db_path(session.session_id)
-    with closing(sqlite3.connect(session_db)) as conn:
+    with store._db_connection() as conn:
         row = conn.execute(
             """
             SELECT memory_id, kind, fact_key, content_enc
@@ -135,7 +144,6 @@ def test_semantic_memory_legacy_hmac_rows_fail_without_preflight_migration(tmp_p
             "UPDATE semantic_memories SET hmac = ? WHERE memory_id = ?",
             (legacy_hmac, memory.memory_id),
         )
-        conn.commit()
 
     reloaded = MemoryStore(root_dir=root, master_key=b"m" * 32)
     with pytest.raises(MemoryStoreError, match="HMAC verification failed"):
@@ -172,6 +180,43 @@ def test_list_messages_returns_full_ordered_conversation(tmp_path) -> None:
     assert [message.turn_index for message in messages] == [0, 1, 2]
 
 
+def test_list_messages_page_returns_latest_and_older_windows(tmp_path) -> None:
+    store = _build_store(tmp_path)
+    session = store.create_session(title="Paged Session", memory_mode=MemoryMode.ON)
+
+    for index in range(10):
+        store.append_message(session.session_id, role="user", content=f"m{index}")
+
+    latest, latest_has_older = store.list_messages_page(
+        session.session_id,
+        direction="latest",
+        limit=4,
+    )
+    assert [message.content for message in latest] == ["m6", "m7", "m8", "m9"]
+    assert [message.turn_index for message in latest] == [6, 7, 8, 9]
+    assert latest_has_older is True
+
+    older, older_has_older = store.list_messages_page(
+        session.session_id,
+        direction="older",
+        anchor_turn_index=latest[0].turn_index,
+        limit=4,
+    )
+    assert [message.content for message in older] == ["m2", "m3", "m4", "m5"]
+    assert [message.turn_index for message in older] == [2, 3, 4, 5]
+    assert older_has_older is True
+
+    oldest, oldest_has_older = store.list_messages_page(
+        session.session_id,
+        direction="older",
+        anchor_turn_index=older[0].turn_index,
+        limit=4,
+    )
+    assert [message.content for message in oldest] == ["m0", "m1"]
+    assert [message.turn_index for message in oldest] == [0, 1]
+    assert oldest_has_older is False
+
+
 def test_rename_session_updates_title(tmp_path) -> None:
     store = _build_store(tmp_path)
     session = store.create_session(title="Initial Name", memory_mode=MemoryMode.ON)
@@ -182,85 +227,60 @@ def test_rename_session_updates_title(tmp_path) -> None:
     assert renamed.title == "Renamed Session"
 
 
-def test_index_schema_recreated_empty_does_not_restore_sessions_runtime(tmp_path) -> None:
+
+
+
+def test_validate_session_deks_closes_direct_sqlite_connections(tmp_path, monkeypatch) -> None:
     store = _build_store(tmp_path)
-    _ = store.create_session(title="Before", memory_mode=MemoryMode.ON)
-
-    store.index_db_path.unlink(missing_ok=True)
-    sqlite3.connect(store.index_db_path).close()
-
-    sessions = store.list_sessions(limit=20)
-    assert sessions == []
-
-    created = store.create_session(title="After", memory_mode=MemoryMode.ON)
-    assert created.title == "After"
-
-
-def test_index_schema_missing_sessions_table_does_not_restore_legacy_session_rows(tmp_path) -> None:
-    store = _build_store(tmp_path)
-    _ = store.create_session(title="Before Drop", memory_mode=MemoryMode.ON)
-
-    with closing(sqlite3.connect(store.index_db_path)) as conn:
-        conn.execute("DROP TABLE sessions")
-        conn.commit()
-
-    sessions = store.list_sessions(limit=20)
-    assert sessions == []
-
-    created = store.create_session(title="After Drop", memory_mode=MemoryMode.ON)
-    assert created.title == "After Drop"
-
-
-def test_delete_session_removes_sqlite_sidecars(tmp_path) -> None:
-    store = _build_store(tmp_path)
-    session = store.create_session(title="Session D", memory_mode=MemoryMode.ON)
-    message = store.append_message(
+    session = store.create_session(title="Close Tracking", memory_mode=MemoryMode.ON)
+    store.append_message(
         session.session_id,
         role="user",
-        content="delete-test",
-    )
-    memory = store.upsert_semantic_memory(
-        session.session_id,
-        kind=MemoryKind.PREFERENCE,
-        fact_key="delete_test",
-        content="delete me",
-        confidence=0.71,
-        source_message_id=message.message_id,
-        trust_flags=("user_stated",),
-        policy_flags=(),
-        embedding_service=_StubEmbeddingService(),
+        content="Keep this session alive.",
     )
 
-    session_db = store._session_db_path(session.session_id)
-    sidecar_wal = Path(f"{session_db}-wal")
-    sidecar_shm = Path(f"{session_db}-shm")
+    original_connect = sqlite3.connect
+    opened: list[_TrackingConnection] = []
 
-    candidate_ids = {row["memory_id"] for row in store.semantic_index_candidates(limit=20)}
-    assert memory.memory_id in candidate_ids
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = _TrackingConnection
+        conn = original_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
 
-    # Create sidecars explicitly so deletion behavior is deterministic.
-    sidecar_wal.write_text("wal")
-    sidecar_shm.write_text("shm")
+    monkeypatch.setattr(store_module.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(
+        store._master_box,
+        "unwrap_key",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(InvalidTag()),
+    )
 
-    store.delete_session(session.session_id)
+    store._validate_session_deks()
 
-    assert not session_db.exists()
-    assert not sidecar_wal.exists()
-    assert not sidecar_shm.exists()
-    assert store.get_session(session.session_id) is None
-    assert session.session_id not in {row.session_id for row in store.list_sessions(limit=20)}
-    candidate_ids_after = {row["memory_id"] for row in store.semantic_index_candidates(limit=20)}
-    assert memory.memory_id not in candidate_ids_after
+    assert opened
+    assert all(conn.closed_explicitly for conn in opened)
 
 
 def test_list_sessions_self_heals_invalid_memory_mode_values(tmp_path) -> None:
     store = _build_store(tmp_path)
     session = store.create_session(title="Mode Repair", memory_mode=MemoryMode.ON)
 
-    with store._index_connection() as conn:
+    # Tamper with the mode AND recompute the HMAC so the integrity check
+    # passes but the invalid mode value still gets self-healed.
+    # Read the raw updated_at from the DB to avoid float formatting mismatches.
+    with store._db_connection() as conn:
+        row = conn.execute(
+            "SELECT updated_at FROM sessions WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()
+        raw_updated_at = row["updated_at"]
+        hmac_for_tampered = compute_hmac(
+            b"m" * 32,
+            f"{session.session_id}|Mode Repair|broken_mode|{raw_updated_at}",
+        )
         conn.execute(
-            "UPDATE sessions SET memory_mode = ? WHERE session_id = ?",
-            ("broken_mode", session.session_id),
+            "UPDATE sessions SET memory_mode = ?, row_hmac = ? WHERE session_id = ?",
+            ("broken_mode", hmac_for_tampered, session.session_id),
         )
 
     rows = store.list_sessions(limit=10)
@@ -279,34 +299,21 @@ def test_list_messages_raises_on_corrupted_message_rows(tmp_path) -> None:
     store.append_message(session.session_id, role="user", content="good-1")
     store.append_message(session.session_id, role="assistant", content="good-2")
 
-    session_db = store._session_db_path(session.session_id)
-    with closing(sqlite3.connect(session_db)) as conn:
+    with store._db_connection() as conn:
         conn.execute(
             """
             UPDATE messages
             SET content_enc = 'corrupted-payload'
-            WHERE turn_index = 0
-            """
+            WHERE session_id = ? AND turn_index = 0
+            """,
+            (session.session_id,)
         )
-        conn.commit()
 
     with pytest.raises(MemoryStoreError, match="Failed to decode message"):
         store.list_messages(session.session_id, limit=20)
 
 
-def test_session_schema_self_heals_when_messages_table_is_missing(tmp_path) -> None:
-    store = _build_store(tmp_path)
-    session = store.create_session(title="Message Table Drop", memory_mode=MemoryMode.ON)
-    store.append_message(session.session_id, role="user", content="persist-me")
 
-    session_db = store._session_db_path(session.session_id)
-    with closing(sqlite3.connect(session_db)) as conn:
-        conn.execute("DROP TABLE messages")
-        conn.commit()
-
-    # Should not raise; missing table is recreated automatically.
-    recovered = store.list_messages(session.session_id, limit=20)
-    assert recovered == []
 
 
 def test_delete_note_also_soft_deletes_attached_images(tmp_path) -> None:
@@ -330,6 +337,32 @@ def test_delete_note_also_soft_deletes_attached_images(tmp_path) -> None:
     assert deleted is True
     assert store.get_note_image(session.session_id, image["image_id"]) is None
     assert store.list_note_images(session.session_id, note["note_id"]) == []
+
+
+def test_list_notes_backfills_session_pad_and_orders_it_first(tmp_path) -> None:
+    store = _build_store(tmp_path)
+    session = store.create_session(title="Pad Session", memory_mode=MemoryMode.ON)
+    legacy = store.create_note(session.session_id, content="Legacy body", source="user")
+
+    notes = store.list_notes(session.session_id)
+
+    assert len(notes) >= 2
+    assert notes[0]["is_default_tab"] is True
+    assert notes[0]["workspace_kind"] == "session_pad"
+    assert notes[0]["title"] == "Session Notes"
+    assert any(note["note_id"] == legacy["note_id"] for note in notes)
+
+
+def test_delete_note_rejects_session_pad(tmp_path) -> None:
+    store = _build_store(tmp_path)
+    session = store.create_session(title="Protected Pad", memory_mode=MemoryMode.ON)
+    session_pad = store.get_or_create_session_pad(session.session_id)
+
+    with pytest.raises(MemoryStoreError, match="Cannot delete the session pad"):
+        store.delete_note(session.session_id, session_pad["note_id"])
+
+
+
 
 
 def test_create_note_image_rejects_deleted_note(tmp_path) -> None:

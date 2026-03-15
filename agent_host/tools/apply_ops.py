@@ -369,6 +369,18 @@ def handle(executor: ToolExecutor, arguments: Mapping[str, Any]) -> dict[str, An
                         continue
             else:
                 raise ToolExecutionError(f"Unsupported operation kind: {op_kind}")
+        except ToolExecutionError as tool_exc:
+            failures += 1
+            results.append({
+                "index": operation_index, "op": op_kind, "ok": False,
+                "src": str(src_path),
+                "dest": str(dest_path) if dest_path else None,
+                "error": str(tool_exc),
+                "error_type": tool_exc.error_type,
+                "retryable": tool_exc.retryable,
+            })
+            if stop_on_error:
+                stop_processing = True
         except Exception as exc:
             failures += 1
             results.append({

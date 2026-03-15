@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent_host.config import Config, _get_project_root
 
 
@@ -13,7 +15,8 @@ def test_from_env_uses_secure_defaults(monkeypatch) -> None:
 
     config = Config.from_env()
 
-    assert config.allowed_roots == [_get_project_root()]
+    # Default allowed_roots is root filesystem for whole-computer search.
+    assert config.allowed_roots == [Path("/")]
     assert config.enable_open_item is False
     assert config.audit_include_prompt is False
 
