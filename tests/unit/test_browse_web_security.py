@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import base64
-from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
 import pytest
 
-from agent_host.tools import browse_web
+from agent_host.adapters.tools.browse_web import handler as browse_web
 
 
 def test_fetch_url_blocks_unsafe_redirect_before_second_request(monkeypatch) -> None:
@@ -285,15 +284,15 @@ def test_process_single_url_blocks_prompt_injection_content(monkeypatch) -> None
         lambda hostname, port=None: ["93.184.216.34"],
     )
 
-    executor = SimpleNamespace(
-        _browse_rate_limiter=browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
-        _browse_response_cache=browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
-        _browse_robots_cache=browse_web.RobotsTxtCache(ttl_seconds=60.0),
-        _browse_circuit_breaker=browse_web.DomainCircuitBreaker(),
-    )
+    infra = {
+        "rate_limiter": browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
+        "response_cache": browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
+        "robots_cache": browse_web.RobotsTxtCache(ttl_seconds=60.0),
+        "circuit_breaker": browse_web.DomainCircuitBreaker(),
+        "incident_monitor": None,
+    }
 
     result = browse_web._process_single_url(
-        executor=executor,
         url="https://example.com",
         timeout_seconds=10,
         follow_redirects=True,
@@ -303,6 +302,7 @@ def test_process_single_url_blocks_prompt_injection_content(monkeypatch) -> None
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is False
@@ -360,15 +360,15 @@ def test_process_single_url_honors_meta_robots_nosnippet(monkeypatch) -> None:
         lambda hostname, port=None: ["93.184.216.34"],
     )
 
-    executor = SimpleNamespace(
-        _browse_rate_limiter=browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
-        _browse_response_cache=browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
-        _browse_robots_cache=browse_web.RobotsTxtCache(ttl_seconds=60.0),
-        _browse_circuit_breaker=browse_web.DomainCircuitBreaker(),
-    )
+    infra = {
+        "rate_limiter": browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
+        "response_cache": browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
+        "robots_cache": browse_web.RobotsTxtCache(ttl_seconds=60.0),
+        "circuit_breaker": browse_web.DomainCircuitBreaker(),
+        "incident_monitor": None,
+    }
 
     result = browse_web._process_single_url(
-        executor=executor,
         url="https://example.com/article",
         timeout_seconds=10,
         follow_redirects=True,
@@ -378,6 +378,7 @@ def test_process_single_url_honors_meta_robots_nosnippet(monkeypatch) -> None:
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is True
@@ -491,15 +492,15 @@ def test_process_single_url_blocks_prompt_injection_present_only_in_raw_html(mon
         lambda hostname, port=None: ["93.184.216.34"],
     )
 
-    executor = SimpleNamespace(
-        _browse_rate_limiter=browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
-        _browse_response_cache=browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
-        _browse_robots_cache=browse_web.RobotsTxtCache(ttl_seconds=60.0),
-        _browse_circuit_breaker=browse_web.DomainCircuitBreaker(),
-    )
+    infra = {
+        "rate_limiter": browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
+        "response_cache": browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
+        "robots_cache": browse_web.RobotsTxtCache(ttl_seconds=60.0),
+        "circuit_breaker": browse_web.DomainCircuitBreaker(),
+        "incident_monitor": None,
+    }
 
     result = browse_web._process_single_url(
-        executor=executor,
         url="https://example.com",
         timeout_seconds=10,
         follow_redirects=True,
@@ -509,6 +510,7 @@ def test_process_single_url_blocks_prompt_injection_present_only_in_raw_html(mon
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is False
@@ -586,15 +588,15 @@ def test_process_single_url_strips_instruction_like_lines_without_blocking(monke
         lambda hostname, port=None: ["93.184.216.34"],
     )
 
-    executor = SimpleNamespace(
-        _browse_rate_limiter=browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
-        _browse_response_cache=browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
-        _browse_robots_cache=browse_web.RobotsTxtCache(ttl_seconds=60.0),
-        _browse_circuit_breaker=browse_web.DomainCircuitBreaker(),
-    )
+    infra = {
+        "rate_limiter": browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
+        "response_cache": browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
+        "robots_cache": browse_web.RobotsTxtCache(ttl_seconds=60.0),
+        "circuit_breaker": browse_web.DomainCircuitBreaker(),
+        "incident_monitor": None,
+    }
 
     result = browse_web._process_single_url(
-        executor=executor,
         url="https://example.com",
         timeout_seconds=10,
         follow_redirects=True,
@@ -604,6 +606,7 @@ def test_process_single_url_strips_instruction_like_lines_without_blocking(monke
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is True
@@ -662,15 +665,15 @@ def test_process_single_url_sanitizes_raw_html_when_requested(monkeypatch) -> No
         lambda hostname, port=None: ["93.184.216.34"],
     )
 
-    executor = SimpleNamespace(
-        _browse_rate_limiter=browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
-        _browse_response_cache=browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
-        _browse_robots_cache=browse_web.RobotsTxtCache(ttl_seconds=60.0),
-        _browse_circuit_breaker=browse_web.DomainCircuitBreaker(),
-    )
+    infra = {
+        "rate_limiter": browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
+        "response_cache": browse_web.ResponseCache(max_entries=8, ttl_seconds=60.0),
+        "robots_cache": browse_web.RobotsTxtCache(ttl_seconds=60.0),
+        "circuit_breaker": browse_web.DomainCircuitBreaker(),
+        "incident_monitor": None,
+    }
 
     result = browse_web._process_single_url(
-        executor=executor,
         url="https://example.com",
         timeout_seconds=10,
         follow_redirects=True,
@@ -680,6 +683,7 @@ def test_process_single_url_sanitizes_raw_html_when_requested(monkeypatch) -> No
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is True

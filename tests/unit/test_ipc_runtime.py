@@ -14,6 +14,7 @@ import uuid
 import pytest
 
 from agent_host import main as main_module
+from agent_host.adapters.modes.plan import state_machine as plan_mode_module
 from agent_host.config import Config
 from agent_host.ipc.protocol import ErrorMessage, IncomingRequest
 from agent_host.ipc.server import IPCServer
@@ -83,13 +84,13 @@ def _embedding_ready_gemini_client(gemini_client_cls: type) -> type:
 
 
 def test_live_web_audit_instruction_requires_browse_or_ready_prefix() -> None:
-    instruction = main_module._build_live_web_audit_instruction(
+    instruction = plan_mode_module._build_live_web_audit_instruction(
         root_prompt="What are the newest model rankings right now?",
         draft_response="Based on early 2025, model X leads.",
     )
 
     assert "browse_web" in instruction
-    assert main_module._FINAL_ANSWER_READY_PREFIX in instruction
+    assert plan_mode_module._FINAL_ANSWER_READY_PREFIX in instruction
     assert "Do not describe this audit step to the user." in instruction
 
 
@@ -1142,7 +1143,7 @@ async def test_run_server_audits_text_only_answer_and_forces_browse_before_final
     )
 
     import agent_host.ipc.hot_reload as hot_reload_module
-    import agent_host.tools.browse_web as browse_web_module
+    import agent_host.adapters.tools.browse_web.handler as browse_web_module
 
     monkeypatch.setattr(
         hot_reload_module,
@@ -1150,7 +1151,7 @@ async def test_run_server_audits_text_only_answer_and_forces_browse_before_final
         lambda **_kwargs: _DummyReloadManager(),
     )
 
-    def _fake_browse_handle(_executor, _arguments):
+    def _fake_browse_handle(_arguments, **_kwargs):
         state["browse_calls"] += 1
         return {
             "ok": True,

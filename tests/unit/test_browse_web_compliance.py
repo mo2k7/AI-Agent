@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 from agent_host.observability import reset_request_context, set_request_context
-from agent_host.tools import browse_web
+from agent_host.adapters.tools.browse_web import handler as browse_web
 
 
-def _executor() -> SimpleNamespace:
-    return SimpleNamespace(
-        _browse_rate_limiter=browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
-        _browse_response_cache=browse_web.ResponseCache(max_entries=32, ttl_seconds=60.0),
-        _browse_robots_cache=browse_web.RobotsTxtCache(ttl_seconds=60.0),
-        _browse_circuit_breaker=browse_web.DomainCircuitBreaker(),
-        _browse_incident_monitor=browse_web.BrowseIncidentMonitor(
+def _infra() -> dict:
+    """Return the five browse_web infrastructure instances as a dict of kwargs."""
+    return {
+        "rate_limiter": browse_web.DomainRateLimiter(max_requests=1000, window_seconds=60.0),
+        "response_cache": browse_web.ResponseCache(max_entries=32, ttl_seconds=60.0),
+        "robots_cache": browse_web.RobotsTxtCache(ttl_seconds=60.0),
+        "circuit_breaker": browse_web.DomainCircuitBreaker(),
+        "incident_monitor": browse_web.BrowseIncidentMonitor(
             threshold=5,
             window_seconds=300,
             cooldown_seconds=600,
             incident_log_path="/tmp/browse_incidents_test.jsonl",
         ),
-    )
+    }
 
 
 @contextmanager
@@ -39,14 +39,13 @@ def _browse_profile(profile: str):
 
 
 def test_process_single_url_blocks_egress_policy(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     policy["egress"]["deny_domain_suffixes"] = [".example.com"]
     monkeypatch.setattr(browse_web, "_load_browse_compliance_policy", lambda: policy)
 
     result = browse_web._process_single_url(
-        executor=ex,
         url="https://api.example.com/data",
         timeout_seconds=10,
         follow_redirects=True,
@@ -56,6 +55,7 @@ def test_process_single_url_blocks_egress_policy(monkeypatch) -> None:
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is False
@@ -63,7 +63,7 @@ def test_process_single_url_blocks_egress_policy(monkeypatch) -> None:
 
 
 def test_process_single_url_blocks_jurisdiction_policy(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     policy["allowed_jurisdictions"] = ["US"]
@@ -71,7 +71,6 @@ def test_process_single_url_blocks_jurisdiction_policy(monkeypatch) -> None:
 
     with _browse_profile("strict"):
         result = browse_web._process_single_url(
-            executor=ex,
             url="https://example.de/news",
             timeout_seconds=10,
             follow_redirects=True,
@@ -81,6 +80,7 @@ def test_process_single_url_blocks_jurisdiction_policy(monkeypatch) -> None:
             use_cache=False,
             custom_headers=None,
             verify_ssl=True,
+            **infra,
         )
 
     assert result["ok"] is False
@@ -88,7 +88,7 @@ def test_process_single_url_blocks_jurisdiction_policy(monkeypatch) -> None:
 
 
 def test_process_single_url_allows_jurisdiction_in_standard_profile(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     policy["allowed_jurisdictions"] = ["US"]
@@ -119,7 +119,6 @@ def test_process_single_url_allows_jurisdiction_in_standard_profile(monkeypatch)
 
     with _browse_profile("standard"):
         result = browse_web._process_single_url(
-            executor=ex,
             url="https://example.de/news",
             timeout_seconds=10,
             follow_redirects=True,
@@ -129,6 +128,7 @@ def test_process_single_url_allows_jurisdiction_in_standard_profile(monkeypatch)
             use_cache=False,
             custom_headers=None,
             verify_ssl=True,
+            **infra,
         )
 
     assert result["ok"] is True
@@ -136,7 +136,7 @@ def test_process_single_url_allows_jurisdiction_in_standard_profile(monkeypatch)
 
 
 def test_process_single_url_warns_when_robots_unavailable_in_standard_profile(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     monkeypatch.setattr(browse_web, "_load_browse_compliance_policy", lambda: policy)
@@ -146,7 +146,7 @@ def test_process_single_url_warns_when_robots_unavailable_in_standard_profile(mo
         lambda hostname, port=None: ["93.184.216.34"],
     )
     monkeypatch.setattr(
-        ex._browse_robots_cache,
+        infra["robots_cache"],
         "is_allowed",
         lambda **kwargs: (False, "Could not confirm robots.txt policy at https://example.com/robots.txt."),
     )
@@ -171,7 +171,6 @@ def test_process_single_url_warns_when_robots_unavailable_in_standard_profile(mo
 
     with _browse_profile("standard"):
         result = browse_web._process_single_url(
-            executor=ex,
             url="https://example.com/public",
             timeout_seconds=10,
             follow_redirects=True,
@@ -181,6 +180,7 @@ def test_process_single_url_warns_when_robots_unavailable_in_standard_profile(mo
             use_cache=False,
             custom_headers=None,
             verify_ssl=True,
+            **infra,
         )
 
     assert result["ok"] is True
@@ -189,7 +189,7 @@ def test_process_single_url_warns_when_robots_unavailable_in_standard_profile(mo
 
 
 def test_process_single_url_blocks_auth_wall(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     monkeypatch.setattr(browse_web, "_load_browse_compliance_policy", lambda: policy)
@@ -218,7 +218,6 @@ def test_process_single_url_blocks_auth_wall(monkeypatch) -> None:
     )
 
     result = browse_web._process_single_url(
-        executor=ex,
         url="https://example.com/article",
         timeout_seconds=10,
         follow_redirects=True,
@@ -228,6 +227,7 @@ def test_process_single_url_blocks_auth_wall(monkeypatch) -> None:
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is False
@@ -235,7 +235,7 @@ def test_process_single_url_blocks_auth_wall(monkeypatch) -> None:
 
 
 def test_process_single_url_warns_on_auth_wall_in_flexible_profile(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     monkeypatch.setattr(browse_web, "_load_browse_compliance_policy", lambda: policy)
@@ -265,7 +265,6 @@ def test_process_single_url_warns_on_auth_wall_in_flexible_profile(monkeypatch) 
 
     with _browse_profile("flexible"):
         result = browse_web._process_single_url(
-            executor=ex,
             url="https://example.com/article",
             timeout_seconds=10,
             follow_redirects=True,
@@ -275,6 +274,7 @@ def test_process_single_url_warns_on_auth_wall_in_flexible_profile(monkeypatch) 
             use_cache=False,
             custom_headers=None,
             verify_ssl=True,
+            **infra,
         )
 
     assert result["ok"] is True
@@ -283,7 +283,7 @@ def test_process_single_url_warns_on_auth_wall_in_flexible_profile(monkeypatch) 
 
 
 def test_process_single_url_applies_pii_and_copyright_controls(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     policy["privacy"]["block_on_pii_detection"] = False
@@ -317,7 +317,6 @@ def test_process_single_url_applies_pii_and_copyright_controls(monkeypatch) -> N
     )
 
     result = browse_web._process_single_url(
-        executor=ex,
         url="https://example.com/public",
         timeout_seconds=10,
         follow_redirects=True,
@@ -327,6 +326,7 @@ def test_process_single_url_applies_pii_and_copyright_controls(monkeypatch) -> N
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is True
@@ -336,7 +336,7 @@ def test_process_single_url_applies_pii_and_copyright_controls(monkeypatch) -> N
 
 
 def test_process_single_url_blocks_when_pii_detected(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     policy["privacy"]["block_on_pii_detection"] = True
@@ -369,7 +369,6 @@ def test_process_single_url_blocks_when_pii_detected(monkeypatch) -> None:
         )
 
     result = browse_web._process_single_url(
-        executor=ex,
         url="https://example.com/public",
         timeout_seconds=10,
         follow_redirects=True,
@@ -379,6 +378,7 @@ def test_process_single_url_blocks_when_pii_detected(monkeypatch) -> None:
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is False
@@ -388,7 +388,7 @@ def test_process_single_url_blocks_when_pii_detected(monkeypatch) -> None:
 
 
 def test_process_single_url_redacts_incidental_raw_html_pii_without_blocking(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     policy = browse_web._default_browse_compliance_policy()
     policy["security_attestation"]["require_recent_attestation"] = False
     monkeypatch.setattr(browse_web, "_load_browse_compliance_policy", lambda: policy)
@@ -421,7 +421,6 @@ def test_process_single_url_redacts_incidental_raw_html_pii_without_blocking(mon
     )
 
     result = browse_web._process_single_url(
-        executor=ex,
         url="https://example.com/public",
         timeout_seconds=10,
         follow_redirects=True,
@@ -431,6 +430,7 @@ def test_process_single_url_redacts_incidental_raw_html_pii_without_blocking(mon
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is True
@@ -439,22 +439,22 @@ def test_process_single_url_redacts_incidental_raw_html_pii_without_blocking(mon
 
 
 def test_compliance_action_purge_cache_domain() -> None:
-    ex = _executor()
-    ex._browse_response_cache.put(
+    infra = _infra()
+    infra["response_cache"].put(
         "https://example.com/a",
         {"url": "https://example.com/a", "final_url": "https://example.com/a", "ok": True},
     )
-    ex._browse_response_cache.put(
+    infra["response_cache"].put(
         "https://other.com/b",
         {"url": "https://other.com/b", "final_url": "https://other.com/b", "ok": True},
     )
 
     result = browse_web.handle(
-        ex,
         {
             "compliance_action": "purge_cache_domain",
             "target_domain": "example.com",
         },
+        **infra,
     )
 
     assert result["ok"] is True
@@ -462,7 +462,7 @@ def test_compliance_action_purge_cache_domain() -> None:
 
 
 def test_security_attestation_gate_blocks_when_invalid(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     monkeypatch.setattr(
         browse_web,
         "_check_security_attestation",
@@ -470,7 +470,6 @@ def test_security_attestation_gate_blocks_when_invalid(monkeypatch) -> None:
     )
 
     result = browse_web._process_single_url(
-        executor=ex,
         url="https://example.com",
         timeout_seconds=10,
         follow_redirects=True,
@@ -480,6 +479,7 @@ def test_security_attestation_gate_blocks_when_invalid(monkeypatch) -> None:
         use_cache=False,
         custom_headers=None,
         verify_ssl=True,
+        **infra,
     )
 
     assert result["ok"] is False
@@ -487,7 +487,7 @@ def test_security_attestation_gate_blocks_when_invalid(monkeypatch) -> None:
 
 
 def test_security_attestation_warns_in_flexible_profile(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     monkeypatch.setattr(
         browse_web,
         "_check_security_attestation",
@@ -519,7 +519,6 @@ def test_security_attestation_warns_in_flexible_profile(monkeypatch) -> None:
 
     with _browse_profile("flexible"):
         result = browse_web._process_single_url(
-            executor=ex,
             url="https://example.com",
             timeout_seconds=10,
             follow_redirects=True,
@@ -529,6 +528,7 @@ def test_security_attestation_warns_in_flexible_profile(monkeypatch) -> None:
             use_cache=False,
             custom_headers=None,
             verify_ssl=True,
+            **infra,
         )
 
     assert result["ok"] is True
@@ -536,7 +536,7 @@ def test_security_attestation_warns_in_flexible_profile(monkeypatch) -> None:
 
 
 def test_handle_blocks_before_processing_when_attestation_invalid(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
     monkeypatch.setattr(
         browse_web,
         "_check_security_attestation",
@@ -551,11 +551,11 @@ def test_handle_blocks_before_processing_when_attestation_invalid(monkeypatch) -
     monkeypatch.setattr(browse_web, "_process_urls_parallel", _should_not_run)
 
     result = browse_web.handle(
-        ex,
         {
             "url": "https://example.com",
             "respect_robots_txt": False,
         },
+        **infra,
     )
 
     assert result["ok"] is False
@@ -584,7 +584,7 @@ def test_build_search_urls_defaults_to_multiple_discovery_engines() -> None:
 
 
 def test_execute_search_query_falls_back_to_generic_result_harvest(monkeypatch) -> None:
-    ex = _executor()
+    infra = _infra()
 
     monkeypatch.setattr(
         browse_web,
@@ -620,7 +620,6 @@ def test_execute_search_query_falls_back_to_generic_result_harvest(monkeypatch) 
     )
 
     result = browse_web._execute_search_query(
-        executor=ex,
         query="new model release",
         engines=["duckduckgo"],
         timeout_seconds=10,
@@ -631,6 +630,7 @@ def test_execute_search_query_falls_back_to_generic_result_harvest(monkeypatch) 
         custom_headers=None,
         verify_ssl=True,
         browse_profile="standard",
+        **infra,
     )
 
     assert result["ok"] is True

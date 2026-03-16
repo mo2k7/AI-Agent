@@ -36,12 +36,11 @@ class TestSchemaLoading:
             "planner",
             "apply_ops",
             "open_item",
-            "run_automation",
             "create_directory",
         ]
-        
+
         loaded_tools = validator.get_all_tool_names()
-        
+
         for tool in expected_tools:
             assert tool in loaded_tools, f"Missing schema for tool: {tool}"
     
@@ -216,16 +215,6 @@ class TestToolCallValidation:
         
         result = validator.validate_tool_call("open_item", {
             "path": "/Users/test/document.pdf"
-        })
-        
-        assert result is True
-    
-    def test_validate_run_automation_valid(self, schemas_dir: Path) -> None:
-        """Test validating a valid run_automation call."""
-        validator = SchemaValidator(schemas_dir)
-        
-        result = validator.validate_tool_call("run_automation", {
-            "name": "My Shortcut"
         })
         
         assert result is True
@@ -413,10 +402,9 @@ class TestGeminiFormat:
             "planner",
             "apply_ops",
             "open_item",
-            "run_automation",
             "create_directory",
         ]
-        
+
         for expected in expected_tools:
             assert expected in tool_names, f"Missing tool in Gemini format: {expected}"
     

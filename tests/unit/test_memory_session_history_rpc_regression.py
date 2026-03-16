@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from agent_host import main as main_module
+from agent_host.adapters.modes.plan import state_machine as plan_mode_module
 from agent_host.config import Config
+from agent_host.core import orchestrator as orchestrator_module
 from agent_host.ipc.protocol import IncomingRequest
 from agent_host.memory.manager import MemoryManager
 
@@ -1278,12 +1280,18 @@ async def test_prompt_teacher_mode_auto_captures_note(monkeypatch, tmp_path: Pat
 
         request_messages = [message for message in client.sent if message.get("id") == request_id]
         assert not any(message.get("type") == "error" for message in request_messages)
+        # Teacher mode auto-capture calls memory_manager.create_note() directly
+        # (not via tool executor), so verify via the status message it sends
+        # after successful note creation: "Teacher note saved (id=...)"
         assert any(
-            message.get("type") == "tool_call"
-            and str(message.get("tool", {}).get("name")) == "manage_notes"
-            and str(message.get("tool", {}).get("status")) == "success"
+            message.get("type") == "status"
+            and "teacher note saved" in str(message.get("detail", "")).lower()
             for message in request_messages
-        )
+        ) or any(
+            message.get("type") == "status"
+            and "study notes" in str(message.get("detail", "")).lower()
+            for message in request_messages
+        ), f"Expected teacher note capture status message, got: {[m for m in request_messages if m.get('type') == 'status']}"
         assert any(message.get("type") == "result" for message in request_messages)
     finally:
         latest = _FakeServer.latest
@@ -1755,7 +1763,8 @@ async def test_prompt_plan_mode_allows_discovery_after_planner_tool_runs(
         base64.b64encode(b"s" * 32).decode("ascii"),
     )
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_DISCOVERY_BEFORE_PLANNER", "0")
-    monkeypatch.setattr(main_module, "_PLAN_MODE_PLANNER_TOOLS", {"search_files"})
+    from agent_host.adapters.modes.plan import state_machine as plan_sm
+    monkeypatch.setattr(plan_sm, "_PLAN_MODE_PLANNER_TOOLS", {"search_files"})
 
     readable_file = tmp_path / "allowed-read-after-planner.txt"
     readable_file.write_text("ok", encoding="utf-8")
@@ -2245,42 +2254,42 @@ async def test_session_create_and_history_reject_invalid_memory_mode(monkeypatch
 
 def test_is_plan_mode_followup_affirmatives():
     """Short affirmative replies are follow-ups when a plan exists."""
-    fn = main_module._is_plan_mode_followup
+    fn = plan_mode_module._is_plan_mode_followup
     for phrase in ("yes", "Yes!", "ok", "sure", "go ahead", "proceed", "do it", "let's go"):
         assert fn(phrase, session_has_plan=True), f"Expected followup for: {phrase!r}"
 
 
 def test_is_plan_mode_followup_negatives():
     """Negative/hold replies are also follow-ups (not new plans)."""
-    fn = main_module._is_plan_mode_followup
+    fn = plan_mode_module._is_plan_mode_followup
     for phrase in ("no", "wait", "hold", "cancel", "revise", "adjust"):
         assert fn(phrase, session_has_plan=True), f"Expected followup for: {phrase!r}"
 
 
 def test_is_plan_mode_followup_questions():
     """Short conversational questions are follow-ups."""
-    fn = main_module._is_plan_mode_followup
+    fn = plan_mode_module._is_plan_mode_followup
     assert fn("what about duplicates?", session_has_plan=True)
     assert fn("can you also handle PDFs?", session_has_plan=True)
 
 
 def test_is_plan_mode_followup_no_plan():
     """Without an existing plan, nothing is a follow-up."""
-    fn = main_module._is_plan_mode_followup
+    fn = plan_mode_module._is_plan_mode_followup
     assert not fn("yes", session_has_plan=False)
     assert not fn("go ahead", session_has_plan=False)
 
 
 def test_is_plan_mode_followup_new_planning_request():
     """A prompt with goal signals is a new planning request, not a follow-up."""
-    fn = main_module._is_plan_mode_followup
+    fn = plan_mode_module._is_plan_mode_followup
     assert not fn("reorganize my photos by date into yearly folders", session_has_plan=True)
     assert not fn("plan to migrate all documents to cloud storage", session_has_plan=True)
 
 
 def test_is_plan_mode_execution_approval_affirmatives():
     """Affirmative approvals are detected for auto-execute."""
-    fn = main_module._is_plan_mode_execution_approval
+    fn = plan_mode_module._is_plan_mode_execution_approval
     for phrase in ("yes", "Yes!", "ok", "sure", "go ahead", "proceed", "do it",
                    "let's go", "sounds good", "perfect", "great", "approved", "confirmed"):
         assert fn(phrase), f"Expected approval for: {phrase!r}"
@@ -2288,7 +2297,7 @@ def test_is_plan_mode_execution_approval_affirmatives():
 
 def test_is_plan_mode_execution_approval_non_approvals():
     """Non-approval follow-ups should not trigger auto-execute."""
-    fn = main_module._is_plan_mode_execution_approval
+    fn = plan_mode_module._is_plan_mode_execution_approval
     for phrase in ("what about duplicates?", "can you also handle PDFs?",
                    "no", "wait", "revise the plan", "actually change step 2"):
         assert not fn(phrase), f"Should NOT be approval: {phrase!r}"

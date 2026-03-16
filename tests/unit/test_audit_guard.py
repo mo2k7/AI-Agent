@@ -40,9 +40,11 @@ def test_main_fails_when_audit_logging_is_unavailable(
             return [{"name": "search_files", "description": "desc", "parameters": {}}]
 
     class FakeToolExecutor:
-        @classmethod
-        def from_config(cls, _config: object) -> object:
-            return object()
+        def __init__(self, *, plugins=(), event_bus=None) -> None:
+            pass
+
+        def list_plugins(self) -> list[str]:
+            return []
 
     class FailingAuditLogger:
         def __init__(self, _path: Path) -> None:
@@ -58,6 +60,8 @@ def test_main_fails_when_audit_logging_is_unavailable(
         memory_root=Path("/tmp/ai-agent-memory"),
         allowed_roots=[Path("/tmp")],
         automations_dir=Path("/tmp"),
+        enable_open_item=False,
+        search_scan_limit=200,
         require_no_training=False,
         use_vertexai=False,
         vertex_project=None,
@@ -101,14 +105,16 @@ async def test_run_server_fails_when_embedding_service_is_unavailable(
             return [{"name": "search_files", "description": "desc", "parameters": {}}]
 
     class FakeToolExecutor:
-        @classmethod
-        def from_config(cls, _config: object) -> object:
-            return object()
+        def __init__(self, *, plugins=(), event_bus=None) -> None:
+            pass
+
+        def list_plugins(self) -> list[str]:
+            return []
 
     class FakeGeminiClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self._client = object()
-            
+
         def resolve_text_model(self, requested_model: str | None = None) -> str:
             return requested_model or "gemini-test"
 
@@ -126,6 +132,8 @@ async def test_run_server_fails_when_embedding_service_is_unavailable(
         memory_root=Path("/tmp/ai-agent-memory"),
         allowed_roots=[Path("/tmp")],
         automations_dir=Path("/tmp"),
+        enable_open_item=False,
+        search_scan_limit=200,
         require_no_training=False,
         use_vertexai=False,
         vertex_project=None,
@@ -154,9 +162,11 @@ def test_main_fails_when_embedding_service_is_unavailable(
             return [{"name": "search_files", "description": "desc", "parameters": {}}]
 
     class FakeToolExecutor:
-        @classmethod
-        def from_config(cls, _config: object) -> object:
-            return object()
+        def __init__(self, *, plugins=(), event_bus=None) -> None:
+            pass
+
+        def list_plugins(self) -> list[str]:
+            return []
 
     class WorkingAuditLogger:
         def __init__(self, _path: Path) -> None:
@@ -189,6 +199,8 @@ def test_main_fails_when_embedding_service_is_unavailable(
         memory_root=Path("/tmp/ai-agent-memory"),
         allowed_roots=[Path("/tmp")],
         automations_dir=Path("/tmp"),
+        enable_open_item=False,
+        search_scan_limit=200,
         require_no_training=False,
         use_vertexai=False,
         vertex_project=None,

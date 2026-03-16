@@ -42,8 +42,8 @@ def _safe_float(raw: str, default: float) -> float:
         return default
 
 
-class MemoryStoreError(RuntimeError):
-    """Raised for storage-layer failures."""
+# Canonical definition in contracts/types/errors.py; re-exported for backward compat.
+from agent_host.contracts.types.errors import MemoryStoreError  # noqa: F401
 
 
 T = TypeVar("T")

@@ -23,9 +23,8 @@ from agent_host.redaction import redact_value
 logger = logging.getLogger(__name__)
 
 
-class AuditLogError(Exception):
-    """Raised when audit logging fails."""
-    pass
+# Canonical definition in contracts/types/errors.py; re-exported for backward compat.
+from agent_host.contracts.types.errors import AuditLogError  # noqa: F401
 
 
 class EventType(str, Enum):

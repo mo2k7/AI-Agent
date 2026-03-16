@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 
-class SystemPromptLoadError(RuntimeError):
-    """Raised when the system prompt cannot be loaded safely."""
+# Canonical definition in contracts/types/errors.py; re-exported for backward compat.
+from agent_host.contracts.types.errors import SystemPromptLoadError  # noqa: F401
 
 
 def _default_prompt_path() -> Path:

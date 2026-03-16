@@ -136,7 +136,6 @@ class TestGoldenToolCalls:
         "search_files_001.json",
         "get_metadata_001.json",
         "open_item_001.json",
-        "run_automation_001.json",
     ])
     def test_parse_fixture_dict_response(
         self,
@@ -163,7 +162,6 @@ class TestGoldenToolCalls:
         "search_files_001.json",
         "get_metadata_001.json",
         "open_item_001.json",
-        "run_automation_001.json",
     ])
     def test_parse_fixture_raw_response(
         self,
@@ -190,7 +188,6 @@ class TestGoldenToolCalls:
         "search_files_001.json",
         "get_metadata_001.json",
         "open_item_001.json",
-        "run_automation_001.json",
     ])
     def test_validate_fixture_tool_calls(
         self,
@@ -352,7 +349,6 @@ class TestGoldenToolCallRoundtrip:
         "search_files_001.json",
         "get_metadata_001.json",
         "open_item_001.json",
-        "run_automation_001.json",
     ])
     def test_to_dict_roundtrip(
         self,

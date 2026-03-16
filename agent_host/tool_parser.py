@@ -11,14 +11,11 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
-class ToolParserError(Exception):
-    """Base exception for tool parser errors."""
-    pass
-
-
-class MalformedResponseError(ToolParserError):
-    """Raised when response structure is malformed."""
-    pass
+# Canonical definitions in contracts/types/errors.py; re-exported for backward compat.
+from agent_host.contracts.types.errors import (  # noqa: F401
+    ToolParserError,
+    MalformedResponseError,
+)
 
 
 @dataclass

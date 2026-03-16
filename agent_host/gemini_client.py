@@ -20,27 +20,13 @@ from google.genai import errors as genai_errors
 logger = logging.getLogger(__name__)
 
 
-class GeminiClientError(Exception):
-    """Base exception for Gemini client errors."""
-    pass
-
-
-class GeminiAPIError(GeminiClientError):
-    """Raised when the Gemini API returns an error."""
-    
-    def __init__(self, message: str, status_code: Optional[int] = None):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class GeminiRateLimitError(GeminiAPIError):
-    """Raised when rate limited (HTTP 429)."""
-    pass
-
-
-class GeminiServerError(GeminiAPIError):
-    """Raised when server error occurs (HTTP 5xx)."""
-    pass
+# Canonical definitions in contracts/types/errors.py; re-exported for backward compat.
+from agent_host.contracts.types.errors import (  # noqa: F401
+    GeminiClientError,
+    GeminiAPIError,
+    GeminiRateLimitError,
+    GeminiServerError,
+)
 
 
 class GeminiClient:

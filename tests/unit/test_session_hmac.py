@@ -16,7 +16,7 @@ def _build_store(tmp_path) -> MemoryStore:
 
 def _get_row_hmac(tmp_path, session_id: str) -> str:
     """Read the raw row_hmac value from the index DB for a given session."""
-    index_db = tmp_path / "memory-store" / "index.db"
+    index_db = tmp_path / "memory-store" / "memory.db"
     with sqlite3.connect(str(index_db)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -52,7 +52,7 @@ def test_tampered_title_detected(tmp_path) -> None:
     store = _build_store(tmp_path)
     session = store.create_session(title="Original", memory_mode=MemoryMode.ON)
 
-    index_db = tmp_path / "memory-store" / "index.db"
+    index_db = tmp_path / "memory-store" / "memory.db"
     with sqlite3.connect(str(index_db)) as conn:
         conn.execute(
             "UPDATE sessions SET title = 'hacked' WHERE session_id = ?",
@@ -68,7 +68,7 @@ def test_tampered_mode_detected(tmp_path) -> None:
     store = _build_store(tmp_path)
     session = store.create_session(title="Mode Tamper", memory_mode=MemoryMode.ON)
 
-    index_db = tmp_path / "memory-store" / "index.db"
+    index_db = tmp_path / "memory-store" / "memory.db"
     with sqlite3.connect(str(index_db)) as conn:
         conn.execute(
             "UPDATE sessions SET memory_mode = 'off' WHERE session_id = ?",
@@ -84,7 +84,7 @@ def test_empty_hmac_passes_premigration(tmp_path) -> None:
     store = _build_store(tmp_path)
     session = store.create_session(title="Legacy Row", memory_mode=MemoryMode.ON)
 
-    index_db = tmp_path / "memory-store" / "index.db"
+    index_db = tmp_path / "memory-store" / "memory.db"
     with sqlite3.connect(str(index_db)) as conn:
         conn.execute(
             "UPDATE sessions SET row_hmac = '' WHERE session_id = ?",

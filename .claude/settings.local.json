@@ -74,7 +74,21 @@
       "Bash(brew install:*)",
       "WebFetch(domain:ai.google.dev)",
       "WebFetch(domain:googleapis.github.io)",
-      "WebFetch(domain:docs.cloud.google.com)"
+      "WebFetch(domain:docs.cloud.google.com)",
+      "Skill(questionably-ultrathink-skill)",
+      "Skill(questionably-ultrathink-skill:*)",
+      "Bash(cd /Users/muhammadabdullah/\"AI Automation Agent macOS\")",
+      "Bash(uv run:*)",
+      "Bash(rm agent_host/core/use_cases/__init__.py)",
+      "Bash(rmdir agent_host/core/use_cases)",
+      "Bash(rm -rf agent_host/core/__pycache__)",
+      "Bash(rm agent_host/core/__init__.py)",
+      "Bash(rmdir agent_host/core)",
+      "Bash(mv agent_host/tools/browse_web.py agent_host/adapters/tools/browse_web/handler.py)",
+      "Bash(mv agent_host/tools/manage_notes.py agent_host/adapters/tools/manage_notes/handler.py)",
+      "Bash(mv agent_host/tools/generate_image.py agent_host/adapters/tools/generate_image/handler.py)",
+      "Bash(mv agent_host/tools/read_screen.py agent_host/adapters/tools/read_screen/handler.py)",
+      "Bash(mv agent_host/tools/_helpers.py agent_host/adapters/tools/_helpers.py)"
     ]
   },
   "outputStyle": "Explanatory"

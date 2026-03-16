@@ -122,7 +122,7 @@ def test_column_auto_created(tmp_path) -> None:
     # Force schema creation by creating at least one session.
     _ = store.create_session(title="Schema Check", memory_mode=MemoryMode.ON)
 
-    index_db = tmp_path / "memory-store" / "index.db"
+    index_db = tmp_path / "memory-store" / "memory.db"
     with sqlite3.connect(str(index_db)) as conn:
         columns = conn.execute("PRAGMA table_info(sessions)").fetchall()
     column_names = [col[1] for col in columns]

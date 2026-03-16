@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_host.main import _format_tool_execution_output
+from agent_host.core.services.prompt_service import _format_tool_execution_output
 
 
 def test_format_search_files_prefers_link_ready_metadata() -> None:

@@ -2,8 +2,10 @@
 
 import pytest
 
-from agent_host import main as main_module
-from agent_host.tools import _helpers as helpers_module
+from agent_host.core.services import prompt_service as prompt_module
+from agent_host.adapters.modes.plan import state_machine as plan_mode_module
+from agent_host.contracts.types.domain import ExecutionMode
+from agent_host.adapters.tools import _helpers as helpers_module
 
 
 @pytest.mark.parametrize(
@@ -18,32 +20,32 @@ from agent_host.tools import _helpers as helpers_module
     ],
 )
 def test_parse_verbosity_level_strict_valid(raw_value: str, expected: int) -> None:
-    assert main_module._parse_verbosity_level_strict(raw_value) == expected
+    assert prompt_module._parse_verbosity_level_strict(raw_value) == expected
 
 
 @pytest.mark.parametrize("raw_value", ["", "extra high", "detailed", "v2", 2, None, object()])
 def test_parse_verbosity_level_strict_invalid(raw_value: object) -> None:
-    assert main_module._parse_verbosity_level_strict(raw_value) is None
+    assert prompt_module._parse_verbosity_level_strict(raw_value) is None
 
 
 @pytest.mark.parametrize(
     ("raw_value", "expected"),
     [
-        ("direct", main_module.ExecutionMode.DIRECT),
-        (" DIRECT ", main_module.ExecutionMode.DIRECT),
-        ("plan", main_module.ExecutionMode.PLAN),
-        ("PLAN", main_module.ExecutionMode.PLAN),
-        ("teacher", main_module.ExecutionMode.TEACHER),
-        (" TEACHER ", main_module.ExecutionMode.TEACHER),
+        ("direct", ExecutionMode.DIRECT),
+        (" DIRECT ", ExecutionMode.DIRECT),
+        ("plan", ExecutionMode.PLAN),
+        ("PLAN", ExecutionMode.PLAN),
+        ("teacher", ExecutionMode.TEACHER),
+        (" TEACHER ", ExecutionMode.TEACHER),
     ],
 )
 def test_parse_execution_mode_strict_valid(raw_value: object, expected: object) -> None:
-    assert main_module._parse_execution_mode_strict(raw_value) == expected
+    assert prompt_module._parse_execution_mode_strict(raw_value) == expected
 
 
 @pytest.mark.parametrize("raw_value", ["", "guided", "planner", None, 3, object()])
 def test_parse_execution_mode_strict_invalid(raw_value: object) -> None:
-    assert main_module._parse_execution_mode_strict(raw_value) is None
+    assert prompt_module._parse_execution_mode_strict(raw_value) is None
 
 
 @pytest.mark.parametrize(
@@ -55,12 +57,12 @@ def test_parse_execution_mode_strict_invalid(raw_value: object) -> None:
     ],
 )
 def test_parse_presentation_style_strict_valid(raw_value: object, expected: str) -> None:
-    assert main_module._parse_presentation_style_strict(raw_value) == expected
+    assert prompt_module._parse_presentation_style_strict(raw_value) == expected
 
 
 @pytest.mark.parametrize("raw_value", ["", "readable-pro", "editorial", None, 5, object()])
 def test_parse_presentation_style_strict_invalid(raw_value: object) -> None:
-    assert main_module._parse_presentation_style_strict(raw_value) is None
+    assert prompt_module._parse_presentation_style_strict(raw_value) is None
 
 
 @pytest.mark.parametrize(
@@ -72,12 +74,12 @@ def test_parse_presentation_style_strict_invalid(raw_value: object) -> None:
     ],
 )
 def test_parse_stream_animation_style_strict_valid(raw_value: object, expected: str) -> None:
-    assert main_module._parse_stream_animation_style_strict(raw_value) == expected
+    assert prompt_module._parse_stream_animation_style_strict(raw_value) == expected
 
 
 @pytest.mark.parametrize("raw_value", ["", "wave", "luxe", None, 7, object()])
 def test_parse_stream_animation_style_strict_invalid(raw_value: object) -> None:
-    assert main_module._parse_stream_animation_style_strict(raw_value) is None
+    assert prompt_module._parse_stream_animation_style_strict(raw_value) is None
 
 
 @pytest.mark.parametrize(
@@ -88,12 +90,12 @@ def test_parse_stream_animation_style_strict_invalid(raw_value: object) -> None:
     ],
 )
 def test_parse_deep_think_flag_strict_valid(raw_value: object, expected: bool) -> None:
-    assert main_module._parse_deep_think_flag_strict(raw_value) is expected
+    assert prompt_module._parse_deep_think_flag_strict(raw_value) is expected
 
 
 @pytest.mark.parametrize("raw_value", ["true", "false", 1, 0, None, object()])
 def test_parse_deep_think_flag_strict_invalid(raw_value: object) -> None:
-    assert main_module._parse_deep_think_flag_strict(raw_value) is None
+    assert prompt_module._parse_deep_think_flag_strict(raw_value) is None
 
 
 @pytest.mark.parametrize(
@@ -105,12 +107,12 @@ def test_parse_deep_think_flag_strict_invalid(raw_value: object) -> None:
     ],
 )
 def test_parse_browse_profile_strict_valid(raw_value: object, expected: str) -> None:
-    assert main_module._parse_browse_profile_strict(raw_value) == expected
+    assert prompt_module._parse_browse_profile_strict(raw_value) == expected
 
 
 @pytest.mark.parametrize("raw_value", ["", "relaxed", "wide_open", None, 3, object()])
 def test_parse_browse_profile_strict_invalid(raw_value: object) -> None:
-    assert main_module._parse_browse_profile_strict(raw_value) is None
+    assert prompt_module._parse_browse_profile_strict(raw_value) is None
 
 
 @pytest.mark.parametrize(
@@ -125,14 +127,14 @@ def test_parse_browse_profile_strict_invalid(raw_value: object) -> None:
     ],
 )
 def test_model_supports_native_deep_think(model_name: str, expected: bool) -> None:
-    assert main_module._model_supports_native_deep_think(model_name) is expected
+    assert prompt_module._model_supports_native_deep_think(model_name) is expected
 
 
 def test_resolve_model_timeout_seconds_scales_for_deep_teacher_continuation() -> None:
-    resolved = main_module._resolve_model_timeout_seconds(
+    resolved = prompt_module._resolve_model_timeout_seconds(
         base_timeout_seconds=180.0,
         deep_think=True,
-        execution_mode=main_module.ExecutionMode.TEACHER,
+        execution_mode=ExecutionMode.TEACHER,
         is_continuation=True,
         deep_think_multiplier=1.25,
         teacher_multiplier=1.10,
@@ -143,10 +145,10 @@ def test_resolve_model_timeout_seconds_scales_for_deep_teacher_continuation() ->
 
 
 def test_resolve_model_timeout_seconds_honors_cap() -> None:
-    resolved = main_module._resolve_model_timeout_seconds(
+    resolved = prompt_module._resolve_model_timeout_seconds(
         base_timeout_seconds=180.0,
         deep_think=True,
-        execution_mode=main_module.ExecutionMode.TEACHER,
+        execution_mode=ExecutionMode.TEACHER,
         is_continuation=True,
         deep_think_multiplier=2.0,
         teacher_multiplier=2.0,
@@ -157,12 +159,12 @@ def test_resolve_model_timeout_seconds_honors_cap() -> None:
 
 
 def test_resolve_prompt_timeout_seconds_extends_teacher_deep_think_window() -> None:
-    resolved = main_module._resolve_prompt_timeout_seconds(
+    resolved = prompt_module._resolve_prompt_timeout_seconds(
         base_timeout_seconds=300.0,
         model_timeout_seconds=284.625,
         tool_timeout_seconds=120.0,
         deep_think=True,
-        execution_mode=main_module.ExecutionMode.TEACHER,
+        execution_mode=ExecutionMode.TEACHER,
         max_timeout_seconds=900.0,
     )
     assert resolved == pytest.approx(449.625)
@@ -247,7 +249,7 @@ def test_parse_plan_mode_discovery_budget_clamps_to_safe_range(
     expected: int,
 ) -> None:
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_DISCOVERY_BEFORE_PLANNER", raw_value)
-    assert main_module._parse_plan_mode_discovery_budget() == expected
+    assert plan_mode_module._parse_plan_mode_discovery_budget() == expected
 
 
 def test_parse_plan_mode_discovery_budget_invalid_uses_default(
@@ -255,8 +257,8 @@ def test_parse_plan_mode_discovery_budget_invalid_uses_default(
 ) -> None:
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_DISCOVERY_BEFORE_PLANNER", "not-a-number")
     assert (
-        main_module._parse_plan_mode_discovery_budget()
-        == main_module._PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT
+        plan_mode_module._parse_plan_mode_discovery_budget()
+        == plan_mode_module._PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT
     )
 
 
@@ -265,8 +267,8 @@ def test_parse_plan_mode_discovery_budget_missing_uses_default(
 ) -> None:
     monkeypatch.delenv("AI_AGENT_PLAN_MODE_DISCOVERY_BEFORE_PLANNER", raising=False)
     assert (
-        main_module._parse_plan_mode_discovery_budget()
-        == main_module._PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT
+        plan_mode_module._parse_plan_mode_discovery_budget()
+        == plan_mode_module._PLAN_MODE_DISCOVERY_BEFORE_PLANNER_DEFAULT
     )
 
 
@@ -283,7 +285,7 @@ def test_parse_plan_mode_discovery_budget_missing_uses_default(
     ],
 )
 def test_prompt_has_actionable_file_operation_intent_positive(prompt: str) -> None:
-    assert main_module._prompt_has_actionable_file_operation_intent(prompt) is True
+    assert plan_mode_module._prompt_has_actionable_file_operation_intent(prompt) is True
 
 
 @pytest.mark.parametrize(
@@ -296,40 +298,40 @@ def test_prompt_has_actionable_file_operation_intent_positive(prompt: str) -> No
     ],
 )
 def test_prompt_has_actionable_file_operation_intent_negative(prompt: str) -> None:
-    assert main_module._prompt_has_actionable_file_operation_intent(prompt) is False
+    assert plan_mode_module._prompt_has_actionable_file_operation_intent(prompt) is False
 
 
 def test_looks_like_plan_clarification_reply_accepts_q2_prefixed_freeform() -> None:
-    state = main_module.PlanClarificationState(
+    state = plan_mode_module.PlanClarificationState(
         root_prompt="Create a study plan for machine learning.",
         domain="study",
         pending_dimension="timeframe",
         pending_question_number=2,
         asked_rounds=1,
     )
-    assert main_module._looks_like_plan_clarification_reply("Q2: 6 weeks", state) is True
+    assert plan_mode_module._looks_like_plan_clarification_reply("Q2: 6 weeks", state) is True
 
 
 def test_looks_like_plan_clarification_reply_rejects_short_new_task_prompt() -> None:
-    state = main_module.PlanClarificationState(
+    state = plan_mode_module.PlanClarificationState(
         root_prompt="Create a study plan for machine learning.",
         domain="study",
         pending_dimension="baseline",
         pending_question_number=1,
         asked_rounds=1,
     )
-    assert main_module._looks_like_plan_clarification_reply("write me a poem", state) is False
+    assert plan_mode_module._looks_like_plan_clarification_reply("write me a poem", state) is False
 
 
 def test_looks_like_plan_clarification_reply_allows_constraints_signal() -> None:
-    state = main_module.PlanClarificationState(
+    state = plan_mode_module.PlanClarificationState(
         root_prompt="Create a study plan for machine learning.",
         domain="study",
         pending_dimension="constraints",
         pending_question_number=1,
         asked_rounds=1,
     )
-    assert main_module._looks_like_plan_clarification_reply("weekends only", state) is True
+    assert plan_mode_module._looks_like_plan_clarification_reply("weekends only", state) is True
 
 
 def test_plan_mode_text_requests_structured_clarification_detects_freeform_question_list() -> None:
@@ -339,7 +341,7 @@ def test_plan_mode_text_requests_structured_clarification_detects_freeform_quest
         "- Storage baseline: Do you have a staging area ready?\n"
         "- Data volume: Roughly how much data are we organizing?\n"
     )
-    assert main_module._plan_mode_text_requests_structured_clarification(text) is True
+    assert plan_mode_module._plan_mode_text_requests_structured_clarification(text) is True
 
 
 def test_plan_mode_text_requests_structured_clarification_ignores_structured_q_and_options() -> None:
@@ -351,11 +353,11 @@ def test_plan_mode_text_requests_structured_clarification_ignores_structured_q_a
         "C) Advanced/accelerated path\n"
         "D) Concise high-level roadmap\n"
     )
-    assert main_module._plan_mode_text_requests_structured_clarification(text) is False
+    assert plan_mode_module._plan_mode_text_requests_structured_clarification(text) is False
 
 
 def test_prepare_plan_mode_followup_clarification_state_rebuilds_unanswered_dimensions() -> None:
-    state = main_module.PlanClarificationState(
+    state = plan_mode_module.PlanClarificationState(
         root_prompt="Create a 6-week file organization plan.",
         domain="files",
         question_dimensions=["goal", "constraints", "timeframe", "baseline"],
@@ -368,7 +370,7 @@ def test_prepare_plan_mode_followup_clarification_state_rebuilds_unanswered_dime
         },
         option_answers={"goal": "B", "timeframe": "B"},
     )
-    prepared = main_module._prepare_plan_mode_followup_clarification_state(
+    prepared = plan_mode_module._prepare_plan_mode_followup_clarification_state(
         root_prompt="Create a 6-week file organization plan.",
         state=state,
     )
@@ -379,7 +381,7 @@ def test_prepare_plan_mode_followup_clarification_state_rebuilds_unanswered_dime
 
 
 def test_prepare_plan_mode_followup_clarification_state_stops_when_all_dimensions_answered() -> None:
-    state = main_module.PlanClarificationState(
+    state = plan_mode_module.PlanClarificationState(
         root_prompt="Create a 6-week file organization plan.",
         domain="files",
         question_dimensions=["goal", "constraints", "timeframe", "baseline"],
@@ -394,7 +396,7 @@ def test_prepare_plan_mode_followup_clarification_state_stops_when_all_dimension
         },
         option_answers={"goal": "A", "constraints": "A", "timeframe": "A", "baseline": "B"},
     )
-    prepared = main_module._prepare_plan_mode_followup_clarification_state(
+    prepared = plan_mode_module._prepare_plan_mode_followup_clarification_state(
         root_prompt="Create a 6-week file organization plan.",
         state=state,
     )
@@ -421,7 +423,7 @@ def test_parse_plan_mode_clarification_required(
     expected: bool,
 ) -> None:
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_CLARIFICATION_REQUIRED", raw_value)
-    assert main_module._parse_plan_mode_clarification_required() is expected
+    assert plan_mode_module._parse_plan_mode_clarification_required() is expected
 
 
 def test_parse_plan_mode_clarification_required_invalid_uses_default(
@@ -429,8 +431,8 @@ def test_parse_plan_mode_clarification_required_invalid_uses_default(
 ) -> None:
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_CLARIFICATION_REQUIRED", "maybe")
     assert (
-        main_module._parse_plan_mode_clarification_required()
-        is main_module._PLAN_MODE_CLARIFICATION_REQUIRED_DEFAULT
+        plan_mode_module._parse_plan_mode_clarification_required()
+        is plan_mode_module._PLAN_MODE_CLARIFICATION_REQUIRED_DEFAULT
     )
 
 
@@ -451,7 +453,7 @@ def test_parse_plan_mode_clarification_min_missing_clamps(
     expected: int,
 ) -> None:
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_CLARIFICATION_MIN_MISSING", raw_value)
-    assert main_module._parse_plan_mode_clarification_min_missing() == expected
+    assert plan_mode_module._parse_plan_mode_clarification_min_missing() == expected
 
 
 def test_parse_plan_mode_clarification_min_missing_invalid_uses_default(
@@ -459,14 +461,14 @@ def test_parse_plan_mode_clarification_min_missing_invalid_uses_default(
 ) -> None:
     monkeypatch.setenv("AI_AGENT_PLAN_MODE_CLARIFICATION_MIN_MISSING", "maybe")
     assert (
-        main_module._parse_plan_mode_clarification_min_missing()
-        == main_module._PLAN_MODE_CLARIFICATION_MIN_MISSING_DEFAULT
+        plan_mode_module._parse_plan_mode_clarification_min_missing()
+        == plan_mode_module._PLAN_MODE_CLARIFICATION_MIN_MISSING_DEFAULT
     )
 
 
 def test_should_run_plan_mode_clarification_runs_for_non_actionable_prompt() -> None:
     assert (
-        main_module._should_run_plan_mode_clarification(
+        plan_mode_module._should_run_plan_mode_clarification(
             prompt="Create a study plan for machine learning.",
             clarification_required=True,
             requires_unified_planning=False,
@@ -478,7 +480,7 @@ def test_should_run_plan_mode_clarification_runs_for_non_actionable_prompt() -> 
 def test_should_run_plan_mode_clarification_runs_for_actionable_prompt_without_explicit_request() -> None:
     # File operations now also benefit from clarification (goal + constraints).
     assert (
-        main_module._should_run_plan_mode_clarification(
+        plan_mode_module._should_run_plan_mode_clarification(
             prompt="Organize these files into folders.",
             clarification_required=True,
             requires_unified_planning=True,
@@ -489,7 +491,7 @@ def test_should_run_plan_mode_clarification_runs_for_actionable_prompt_without_e
 
 def test_should_run_plan_mode_clarification_stays_enabled_when_explicitly_requested() -> None:
     assert (
-        main_module._should_run_plan_mode_clarification(
+        plan_mode_module._should_run_plan_mode_clarification(
             prompt="Before writing the plan, ask clarifying questions first while organizing files.",
             clarification_required=True,
             requires_unified_planning=True,
@@ -500,7 +502,7 @@ def test_should_run_plan_mode_clarification_stays_enabled_when_explicitly_reques
 
 def test_prompt_requires_plan_mode_clarification_when_dimensions_missing() -> None:
     assert (
-        main_module._prompt_requires_plan_mode_clarification(
+        plan_mode_module._prompt_requires_plan_mode_clarification(
             "Create a study plan for machine learning."
         )
         is True
@@ -509,7 +511,7 @@ def test_prompt_requires_plan_mode_clarification_when_dimensions_missing() -> No
 
 def test_prompt_requires_plan_mode_clarification_false_when_detailed() -> None:
     assert (
-        main_module._prompt_requires_plan_mode_clarification(
+        plan_mode_module._prompt_requires_plan_mode_clarification(
             "Create a 10-week beginner study plan for AWS ML with 1 hour per day."
         )
         is False
@@ -518,7 +520,7 @@ def test_prompt_requires_plan_mode_clarification_false_when_detailed() -> None:
 
 def test_prompt_requires_plan_mode_clarification_false_for_rich_file_prompt() -> None:
     assert (
-        main_module._prompt_requires_plan_mode_clarification(
+        plan_mode_module._prompt_requires_plan_mode_clarification(
             "I need a complete, real-world plan to safely reorganize my digital life "
             "over the next 12 weeks. I'm talking about everything: ~2.5 TB of documents, "
             "photos, videos, and downloads spread across my Mac, iCloud Drive, and "
@@ -531,7 +533,7 @@ def test_prompt_requires_plan_mode_clarification_false_for_rich_file_prompt() ->
 
 
 def test_plan_mode_missing_dimensions_detects_goal_via_plan_to_verb() -> None:
-    missing = main_module._plan_mode_missing_clarification_dimensions(
+    missing = plan_mode_module._plan_mode_missing_clarification_dimensions(
         "plan to reorganize my photos over 4 weeks"
     )
     assert "goal" not in missing
@@ -539,14 +541,14 @@ def test_plan_mode_missing_dimensions_detects_goal_via_plan_to_verb() -> None:
 
 
 def test_plan_mode_missing_dimensions_detects_constraints_via_profile_signals() -> None:
-    missing = main_module._plan_mode_missing_clarification_dimensions(
+    missing = plan_mode_module._plan_mode_missing_clarification_dimensions(
         "create a privacy-first file backup plan with rollback checkpoints"
     )
     assert "constraints" not in missing
 
 
 def test_plan_mode_missing_dimensions_detects_baseline_via_volume_hint() -> None:
-    missing = main_module._plan_mode_missing_clarification_dimensions(
+    missing = plan_mode_module._plan_mode_missing_clarification_dimensions(
         "organize 2.5 TB of documents and photos"
     )
     assert "baseline" not in missing
@@ -554,7 +556,7 @@ def test_plan_mode_missing_dimensions_detects_baseline_via_volume_hint() -> None
 
 def test_prompt_requires_plan_mode_clarification_when_user_explicitly_requests_questions() -> None:
     assert (
-        main_module._prompt_requires_plan_mode_clarification(
+        plan_mode_module._prompt_requires_plan_mode_clarification(
             "Create a practical 6-week plan. Before writing the plan, ask clarifying questions."
         )
         is True
@@ -562,7 +564,7 @@ def test_prompt_requires_plan_mode_clarification_when_user_explicitly_requests_q
 
 
 def test_extract_plan_prompt_profile_detects_high_signal_file_constraints() -> None:
-    profile = main_module._extract_plan_prompt_profile(
+    profile = plan_mode_module._extract_plan_prompt_profile(
         (
             "Create a privacy-first 12 weeks file plan for 2.5 TB of documents and photos. "
             "No permanent deletion initially, include rollback checkpoints, and account for "
@@ -580,7 +582,7 @@ def test_extract_plan_prompt_profile_detects_high_signal_file_constraints() -> N
 
 
 def test_build_plan_mode_choice_question_uses_timeline_hint_for_timeframe_dimension() -> None:
-    _, options, _ = main_module._build_plan_mode_choice_question(
+    _, options, _ = plan_mode_module._build_plan_mode_choice_question(
         dimension="timeframe",
         prompt="Build a 10 week plan for organizing files safely.",
         session_learning=None,
@@ -591,7 +593,7 @@ def test_build_plan_mode_choice_question_uses_timeline_hint_for_timeframe_dimens
 
 
 def test_plan_mode_clarification_dimensions_use_all_core_dimensions_when_explicitly_requested() -> None:
-    dims = main_module._plan_mode_clarification_dimensions_for_prompt(
+    dims = plan_mode_module._plan_mode_clarification_dimensions_for_prompt(
         "I need a 6-week plan. Before writing the plan, ask all clarification questions first.",
         "project",
     )
@@ -604,12 +606,12 @@ def test_normalize_plan_mode_banner_removes_trailing_ellipsis() -> None:
         "No destructive tools were executed in this response.\n"
         "Draft follows."
     )
-    normalized = main_module._normalize_plan_mode_banner(text)
+    normalized = plan_mode_module._normalize_plan_mode_banner(text)
     assert normalized.splitlines()[0] == "PLAN MODE (Planning Only)"
 
 
 def test_compute_plan_mode_alignment_score_rewards_query_aligned_response() -> None:
-    score = main_module._compute_plan_mode_alignment_score(
+    score = plan_mode_module._compute_plan_mode_alignment_score(
         root_prompt="Create a practical 6-week file organization plan with rollback checkpoints.",
         response_text=(
             "Phase 1 (week 1-2): define taxonomy and constraints.\n"
@@ -628,7 +630,7 @@ def test_compute_plan_mode_alignment_score_rewards_query_aligned_response() -> N
 
 
 def test_compute_plan_mode_alignment_score_penalizes_off_topic_response() -> None:
-    score = main_module._compute_plan_mode_alignment_score(
+    score = plan_mode_module._compute_plan_mode_alignment_score(
         root_prompt="Create a practical 6-week file organization plan with rollback checkpoints.",
         response_text="Here is a random poem about summer weather and mountains.",
         clarification_context_block="",

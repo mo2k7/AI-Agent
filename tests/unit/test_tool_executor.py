@@ -8,18 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from agent_host.adapters.tools.apply_ops.plugin import ApplyOpsPlugin
 from agent_host.tools.executor import ToolExecutionError, ToolExecutor
+from tests.conftest import build_tool_executor
 
 
 def _make_executor(tmp_path: Path, *, enable_open_item: bool = False) -> ToolExecutor:
-    automations_dir = tmp_path / "automations"
-    automations_dir.mkdir(parents=True, exist_ok=True)
-    return ToolExecutor(
-        allowed_roots=[tmp_path],
-        automations_dir=automations_dir,
-        enable_open_item=enable_open_item,
-        search_scan_limit=5000,
-    )
+    return build_tool_executor(tmp_path, enable_open_item=enable_open_item)
 
 
 def test_search_files_finds_matches(tmp_path: Path) -> None:
@@ -73,14 +68,15 @@ def test_search_files_semantic_extension_boosts_document_types(
     report_pdf.write_text("pdf")
     report_bin.write_text("bin")
 
-    # Mock Spotlight to return both files so the scoring pipeline runs
+    # Mock Spotlight on the search plugin (not the executor)
+    search_plugin = executor.get("search_files")
     monkeypatch.setattr(
-        executor,
+        search_plugin,
         "_search_spotlight",
         lambda **_kwargs: (
             [
-                executor._make_search_metadata(report_pdf, score=100, source="spotlight"),
-                executor._make_search_metadata(report_bin, score=100, source="spotlight"),
+                search_plugin._make_search_metadata(report_pdf, score=100, source="spotlight"),
+                search_plugin._make_search_metadata(report_bin, score=100, source="spotlight"),
             ],
             2,
         ),
@@ -195,7 +191,7 @@ def test_apply_ops_delete_moves_to_trash_by_default(tmp_path: Path, monkeypatch:
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text("payload")
     trash_dir = tmp_path / ".test-trash"
-    monkeypatch.setattr(ToolExecutor, "_trash_directory", staticmethod(lambda: trash_dir))
+    monkeypatch.setattr(ApplyOpsPlugin, "_trash_directory", staticmethod(lambda: trash_dir))
 
     plan = executor.execute(
         "plan_ops",
@@ -226,7 +222,7 @@ def test_apply_ops_delete_trash_collision_gets_unique_name(
     trash_dir.mkdir(parents=True, exist_ok=True)
     existing = trash_dir / "duplicate.txt"
     existing.write_text("old")
-    monkeypatch.setattr(ToolExecutor, "_trash_directory", staticmethod(lambda: trash_dir))
+    monkeypatch.setattr(ApplyOpsPlugin, "_trash_directory", staticmethod(lambda: trash_dir))
 
     plan = executor.execute(
         "plan_ops",
@@ -252,8 +248,8 @@ def test_apply_ops_delete_hard_delete_opt_in_env_var(
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text("x")
     trash_dir = tmp_path / ".test-trash"
-    monkeypatch.setattr(ToolExecutor, "_trash_directory", staticmethod(lambda: trash_dir))
-    monkeypatch.setenv(ToolExecutor._HARD_DELETE_ENV_VAR, "1")
+    monkeypatch.setattr(ApplyOpsPlugin, "_trash_directory", staticmethod(lambda: trash_dir))
+    monkeypatch.setenv("AI_AGENT_ENABLE_HARD_DELETE", "1")
 
     plan = executor.execute(
         "plan_ops",
@@ -361,24 +357,6 @@ def test_apply_ops_idempotency_key_replays_without_reexecution(tmp_path: Path) -
     assert second["output"]["idempotent_replay"] is True
     assert dest.exists()
     assert not src.exists()
-
-
-def test_run_automation_executes_allowlisted_shell_script(tmp_path: Path) -> None:
-    executor = _make_executor(tmp_path)
-    script = tmp_path / "automations" / "Echo_Inputs.sh"
-    script.write_text("#!/bin/zsh\necho \"$AI_AGENT_AUTOMATION_INPUTS\"")
-    os.chmod(script, 0o700)
-
-    result = executor.execute(
-        "run_automation",
-        {"name": "Echo Inputs", "inputs": {"key": "value"}},
-    )
-
-    assert result["ok"] is True
-    output = result["output"]
-    assert output["ok"] is True
-    payload = json.loads(output["stdout"])
-    assert payload == {"key": "value"}
 
 
 def test_open_item_rejected_when_disabled(tmp_path: Path) -> None:

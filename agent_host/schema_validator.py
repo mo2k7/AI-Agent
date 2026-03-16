@@ -15,27 +15,13 @@ from jsonschema import Draft7Validator, ValidationError, SchemaError
 logger = logging.getLogger(__name__)
 
 
-class SchemaValidatorError(Exception):
-    """Base exception for schema validator errors."""
-    pass
-
-
-class SchemaLoadError(SchemaValidatorError):
-    """Raised when a schema cannot be loaded."""
-    pass
-
-
-class SchemaNotFoundError(SchemaValidatorError):
-    """Raised when a requested schema does not exist."""
-    pass
-
-
-class ValidationFailedError(SchemaValidatorError):
-    """Raised when validation fails."""
-    
-    def __init__(self, message: str, errors: Optional[List[str]] = None):
-        super().__init__(message)
-        self.errors = errors or []
+# Canonical definitions in contracts/types/errors.py; re-exported for backward compat.
+from agent_host.contracts.types.errors import (  # noqa: F401
+    SchemaValidatorError,
+    SchemaLoadError,
+    SchemaNotFoundError,
+    ValidationFailedError,
+)
 
 
 class SchemaValidator:
