@@ -1,132 +1,71 @@
-# macOS AI Agent
+# macOS AI Automation Agent
 
-Personal AI agent for macOS file management, powered by Google's Gemini AI.
+*A privacy-first, autonomous file management assistant powered by Google Gemini.*
 
-## Overview
+This project implements a highly capable AI assistant that natively integrates with your macOS filesystem. Built entirely from scratch using a Hexagonal (Ports & Adapters) architecture, the agent can navigate, organize, search, and modify files based solely on natural language commands—all while treating the LLM as an untrusted operator within a strict defense-in-depth security sandbox.
 
-This project implements an AI-powered file management assistant for macOS that can:
-- Navigate and organize files on your system
-- Perform file operations (move, copy, rename, delete)
-- Search for files based on natural language queries
-- Create organized folder structures
+## Key Features
 
-## Requirements
+- **Autonomous File Management**: Move, copy, rename, delete, and organize folders using natural context.
+- **Strict Security Guardrails**: Path sandboxing, SSRF DNS-level prevention, and approval gates prevent catastrophic operations.
+- **Encrypted Semantic Memory**: AES-256-GCM encrypted local state with macOS Keychain integration.
+- **3 Execution Modes**: Run in *Direct* mode for speed, *Plan* mode for complex multi-step workflows via NLP clarification, or *Teacher* mode for active learning.
+- **Cross-Platform IPC**: Native Swift macOS frontend with iOS connectivity via Tailscale.
 
-- Python 3.13 or higher
+## Quickstart
+
+### Requirements
+- Python 3.13+
 - macOS (Tahoe or later recommended)
-- Google API key for Gemini AI
+- Google Gemini API Key
 
-## Installation
+### Installation
 
-1. Clone the repository:
+1. **Clone the repository:**
    ```bash
-   git clone <repository-url>
-   cd macos-ai-agent
+   git clone https://github.com/mo2k7/Local-AI-Assistant.git
+   cd Local-AI-Assistant
    ```
 
-2. Install dependencies using Poetry:
+2. **Install dependencies:**
    ```bash
    poetry install
    ```
 
-3. Set up environment variables:
+3. **Configure Environment:**
    ```bash
    cp .env.example .env
-   # Edit .env and add your GOOGLE_API_KEY
+   # Add your GOOGLE_API_KEY inside the .env file
    ```
 
-4. (Optional, recommended) Review security-related runtime defaults:
-   ```bash
-   # File operations default to the project root. Set explicit roots as needed.
-   AI_AGENT_ALLOWED_ROOTS=/absolute/path/one,/absolute/path/two
+*(For advanced security configurations, hash-pin rotations, and explicit path sandboxing limits, refer to the `.env.example` file).*
 
-   # open_item is disabled by default; enable only if needed.
-   AI_AGENT_ENABLE_OPEN_ITEM=false
+## Development & Testing
 
-   # Raw prompts are excluded from audit logs by default.
-   AI_AGENT_AUDIT_INCLUDE_PROMPT=false
+Built with an emphasis on production-grade standards, the custom orchestration codebase is backed by rigid linting, type-checking, and comprehensive test coverage.
 
-   # Keep TLS verification on by default.
-   # Only for local debugging:
-   # AI_AGENT_ALLOW_INSECURE_TLS=true
-
-   # Automation scripts run with a minimal environment by default.
-   # Optional comma-separated passthrough list:
-   # AI_AGENT_AUTOMATION_ENV_ALLOWLIST=MY_VAR,ANOTHER_VAR
-   ```
-
-5. (Optional, recommended) Pin `unified-planning` package hash with rotation support:
-   ```bash
-   # Comma-separated SHA-256 digests: current + next allowed digest
-   AI_AGENT_UNIFIED_PLANNING_HASH_PIN=<current_digest>,<next_digest>
-   ```
-
-6. (Optional, advanced) Enable secure automatic hash rotation:
-   ```bash
-   # Enables signed local trust-store updates after successful verification
-   AI_AGENT_UNIFIED_PLANNING_HASH_PIN_AUTO_ROTATE=true
-   AI_AGENT_UNIFIED_PLANNING_HASH_PIN_STORE_HMAC_KEY=<strong-secret>
-
-   # Optional tuning
-   AI_AGENT_UNIFIED_PLANNING_HASH_PIN_MAX_HISTORY=6
-   # AI_AGENT_UNIFIED_PLANNING_HASH_PIN_STORE=~/.local/share/ai-agent/security/unified_planning_hash_store.json
-   ```
-
-7. (Optional) Tune Plan-mode planner-first behavior:
-   ```bash
-   # For actionable file-operation prompts in PLAN mode, this controls how many
-   # discovery calls are allowed before planner/plan_ops is required.
-   AI_AGENT_PLAN_MODE_DISCOVERY_BEFORE_PLANNER=2
-
-   # Ask clarification questions first in PLAN mode when prompt requirements
-   # are incomplete, so plans are not based on assumptions.
-   AI_AGENT_PLAN_MODE_CLARIFICATION_REQUIRED=true
-   ```
-
-## Development
-
-### Running Tests
-
+**Running the Test Suite:**
 ```bash
-# Run all tests
 poetry run pytest
-
-# Run with coverage
 poetry run pytest --cov
-
-# Run specific test file
-poetry run pytest tests/unit/test_specific.py
 ```
 
-### Code Quality
-
+**Quality Checks:**
 ```bash
-# Lint with ruff
 poetry run ruff check .
-
-# Type check with mypy
 poetry run mypy agent_host
 ```
 
-## Project Structure
+## Architecture
 
-```
-.
-├── agent_host/          # Main package
-│   ├── core/           # AI agent orchestration
-│   └── tools/          # File system operations
-├── schemas/            # JSON schemas for tool definitions
-├── tests/
-│   ├── unit/          # Unit tests
-│   └── golden/        # Golden/snapshot tests
-│       └── fixtures/  # Test fixtures
-├── pyproject.toml     # Project configuration
-└── README.md          # This file
-```
+- `agent_host/` - The core AI orchestration, tool execution, and memory managers.
+- `schemas/` - Strict JSON schemas for sandboxed tool validation.
+- `tests/` - High-leverage unit and golden snapshot tests.
+- `ui/` - Native Swift frontend interface.
 
-## License
+---
 
-Closed-source proprietary software.
+### License & Copyright
 
-- Legal terms: [LICENSE](/Users/muhammadabdullah/AI%20Automation%20Agent%20macOS/LICENSE)
-- Operational policy summary: [docs/licensing_policy.md](/Users/muhammadabdullah/AI%20Automation%20Agent%20macOS/docs/licensing_policy.md)
+**Copyright © 2026 Muhammad Abdullah. All rights reserved.**  
+Closed-source proprietary software. See the `LICENSE` file and `docs/licensing_policy.md` for complete operational policies and legal terms.
